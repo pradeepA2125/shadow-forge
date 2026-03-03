@@ -36,6 +36,10 @@ Review lifecycle states are explicit:
 - `AI_EDITOR_ANTHROPIC_TIMEOUT_SEC`: optional, default `60.0`
 - `GEMINI_API_KEY` or `GOOGLE_API_KEY`: required when `AI_EDITOR_REASONING_BACKEND=gemini`
 - `AI_EDITOR_GEMINI_MODEL`: optional, default `gemini-3-flash-preview`
+- `AI_EDITOR_GEMINI_THINKING_ENABLED`: optional, default `1` (enables Gemini thinking mode)
+- `AI_EDITOR_GEMINI_THINKING_BUDGET`: optional integer budget; default dynamic `-1` when thinking is enabled and no level is set
+- `AI_EDITOR_GEMINI_THINKING_LEVEL`: optional thinking level hint (for models that support levels)
+- `AI_EDITOR_GEMINI_INCLUDE_THOUGHTS`: optional (`1|0`), default `0`
 - `AI_EDITOR_REASONING_BACKEND`: `openai` (default), `anthropic`, `gemini`, or `scripted` (debug)
 - `AI_EDITOR_VALIDATION_COMMANDS_JSON`: optional JSON array of commands; if unset, validator auto-detects defaults
 - `AI_EDITOR_DB_PATH`: optional SQLite path, default `.agentd/agentd.sqlite3`

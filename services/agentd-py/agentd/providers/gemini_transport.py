@@ -17,9 +17,17 @@ class GeminiJsonTransport(ModelJsonTransport):
         self,
         *,
         api_key: str | None = None,
+        thinking_enabled: bool = False,
+        thinking_budget: int | None = None,
+        thinking_level: str | None = None,
+        include_thoughts: bool = False,
         models_client: Any | None = None,
     ) -> None:
         self._client: Any | None = None
+        self._thinking_enabled = thinking_enabled
+        self._thinking_budget = thinking_budget
+        self._thinking_level = normalize_thinking_level(thinking_level)
+        self._include_thoughts = include_thoughts
         if models_client is not None:
             self._models: Any = models_client
             return
@@ -47,15 +55,20 @@ class GeminiJsonTransport(ModelJsonTransport):
         system_instructions: str,
         user_payload: dict[str, object],
     ) -> dict[str, object]:
+        config: dict[str, object] = {
+            "temperature": 0,
+            "system_instruction": system_instructions,
+            "response_mime_type": "application/json",
+            "response_json_schema": schema,
+        }
+        thinking_config = self._build_thinking_config()
+        if thinking_config is not None:
+            config["thinking_config"] = thinking_config
+
         response = await self._models.generate_content(
             model=model,
             contents=json.dumps(user_payload),
-            config={
-                "temperature": 0,
-                "system_instruction": system_instructions,
-                "response_mime_type": "application/json",
-                "response_json_schema": schema,
-            },
+            config=config,
         )
 
         output_text = self._extract_text(response)
@@ -81,6 +94,24 @@ class GeminiJsonTransport(ModelJsonTransport):
 
         return payload
 
+    def _build_thinking_config(self) -> dict[str, object] | None:
+        if not self._thinking_enabled:
+            return None
+
+        thinking_config: dict[str, object] = {}
+        if self._thinking_budget is not None:
+            thinking_config["thinking_budget"] = self._thinking_budget
+        if self._thinking_level is not None:
+            thinking_config["thinking_level"] = self._thinking_level
+        if self._include_thoughts:
+            thinking_config["include_thoughts"] = True
+
+        if not thinking_config:
+            # Dynamic thinking budget when enabled but no explicit params were set.
+            thinking_config["thinking_budget"] = -1
+
+        return thinking_config
+
 
 def strip_json_code_fences(text: str) -> str:
     raw = text.strip()
@@ -99,3 +130,12 @@ def read_value(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         return value.get(key)
     return getattr(value, key, None)
+
+
+def normalize_thinking_level(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    return normalized

@@ -47,6 +47,70 @@ async def test_gemini_transport_sends_expected_request_shape() -> None:
     assert call["config"]["system_instruction"] == "plan"
     assert call["config"]["response_mime_type"] == "application/json"
     assert call["config"]["response_json_schema"] == {"type": "object"}
+    assert "thinking_config" not in call["config"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_transport_includes_thinking_budget_when_enabled() -> None:
+    fake_client = FakeModelsClient(outputs=[json.dumps({"ok": True})])
+    transport = GeminiJsonTransport(
+        models_client=fake_client,
+        thinking_enabled=True,
+        thinking_budget=2048,
+    )
+
+    await transport.generate_json(
+        model="gemini-3-flash-preview",
+        schema_name="plan_document",
+        schema={"type": "object"},
+        system_instructions="plan",
+        user_payload={"task_id": "task-1"},
+    )
+
+    call = fake_client.calls[0]
+    assert call["config"]["thinking_config"] == {"thinking_budget": 2048}
+
+
+@pytest.mark.asyncio
+async def test_gemini_transport_includes_thinking_level_and_include_thoughts() -> None:
+    fake_client = FakeModelsClient(outputs=[json.dumps({"ok": True})])
+    transport = GeminiJsonTransport(
+        models_client=fake_client,
+        thinking_enabled=True,
+        thinking_level="HIGH",
+        include_thoughts=True,
+    )
+
+    await transport.generate_json(
+        model="gemini-3-flash-preview",
+        schema_name="patch_document",
+        schema={"type": "object"},
+        system_instructions="patch",
+        user_payload={"task_id": "task-2"},
+    )
+
+    call = fake_client.calls[0]
+    assert call["config"]["thinking_config"] == {
+        "thinking_level": "high",
+        "include_thoughts": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_gemini_transport_uses_dynamic_budget_when_enabled_without_explicit_config() -> None:
+    fake_client = FakeModelsClient(outputs=[json.dumps({"ok": True})])
+    transport = GeminiJsonTransport(models_client=fake_client, thinking_enabled=True)
+
+    await transport.generate_json(
+        model="gemini-3-flash-preview",
+        schema_name="patch_document",
+        schema={"type": "object"},
+        system_instructions="patch",
+        user_payload={"task_id": "task-3"},
+    )
+
+    call = fake_client.calls[0]
+    assert call["config"]["thinking_config"] == {"thinking_budget": -1}
 
 
 @pytest.mark.asyncio
