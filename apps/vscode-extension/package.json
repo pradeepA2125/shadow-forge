@@ -1,0 +1,76 @@
+{
+  "name": "@ai-editor/vscode-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "activationEvents": [
+    "onCommand:aiEditor.startTask",
+    "onCommand:aiEditor.openReviewPanel",
+    "onCommand:aiEditor.acceptPatch",
+    "onCommand:aiEditor.rejectPatch",
+    "onCommand:aiEditor.refreshTask"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiEditor.startTask",
+        "title": "AI Editor: Start Task"
+      },
+      {
+        "command": "aiEditor.openReviewPanel",
+        "title": "AI Editor: Open Review Panel"
+      },
+      {
+        "command": "aiEditor.acceptPatch",
+        "title": "AI Editor: Accept Patch"
+      },
+      {
+        "command": "aiEditor.rejectPatch",
+        "title": "AI Editor: Reject Patch"
+      },
+      {
+        "command": "aiEditor.refreshTask",
+        "title": "AI Editor: Refresh Task"
+      }
+    ],
+    "configuration": {
+      "title": "AI Editor",
+      "properties": {
+        "aiEditor.backendBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "Base URL for the running agentd-py backend service."
+        },
+        "aiEditor.defaultMode": {
+          "type": "string",
+          "default": "project_edit",
+          "enum": ["inline", "file_edit", "project_edit", "autonomous"],
+          "description": "Default orchestration mode for submitted tasks."
+        },
+        "aiEditor.pollIntervalMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 250,
+          "description": "Polling interval used while a task is running."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ai-editor/editor-client": "0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}

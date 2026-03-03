@@ -1,0 +1,15 @@
+{
+  "name": "ai-editor",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Production-grade AI editor monorepo",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run -w @ai-editor/editor-client build && npm run -w @ai-editor/vscode-extension build",
+    "dev": "npm run -w @ai-editor/editor-client dev",
+    "test": "npm run -w @ai-editor/editor-client test && npm run -w @ai-editor/vscode-extension test",
+    "typecheck": "npm run -w @ai-editor/editor-client typecheck && npm run -w @ai-editor/vscode-extension typecheck"
+  }
+}
