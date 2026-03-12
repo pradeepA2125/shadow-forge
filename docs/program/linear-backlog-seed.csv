@@ -1,0 +1,21 @@
+title,phase,epic,priority,benchmark_impact,failure_taxonomy_tag,acceptance_metric,owner_role
+Build deterministic replay bundle schema and writer,0,Evaluation,High,High,replay_determinism,"95% failed-run replay reproducibility",Backend
+Implement replay bundle runner and verifier CLI,0,Evaluation,High,High,replay_determinism,"Replay command succeeds on baseline corpus",Backend
+Freeze benchmark corpus manifest (100 internal + 50 OSS),0,Evaluation,High,High,benchmark_coverage,"Manifest checked in with 150 tasks and language labels",Platform
+Add baseline scoring pipeline (success/retry/unsafe mutation/accept),0,Evaluation,High,High,metrics_fidelity,"Score report generated for full corpus",Backend
+Add weekly benchmark summary artifact writer,0,Evaluation,Medium,Medium,metrics_fidelity,"Weekly JSON summary generated in .tmp/benchmarks",Backend
+Implement failure cluster report (top 5 classes),0,Reliability,High,High,failure_clustering,"Top 5 cluster report generated from run artifacts",Backend
+Define patch op dependency graph checks,1,Patch Engine,High,High,preflight_order_conflict,"Rejects self-invalidating op sequences pre-apply",Backend
+Implement anchor stability validation in preflight,1,Patch Engine,High,High,anchor_invalid,"Anchor drift cases rejected pre-apply",Backend
+Add language parse simulation in preflight (TS/Py/Rs),1,Patch Engine,High,High,syntax_preflight,"Parse-invalid candidate patches blocked before apply",Backend
+Add transactional checkpoint manager per step attempt,1,Reliability,High,High,rollback_integrity,"No leaked mutations after failed attempt rollback",Backend
+Persist checkpoint metadata in task artifacts,1,Reliability,Medium,Medium,rollback_integrity,"Every failed attempt has recoverable checkpoint metadata",Backend
+Implement candidate patch generation (N variants),1,Patch Engine,High,High,patch_quality,"N candidates generated under budget constraints",Backend
+Implement candidate patch scoring and selection,1,Patch Engine,High,High,patch_quality,"Best-candidate selection improves pass rate vs baseline",Backend
+Create regression pack for syntax/indent/anchor drift failures,1,Evaluation,High,High,regression_guard,"Known failure pack passes in CI",QA
+Add benchmark delta report for Phase 1 exit gate,1,Evaluation,High,High,phase_gate,"70% reduction in syntax/indent/anchor drift failures",Platform
+Define PlanStepV2 contract with pre/post/verification,2,Planner,High,High,semantic_mismatch,"PlanStepV2 validated end-to-end in planner flow",Backend
+Add critic taxonomy and targeted retry prompting,2,Planner,High,High,critic_taxonomy,"Retries include typed failure context and reduce generic retries",Backend
+Implement rules precedence engine (global/workspace/repo/task),2,Policy/MCP,High,Medium,policy_resolution,"Deterministic precedence tests all pass",Backend
+Add timeline API and VS Code timeline panel,3,UI/Review,High,Medium,observability,"Users can inspect step-attempt timeline in extension",Frontend
+Add background task mode with resume and rollback controls,3,UI/Review,High,High,resume_rollback,"Background tasks can pause/resume/rollback safely",Fullstack

@@ -2,6 +2,12 @@
 
 Production-grade AI editor foundation with a polyglot architecture.
 
+## Program roadmap
+- Active strategy: 24-week parity+ roadmap (reliability first, Cursor/Windsurf core parity baseline).
+- Program plan: `docs/program/parity-plus-6-month-plan.md`
+- Delivery model: `docs/program/linear-execution-model.md`
+- Strategy/docs model: `docs/program/notion-structure.md`
+
 ## Service layout
 - `apps/editor-client` (TypeScript): editor-facing contracts and HTTP client
 - `apps/vscode-extension` (TypeScript): VS Code MVP command + review UI
@@ -70,10 +76,16 @@ Key env vars:
 - [x] LSP session manager in Rust indexer (TS + Pyright + rust-analyzer, diagnostics-first, best-effort fallback)
 - [x] Artifact-first retrieval core (parser registry, full graph snapshot, deterministic query CLI, orchestrator artifact integration)
 - [x] VS Code MVP review loop (start task, poll status, review panel, real/shadow diff, accept/reject/refresh commands)
+- [x] Step-scoped patch execution with bounded per-step patch calls
+- [x] Deterministic patch preflight conflict detection for self-invalidating op order/anchors
+- [x] Plan-target grounding with one-shot replan feedback for missing step paths
 
 ## Explicitly pending
-- [ ] Rollback snapshots per repair loop iteration
-- [ ] Task timeline/execution trace APIs and UI surfaces
-- [ ] Loop analytics dashboards (token budgets, failure mode trends, latency metrics)
-- [ ] Step-scoped patch generation for reliability (replace full-plan single-shot patching with bounded patch size via per-step patch calls)
-- [ ] Deterministic patch preflight conflict detection for self-invalidating op order/anchors (e.g., removing `TaskStore` before `insert_after_symbol` on `TaskStore`)
+- [x] Phase 0 eval harness and deterministic replay bundles
+- [ ] Phase 1 patch engine v2 (hybrid CST/AST + simulated apply + ranking)
+: delivered so far in Phase 1 kickoff: deterministic preflight dependency/anchor conflict checks, candidate ranking with deterministic selection, transactional checkpoints, and `/v1/tasks/{task_id}/artifacts`.
+- [x] Phase 1 failure corpus + gate report tooling (`docs/benchmarks/phase1-failure-corpus.v1.json`, `ai-editor-eval phase1-gate-report`)
+- [ ] Phase 2 planner/executor/critic v2 and rules/memory precedence
+- [ ] Phase 3 parity surfaces (timeline/background/code review + MCP policy controls)
+- [ ] Phase 4 workflow layer (issue-driven flows + knowledge spaces + collaboration metadata)
+- [ ] Phase 5 differentiation (multi-agent orchestrator + retrieval v2 + autonomous refactors)

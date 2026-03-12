@@ -19,6 +19,7 @@ Review lifecycle states are explicit:
 - `POST /v1/tasks`
 - `GET /v1/tasks/{task_id}`
 - `GET /v1/tasks/{task_id}/result`
+- `GET /v1/tasks/{task_id}/artifacts`
 - `POST /v1/tasks/{task_id}/cancel`
 - `POST /v1/tasks/{task_id}/accept`
 - `POST /v1/tasks/{task_id}/reject`
@@ -52,8 +53,18 @@ Review lifecycle states are explicit:
 - `AI_EDITOR_GROQ_TIMEOUT_SEC`: optional, default `60.0`
 - `AI_EDITOR_REASONING_BACKEND`: `openai` (default), `anthropic`, `gemini`, `huggingface`, `groq`, or `scripted` (debug)
 - `AI_EDITOR_VALIDATION_COMMANDS_JSON`: optional JSON array of commands; if unset, validator auto-detects defaults
+- `AI_EDITOR_STEP_SCOPED_MODE`: optional (`1|0`), default `1`; enables step-scoped patching with preflight gates
+- `AI_EDITOR_AST_CUTOVER_MODE`: optional, default `hard`; any value other than `hard` fails startup
+- `AI_EDITOR_MAX_ATTEMPTS_PER_STEP`: optional, default `3`
+- `AI_EDITOR_PATCH_CANDIDATE_COUNT`: optional, default `3`
+- `AI_EDITOR_CHECKPOINT_RETENTION_TASKS`: optional, default `20`
 - `AI_EDITOR_DB_PATH`: optional SQLite path, default `.agentd/agentd.sqlite3`
 - `AI_EDITOR_SHADOW_ROOT`: optional shadow root, default `.agentd/shadows`
+
+AST patching dependencies:
+- Python AST/CST patching requires `libcst` (installed by default dependencies).
+- TypeScript/Rust selector resolution uses `tree_sitter_languages` when available.
+- If tree-sitter parsers are unavailable in runtime, candidate preflight fails deterministically with `parser_unavailable`.
 
 ## Run (after deps install)
 ```bash
@@ -76,4 +87,32 @@ export AI_EDITOR_HUGGINGFACE_MODEL=deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct:f
 export AI_EDITOR_REASONING_BACKEND=groq
 export GROQ_API_KEY=gsk_xxx
 export AI_EDITOR_GROQ_MODEL=openai/gpt-oss-120b
+```
+
+## Phase 0 evaluation commands
+```bash
+# 1) Seed/freeze benchmark corpus manifest
+ai-editor-eval init-corpus-manifest \
+  --workspace-root /path/to/workspaces \
+  --output /path/to/repo/docs/benchmarks/benchmark-corpus.v1.json \
+  --freeze
+
+# 2) Export deterministic replay bundle for a task from SQLite
+ai-editor-eval export-bundle \
+  --db-path /path/to/repo/services/agentd-py/.agentd/agentd.sqlite3 \
+  --task-id task-123 \
+  --output /tmp/benchmarks/bundle.task-123.json
+
+# 3) Replay/verify deterministic bundle fingerprint
+ai-editor-eval replay-bundle \
+  --bundle /tmp/benchmarks/bundle.task-123.json
+
+# 4) Produce score + weekly report from bundles directory
+ai-editor-eval score --bundles-root /tmp/benchmarks
+ai-editor-eval weekly-report --bundles-root /tmp/benchmarks
+
+# 5) Phase 1 reliability gate (baseline vs current)
+ai-editor-eval phase1-gate-report \
+  --baseline-bundles-root /tmp/benchmarks/baseline \
+  --bundles-root /tmp/benchmarks/current
 ```
