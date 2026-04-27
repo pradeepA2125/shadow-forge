@@ -104,3 +104,18 @@ class ScriptedReasoningEngine:
                     if isinstance(ops, list):
                         patch_ops = ops
         return {"type": "emit_patch", "thought": "scripted engine bypasses tool loop", "patch_ops": patch_ops}
+
+    async def create_planning_step(
+        self,
+        plan_context: dict[str, object],
+        history: list[dict[str, object]],
+        tool_definitions: list[dict[str, object]],
+    ) -> dict[str, object]:
+        _ = (plan_context, history, tool_definitions)
+        return {
+            "type": "emit_plan",
+            "thought": "scripted planning engine bypasses exploration",
+            "plan_markdown": "# Scripted Plan\n\n- Review generated changes",
+            "files_examined": [],
+            "confidence": "high",
+        }

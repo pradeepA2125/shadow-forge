@@ -263,3 +263,26 @@ class DefaultReasoningEngine(ReasoningEngine):
             user_payload=user_payload,
         )
         return result
+
+    async def create_planning_step(
+        self,
+        plan_context: dict[str, object],
+        history: list[dict[str, object]],
+        tool_definitions: list[dict[str, object]],
+    ) -> dict[str, object]:
+        from agentd.planning.prompts import (
+            PLANNING_STEP_RESPONSE_SCHEMA,
+            build_planning_step_payload,
+            format_planning_system_prompt,
+        )
+        revision_mode = "revision_request" in plan_context
+        system_instructions = format_planning_system_prompt(tool_definitions, revision_mode=revision_mode)
+        user_payload = build_planning_step_payload(plan_context, history, tool_definitions)
+        result = await self._transport.generate_json(
+            model=self._model,
+            schema_name="planning_step_response",
+            schema=PLANNING_STEP_RESPONSE_SCHEMA,
+            system_instructions=system_instructions,
+            user_payload=user_payload,
+        )
+        return result if isinstance(result, dict) else {}

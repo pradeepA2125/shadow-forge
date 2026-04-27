@@ -64,3 +64,18 @@ class ReasoningEngine(Protocol):
         For emit_patch: also "patch_ops" (list of patch op dicts).
         """
         ...
+
+    async def create_planning_step(
+        self,
+        plan_context: dict[str, object],
+        history: list[dict[str, object]],
+        tool_definitions: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """One turn of the planning ReAct loop.
+
+        Returns a dict with at minimum {"type": "tool_call"|"emit_plan"|"emit_revision", "thought": str}.
+        For tool_call: also "tool" (name) and "args" (dict).
+        For emit_plan: also "plan_markdown", "files_examined", "confidence".
+        For emit_revision: also "revised_steps", "reverted_step_ids", "revision_summary".
+        """
+        ...
