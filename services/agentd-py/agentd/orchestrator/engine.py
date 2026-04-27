@@ -39,6 +39,8 @@ from agentd.domain.models import (
 )
 from agentd.domain.state_machine import assert_budget, bump_usage, transition
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster
+from agentd.planning.agent import PlanningAgent
+from agentd.planning.registry import PlanningToolRegistry
 from agentd.tools.loop import PlanHandoff
 from agentd.patch.engine import PatchEngine
 from agentd.reasoning.contracts import ReasoningEngine
@@ -163,15 +165,35 @@ class AgentOrchestrator:
                 },
                 artifacts_root_path=task.artifacts_root_path,
             )
-            print("\n[PLAN] Entering Planning Node...")
-            plan_markdown, critique_diagnostics = await self._generate_repo_grounded_markdown_plan(
-                task,
-                str(shadow_workspace.shadow_path),
-                plan_context_payload,
+            print("\n[PLAN] PlanningAgent exploring workspace...")
+            planning_agent = self._build_planning_agent(task.task_id, task.workspace_path)
+            planning_result = await planning_agent.generate_plan(
+                task=task,
+                initial_context=plan_context_payload,
+                budget=task.budget,
             )
-            print("[PLAN] Plan Created.")
-            task.plan_markdown = plan_markdown
-            task.diagnostics = [*persistent_diagnostics, *critique_diagnostics]
+            self._write_debug_artifact(
+                task.task_id,
+                "planning-trace",
+                planning_result.tool_trace.model_dump(mode="json"),
+                artifacts_root_path=task.artifacts_root_path,
+            )
+            print(
+                f"[PLAN] Plan created. Examined {len(planning_result.files_examined)} files. "
+                f"Confidence: {planning_result.confidence}"
+            )
+            task.plan_markdown = planning_result.plan_markdown
+            confidence_diagnostics: list[Diagnostic] = []
+            if planning_result.confidence == "low":
+                confidence_diagnostics = [Diagnostic(
+                    source="planning_agent",
+                    message=(
+                        f"Planning confidence: low. Agent examined "
+                        f"{len(planning_result.files_examined)} files — review plan carefully."
+                    ),
+                    level="warning",
+                )]
+            task.diagnostics = [*persistent_diagnostics, *confidence_diagnostics]
             task.plan_approval_snapshot = TaskMilestoneSnapshot(
                 captured_at=datetime.now(timezone.utc),
                 task_state=task.model_dump(mode="json"),
@@ -236,14 +258,26 @@ class AgentOrchestrator:
                 # User provided feedback, regenerate markdown plan
                 task = transition(task, TaskStatus.CONTEXT_READY, "regenerating plan with feedback")
                 await self._store.save(task)
-                
-                plan_markdown, critique_diagnostics = await self._generate_repo_grounded_markdown_plan(
-                    task,
-                    str(shadow_workspace.shadow_path),
-                    {**plan_context_payload, "plan_feedback": feedback},
+
+                planning_agent = self._build_planning_agent(task.task_id, task.workspace_path)
+                planning_result = await planning_agent.generate_plan(
+                    task=task,
+                    initial_context={**plan_context_payload, "plan_feedback": feedback},
+                    budget=task.budget,
                 )
-                task.plan_markdown = plan_markdown
-                task.diagnostics = [*retrieval_warnings, *critique_diagnostics]
+                self._write_debug_artifact(
+                    task.task_id,
+                    "planning-trace-feedback",
+                    planning_result.tool_trace.model_dump(mode="json"),
+                    artifacts_root_path=task.artifacts_root_path,
+                )
+                task.plan_markdown = planning_result.plan_markdown
+                confidence_diagnostics_fb: list[Diagnostic] = [Diagnostic(
+                    source="planning_agent",
+                    message="Planning confidence: low. Review plan carefully.",
+                    level="warning",
+                )] if planning_result.confidence == "low" else []
+                task.diagnostics = [*retrieval_warnings, *confidence_diagnostics_fb]
                 task.plan_approval_snapshot = TaskMilestoneSnapshot(
                     captured_at=datetime.now(timezone.utc),
                     task_state=task.model_dump(mode="json"),
@@ -259,117 +293,30 @@ class AgentOrchestrator:
             task = transition(task, TaskStatus.PLANNED, "plan approved; starting execution")
             await self._store.save(task)
 
-            plan_validation_feedback: dict[str, object] | None = None
-            plan_draft_rounds: list[dict[str, object]] = []
-            plan_critique_rounds: list[dict[str, object]] = []
-            unresolved_targets: list[dict[str, str | None]] = []
-            grounding_issues: list[PlanCritiqueIssue] = []
-            schema_errors: list[dict[str, object]] = []
-            for attempt in range(3):
-                validation_context = dict(plan_context_payload)
-                if plan_validation_feedback is not None:
-                    validation_context["plan_validation_feedback"] = plan_validation_feedback
-
-                plan_raw = await self._reasoning_engine.create_plan(
-                    task,
-                    str(shadow_workspace.shadow_path),
-                    validation_context,
-                )
-                plan_draft_rounds.append(
-                    {
-                        "round": attempt + 1,
-                        "plan": plan_raw,
-                    }
-                )
-                try:
-                    candidate_plan = PlanDocument.model_validate(plan_raw)
-                except ValidationError as exc:
-                    schema_errors = list(exc.errors(include_url=False))
-                    plan_validation_feedback = {
-                        "previous_plan": plan_raw,
-                        "schema_errors": schema_errors,
-                    }
-                    continue
-
-                # Structural grounding check: verifies file paths, intents, expected_files
-                unresolved_targets, structural_issues = self._validate_plan_grounding(
-                    candidate_plan,
-                    task.plan_markdown or "",
-                    workspace_files_set,
-                    workspace_files_index,
-                    retrieval_context.planner_evidence,
-                )
-
-                # Always run LLM semantic critique — not only as a repair mechanism
-                critique_result = await self._reasoning_engine.critique_json_plan(
-                    task,
-                    str(shadow_workspace.shadow_path),
-                    validation_context,
-                    candidate_plan.model_dump(mode="json"),
-                )
-                critique = PlanCritiqueResult.model_validate(critique_result)
-                plan_critique_rounds.append(
-                    {
-                        "round": attempt + 1,
-                        "critique": critique.model_dump(mode="json"),
-                    }
-                )
-                llm_issues = critique.issues if critique.verdict == "revise" else []
-
-                # Merge: structural issues take precedence; LLM issues are additive
-                grounding_issues = [*structural_issues, *llm_issues]
-
-                if not unresolved_targets and not grounding_issues:
-                    task.plan = candidate_plan
-                    break
-
-                plan_validation_feedback = {
-                    "previous_plan": plan_raw,
-                    "missing_targets": unresolved_targets,
-                    "grounding_issues": [issue.model_dump(mode="json") for issue in grounding_issues],
-                }
-
-            if task.plan is None:
-                schema_diagnostics: list[Diagnostic] = []
-                for item in schema_errors[:8]:
-                    loc = ".".join(str(part) for part in item.get("loc", ()))
-                    msg = str(item.get("msg", "invalid plan schema"))
-                    formatted = f"{loc}: {msg}" if loc else msg
-                    schema_diagnostics.append(
-                        Diagnostic(
-                            source="plan_schema_validation",
-                            message=formatted,
-                            level="error",
-                        )
-                    )
-                task.diagnostics = [
-                    *retrieval_warnings,
-                    *schema_diagnostics,
-                    *self._plan_target_diagnostics(unresolved_targets),
-                    *self._critique_diagnostics(grounding_issues, source="plan_grounding"),
-                ]
-                task = transition(task, TaskStatus.FAILED, "plan target validation failed")
-                await self._store.save(task)
-                return task
-
+            plan_raw = await self._reasoning_engine.create_plan(
+                task,
+                str(shadow_workspace.shadow_path),
+                plan_context_payload,
+            )
             self._write_debug_artifact(
                 task.task_id,
                 "json-plan-draft",
-                {"rounds": plan_draft_rounds},
-                artifacts_root_path=task.artifacts_root_path,
-            )
-            self._write_debug_artifact(
-                task.task_id,
-                "json-plan-critique",
-                {"rounds": plan_critique_rounds},
-                artifacts_root_path=task.artifacts_root_path,
-            )
-            self._write_debug_artifact(
-                task.task_id,
-                "json-plan-final",
                 {"plan": plan_raw},
                 artifacts_root_path=task.artifacts_root_path,
             )
+            try:
+                candidate_plan = PlanDocument.model_validate(plan_raw)
+            except ValidationError as exc:
+                task.diagnostics.append(Diagnostic(
+                    source="orchestrator",
+                    message=f"JSON plan schema validation failed: {exc}",
+                    level="error",
+                ))
+                task = transition(task, TaskStatus.FAILED, "JSON plan schema invalid")
+                await self._store.save(task)
+                return task
+
+            task.plan = candidate_plan
             self._write_debug_artifact(
                 task.task_id,
                 "plan",
@@ -675,6 +622,19 @@ class AgentOrchestrator:
             and result.step_id not in task.completed_step_ids
         ):
             task.completed_step_ids.append(result.step_id)
+
+    def _build_planning_agent(self, task_id: str, workspace_path: str) -> PlanningAgent:
+        """Construct a PlanningAgent reading from the real (unmodified) workspace."""
+        planning_registry = PlanningToolRegistry(
+            real_path=Path(workspace_path).resolve(),
+            semantic_index=getattr(self._retrieval_client, "_semantic_index", None),
+        )
+        return PlanningAgent(
+            reasoning_engine=self._reasoning_engine,
+            registry=planning_registry,
+            broadcaster=self.broadcaster,
+            task_id=task_id,
+        )
 
     def _next_incomplete_step(self, task: TaskRecord) -> PlanStep | None:
         """Return the first step in the plan that hasn't been completed."""

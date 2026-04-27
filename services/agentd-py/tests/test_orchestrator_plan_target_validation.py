@@ -388,6 +388,9 @@ class NewFileIntentReasoner(ReplanningReasoner):
 
 @pytest.mark.asyncio
 async def test_orchestrator_replans_when_plan_targets_missing(tmp_path: Path) -> None:
+    # With the PlanningAgent architecture, grounding retry is replaced by the
+    # explore-then-commit loop. A plan targeting a non-existent file still fails
+    # at step execution (preflight scope/missing-target), not at plan generation.
     real_workspace = tmp_path / "real"
     (real_workspace / "src").mkdir(parents=True)
     (real_workspace / "src/example.py").write_text("class X:\n    pass\n", encoding="utf-8")
@@ -414,19 +417,17 @@ async def test_orchestrator_replans_when_plan_targets_missing(tmp_path: Path) ->
 
     result = await orchestrator.continue_task(task.task_id, feedback=None)
 
-    assert result.status == TaskStatus.READY_FOR_REVIEW
-    assert reasoner.markdown_plan_calls == 1
-    assert reasoner.plan_calls == 2
-    assert "plan_validation_feedback" in reasoner.plan_contexts[1]
-    feedback = reasoner.plan_contexts[1]["plan_validation_feedback"]
-    assert isinstance(feedback, dict)
-    missing_targets = feedback["missing_targets"]
-    assert isinstance(missing_targets, list)
-    assert missing_targets[0]["target"] == "agentd/api/tasks.py"
+    # Plan is generated once; execution fails because the tool step targets
+    # src/example.py but the plan's allowed_files is agentd/api/tasks.py.
+    assert result.status == TaskStatus.FAILED
+    assert reasoner.plan_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_fails_fast_when_replanned_targets_still_missing(tmp_path: Path) -> None:
+    # With the PlanningAgent architecture, create_plan() is called exactly once.
+    # A plan targeting a non-existent file without a valid intent causes step
+    # execution to fail (preflight rejects the tool step's scope violation).
     real_workspace = tmp_path / "real"
     (real_workspace / "src").mkdir(parents=True)
     (real_workspace / "src/example.py").write_text("class X:\n    pass\n", encoding="utf-8")
@@ -454,13 +455,14 @@ async def test_orchestrator_fails_fast_when_replanned_targets_still_missing(tmp_
     result = await orchestrator.continue_task(task.task_id, feedback=None)
 
     assert result.status == TaskStatus.FAILED
-    assert reasoner.plan_calls == 3  # loop is range(3): initial + 2 repair rounds
-    assert any(d.source == "plan_schema_validation" for d in result.diagnostics)
-    assert any("steps.0.targets.0.intent" in d.message for d in result.diagnostics)
+    assert reasoner.plan_calls == 1  # single call — grounding retry loop is removed
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_replans_when_json_plan_drifts_from_markdown_blueprint(tmp_path: Path) -> None:
+    # With the PlanningAgent architecture, there is no JSON-vs-markdown grounding
+    # critique loop. create_plan() is called once; if the step targets a file that
+    # conflicts with what the tool step actually patches, execution fails.
     real_workspace = tmp_path / "real"
     (real_workspace / "services/agentd-py/agentd/api").mkdir(parents=True)
     (real_workspace / "services/agentd-py/agentd/storage").mkdir(parents=True)
@@ -489,13 +491,10 @@ async def test_orchestrator_replans_when_json_plan_drifts_from_markdown_blueprin
 
     result = await orchestrator.continue_task(task.task_id, feedback=None)
 
-    assert result.status == TaskStatus.READY_FOR_REVIEW
-    assert reasoner.plan_calls == 2
-    feedback = reasoner.plan_contexts[1]["plan_validation_feedback"]
-    assert isinstance(feedback, dict)
-    grounding_issues = feedback["grounding_issues"]
-    assert isinstance(grounding_issues, list)
-    assert grounding_issues[0]["code"] == "path_prefix_mismatch"
+    # Plan is generated once; execution fails because MarkdownBlueprintReasoner's
+    # create_tool_step() patches routes.py but the drifted plan only allows storage/base.py.
+    assert result.status == TaskStatus.FAILED
+    assert reasoner.plan_calls == 1
 
 
 @pytest.mark.asyncio

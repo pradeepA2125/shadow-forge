@@ -125,53 +125,47 @@ class SpecFirstReasoner:
         history: list,
         tool_definitions: list,
     ) -> dict:
-        _ = (plan_context, history, tool_definitions)
+        _ = (history, tool_definitions)
+        initial_context = plan_context.get("initial_context", {})
+        feedback = initial_context.get("plan_feedback")
+        if isinstance(feedback, str) and feedback.strip():
+            self.markdown_feedbacks.append(feedback)
+            return {
+                "type": "emit_plan",
+                "thought": "revised with feedback",
+                "plan_markdown": f"# Revised Plan\n\n- {feedback}",
+                "files_examined": [],
+                "confidence": "high",
+            }
+        self.markdown_feedbacks.append(None)
         return {
             "type": "emit_plan",
             "thought": "stub: planning agent bypassed",
-            "plan_markdown": "# Stub Plan\n\n- Review generated changes",
+            "plan_markdown": "# Initial Plan\n\n- Create generated file",
             "files_examined": [],
             "confidence": "high",
         }
 
 
 class AutoCritiqueReasoner(SpecFirstReasoner):
-    def __init__(self) -> None:
-        super().__init__()
-        self.markdown_calls = 0
+    # The auto-critique loop (create_markdown_plan → critique_markdown_plan → revise)
+    # is replaced by the PlanningAgent's explore-then-commit loop. The agent is
+    # expected to produce the correct plan in one shot via create_planning_step().
 
-    async def create_markdown_plan(
+    async def create_planning_step(
         self,
-        task: TaskRecord,
-        workspace_path: str,
-        retrieval_context: dict[str, object],
-    ) -> str:
-        _ = (task, workspace_path, retrieval_context)
-        self.markdown_calls += 1
-        if self.markdown_calls == 1:
-            return "# Draft Plan\n\n- Update `agentd/api/tasks.py`"
-        return "# Revised Plan\n\n- Update `services/agentd-py/agentd/api/routes.py`"
-
-    async def critique_markdown_plan(
-        self,
-        task: TaskRecord,
-        workspace_path: str,
-        retrieval_context: dict[str, object],
-        plan_markdown: str,
-    ) -> object:
-        _ = (task, workspace_path, retrieval_context)
-        if "agentd/api/tasks.py" in plan_markdown:
-            return {
-                "verdict": "revise",
-                "issues": [
-                    {
-                        "code": "invented_file",
-                        "message": "Use the existing routes file instead of inventing agentd/api/tasks.py.",
-                        "file": "agentd/api/tasks.py",
-                    }
-                ],
-            }
-        return {"verdict": "pass", "issues": []}
+        plan_context: dict,
+        history: list,
+        tool_definitions: list,
+    ) -> dict:
+        _ = (plan_context, history, tool_definitions)
+        return {
+            "type": "emit_plan",
+            "thought": "planning agent explored workspace and identified correct file",
+            "plan_markdown": "# Revised Plan\n\n- Update `services/agentd-py/agentd/api/routes.py`",
+            "files_examined": ["services/agentd-py/agentd/api/routes.py"],
+            "confidence": "high",
+        }
 
 
 class AlwaysPassValidator:
@@ -344,7 +338,6 @@ async def test_create_task_auto_critiques_markdown_before_approval(tmp_path: Pat
         task_id = response.json()["task_id"]
         payload = await _wait_for_status(client, task_id, "AWAITING_PLAN_APPROVAL")
 
-    assert reasoner.markdown_calls == 2
     assert payload["plan_markdown"] == "# Revised Plan\n\n- Update `services/agentd-py/agentd/api/routes.py`"
 
 
