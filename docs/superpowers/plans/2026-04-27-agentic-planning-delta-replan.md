@@ -26,8 +26,8 @@
 ### Modified files
 | File | Change |
 |------|--------|
-| `agentd/domain/models.py` | Add 6 new models, extend `TaskBudget`/`TaskRecord`, add `AWAITING_DELTA_REPLAN_APPROVAL` status |
-| `agentd/domain/state_machine.py` | Add transitions for `AWAITING_DELTA_REPLAN_APPROVAL` |
+| `agentd/domain/models.py` | Add 6 new models, extend `TaskBudget`/`TaskRecord` |
+| `agentd/domain/state_machine.py` | No change required |
 | `agentd/reasoning/tool_prompts.py` | Add `revision_needed` to execution agent schema |
 | `agentd/reasoning/contracts.py` | Add `create_planning_step()` to `ReasoningEngine` protocol |
 | `agentd/reasoning/engine.py` | Implement `create_planning_step()` |
@@ -38,12 +38,11 @@
 
 ---
 
-## Task 1: Domain models — new types and status
+## Task 1: Domain models — new types
 
 **Files:**
 - Modify: `agentd/domain/models.py`
-- Modify: `agentd/domain/state_machine.py`
-- Test: `tests/test_state_machine.py` (extend existing)
+- Test: `tests/test_planning_domain_models.py` (new)
 
 - [ ] **Step 1: Write failing tests for new domain types**
 
@@ -82,8 +81,17 @@ def test_revised_step_model():
     assert rs.risk == "low"
     assert rs.edge_cases == ""
 
-def test_awaiting_delta_replan_approval_is_valid_status():
-    assert TaskStatus.AWAITING_DELTA_REPLAN_APPROVAL == "AWAITING_DELTA_REPLAN_APPROVAL"
+def test_delta_replan_request_fields():
+    from datetime import datetime, timezone
+    r = DeltaReplanRequest(
+        requested_by_step_id="s2",
+        reason="wrong file",
+        evidence="grep found it in other.py",
+        hinted_affected_steps=["s3"],
+        requested_at=datetime.now(timezone.utc),
+    )
+    assert r.requested_by_step_id == "s2"
+    assert r.hinted_affected_steps == ["s3"]
 ```
 
 - [ ] **Step 2: Run tests to confirm they fail**
@@ -94,14 +102,7 @@ pytest tests/test_planning_domain_models.py -v 2>&1 | head -30
 ```
 Expected: ImportError or AttributeError — types don't exist yet.
 
-- [ ] **Step 3: Add `AWAITING_DELTA_REPLAN_APPROVAL` to `TaskStatus` in `models.py`**
-
-In `agentd/domain/models.py`, add after `ABORTED = "ABORTED"`:
-```python
-    AWAITING_DELTA_REPLAN_APPROVAL = "AWAITING_DELTA_REPLAN_APPROVAL"
-```
-
-- [ ] **Step 4: Extend `TaskBudget` with three new fields**
+- [ ] **Step 3: Extend `TaskBudget` with three new fields**
 
 Replace the existing `TaskBudget` class:
 ```python
@@ -174,42 +175,18 @@ Add after `checkpoints: list[CheckpointManifest]`:
     execution_state: TaskExecutionState = Field(default_factory=TaskExecutionState)
 ```
 
-- [ ] **Step 9: Add transitions for `AWAITING_DELTA_REPLAN_APPROVAL` in `state_machine.py`**
-
-In `agentd/domain/state_machine.py`, add to `_TRANSITIONS`:
-```python
-    TaskStatus.EXECUTING: {
-        TaskStatus.VALIDATING,
-        TaskStatus.AWAITING_DELTA_REPLAN_APPROVAL,  # add this
-        TaskStatus.FAILED,
-        TaskStatus.ABORTED,
-    },
-    TaskStatus.AWAITING_DELTA_REPLAN_APPROVAL: {
-        TaskStatus.EXECUTING,
-        TaskStatus.FAILED,
-        TaskStatus.ABORTED,
-    },
-```
-
-- [ ] **Step 10: Run tests to confirm they pass**
+- [ ] **Step 9: Run tests to confirm they pass**
 
 ```bash
 pytest tests/test_planning_domain_models.py -v
 ```
 Expected: All 5 tests PASS.
 
-- [ ] **Step 11: Run existing state machine tests to confirm no regressions**
+- [ ] **Step 10: Commit**
 
 ```bash
-pytest tests/test_state_machine.py -v
-```
-Expected: All tests PASS.
-
-- [ ] **Step 12: Commit**
-
-```bash
-git add agentd/domain/models.py agentd/domain/state_machine.py tests/test_planning_domain_models.py
-git commit -m "feat(models): add planning agent domain types and AWAITING_DELTA_REPLAN_APPROVAL status"
+git add agentd/domain/models.py tests/test_planning_domain_models.py
+git commit -m "feat(models): add planning agent domain types — TaskExecutionState, DeltaReplanRequest, PlanningResult, PlanRevisionResult"
 ```
 
 ---
@@ -2697,7 +2674,7 @@ git commit -m "feat(validation): one-step-per-file duplicate target check at JSO
 | ScriptedReasoningEngine stub | Task 7 |
 | TaskBudget extensions (3 fields) | Task 1 |
 | TaskExecutionState + DeltaReplanRequest | Task 1 |
-| AWAITING_DELTA_REPLAN_APPROVAL status + transitions | Task 1 |
+| Delta replan always automatic (no user gate) | Architecture decision — no task needed |
 | revision_needed in execution agent schema | Task 8 |
 | ToolLoop.run() returns StepOutcome | Task 8, 9 |
 | PlanHandoff as first-class return (no exceptions) | Task 8 |

@@ -338,17 +338,9 @@ if isinstance(outcome, PlanHandoff):
     ))
     await self._store.save(task)
 
-    # Optional review gate: task transitions to AWAITING_DELTA_REPLAN_APPROVAL,
-    # VS Code extension polls, shows summary, user calls POST /plan/delta-approve.
-    # Same pattern as AWAITING_PLAN_APPROVAL but shorter-lived.
-    if self._delta_replan_review_mode:
-        task = transition(task, TaskStatus.AWAITING_DELTA_REPLAN_APPROVAL, "delta replan pending review")
-        await self._store.save(task)
-        self._running_tasks.discard(task.task_id)
-        return task  # route handler for delta-approve resumes execution
-
-    # Hand off to planning agent — reads full TaskRecord from store
-    revision = await planning_agent.revise(task, shadow_path)
+    # Hand off to planning agent automatically — no user gate.
+    # Planning agent reads real_path (unmodified workspace); execution continues inline.
+    revision = await planning_agent.revise(task, real_path)
     await self._apply_revision(task, revision, shadow_path)
     # Loop continues — _next_incomplete_step() returns the right step
 
@@ -525,9 +517,8 @@ async def _apply_revision(self, task, revision, shadow_path) -> None:
 | Setting | Type | Default | Effect |
 |---|---|---|---|
 | `aiEditor.jsonPlanReviewMode` | boolean | `false` | Show JSON plan before execution; allow delta edits |
-| `aiEditor.deltaReplanReviewMode` | boolean | `false` | Pause on mid-execution delta replan; ask user to review |
 
-Both flags off by default. Core developers enable them for full visibility.
+Delta replan is always automatic — no user gate. The `delta_replan_applied` SSE event keeps the activity log visible without blocking execution.
 
 ---
 
@@ -552,10 +543,6 @@ Both flags off by default. Core developers enable them for full visibility.
 | `agentd/reasoning/engine.py` | Implement `create_planning_step()` |
 | `agentd/orchestrator/scripted_engine.py` | Add `create_planning_step()` stub |
 | `agentd/orchestrator/engine.py` | Replace `_generate_repo_grounded_markdown_plan()` with `PlanningAgent.generate_plan()`; replace step for-loop with `while _next_incomplete_step()`; add `PlanHandoff` dispatch; add `_apply_revision()` |
-
-## New State Machine Status
-
-`AWAITING_DELTA_REPLAN_APPROVAL` — entered only when `aiEditor.deltaReplanReviewMode = true`. Task pauses mid-execution waiting for user to approve the revision via `POST /v1/tasks/{id}/plan/delta-approve`. On approval, execution resumes from `_apply_revision()`. On rejection, task transitions to `FAILED`. This status is never entered when the flag is off.
 
 ## Deleted
 
@@ -586,7 +573,7 @@ Both flags off by default. Core developers enable them for full visibility.
 6. **No-checkpoint constraint**: Completed step with no checkpoint listed in `reverted_step_ids`. Confirm `_apply_revision()` skips the rollback (checkpoint not found). Plan adapts forward.
 7. **`_next_incomplete_step()` drives the loop**: Confirm step loop re-executes reverted steps without any explicit restart signal.
 8. **Max delta replans guard**: Set `max_delta_replans = 1`, trigger two delta replans. Confirm second triggers `FAILED` with clear diagnostic.
-9. **`aiEditor.deltaReplanReviewMode = true`**: Confirm task pauses at delta replan, VS Code shows revision summary, execution resumes after user approval.
+9. **Automatic delta replan**: Confirm delta replan fires inline without user intervention. `delta_replan_applied` SSE event appears in the activity log with `revised_steps` and `summary`.
 10. **`aiEditor.jsonPlanReviewMode = true`**: Confirm VS Code shows JSON plan after markdown approval, allows step edits, then starts execution on confirm.
 11. **Deleted code paths removed**: Confirm `critique_markdown_plan`, `_validate_plan_grounding`, `critique_json_plan` loop are gone. All tests still pass.
 12. **`ScriptedReasoningEngine`**: Confirm `create_planning_step()` stub added; existing tests unaffected.
