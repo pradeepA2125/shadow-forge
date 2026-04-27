@@ -39,6 +39,7 @@ from agentd.domain.models import (
 )
 from agentd.domain.state_machine import assert_budget, bump_usage, transition
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster
+from agentd.tools.loop import PlanHandoff
 from agentd.patch.engine import PatchEngine
 from agentd.reasoning.contracts import ReasoningEngine
 from agentd.retrieval.artifact_client import RetrievalContext
@@ -457,9 +458,7 @@ class AgentOrchestrator:
                     extra={"task_id": task.task_id, "baseline_error_count": len(baseline_errors)},
                 )
 
-            for step in task.plan.steps:
-                if step.id in task.completed_step_ids:
-                    continue
+            while (step := self._next_incomplete_step(task)) is not None:
                 step_result = await self._run_step_with_retries(
                     task,
                     step,
@@ -468,6 +467,19 @@ class AgentOrchestrator:
                     persistent_diagnostics,
                     started_at_ms,
                 )
+
+                if isinstance(step_result, PlanHandoff):
+                    # Delta replan: planning agent dispatch added in Task 12.
+                    # For now, fail cleanly so existing tests see a predictable error.
+                    task.diagnostics.append(Diagnostic(
+                        source="orchestrator",
+                        message=f"Delta replan requested by step {step_result.step_id}: {step_result.reason}",
+                        level="error",
+                    ))
+                    task = transition(task, TaskStatus.FAILED, "delta replan not yet wired")
+                    await self._store.save(task)
+                    return task
+
                 self._merge_step_result(task, step_result, persistent_diagnostics)
                 await self._store.save(task)
                 if step_result.outcome != "step_completed":
@@ -664,6 +676,13 @@ class AgentOrchestrator:
         ):
             task.completed_step_ids.append(result.step_id)
 
+    def _next_incomplete_step(self, task: TaskRecord) -> PlanStep | None:
+        """Return the first step in the plan that hasn't been completed."""
+        if task.plan is None:
+            return None
+        completed = set(task.completed_step_ids)
+        return next((s for s in task.plan.steps if s.id not in completed), None)
+
     async def _run_step_with_retries(
         self,
         task: TaskRecord,
@@ -674,7 +693,7 @@ class AgentOrchestrator:
         started_at_ms: int,
         *,
         last_failure: dict[str, object] | None = None,
-    ) -> StepRunResult:
+    ) -> "StepRunResult | PlanHandoff":
         allowed_files = sorted(set(step.target_paths()))
         if not allowed_files:
             allowed_files = [*task.modified_files] or [*task.plan.expected_files]
@@ -754,7 +773,7 @@ class AgentOrchestrator:
 
                 if self._tool_loop_enabled:
                     print("\n[PATCH] Entering Tool-Use Loop (ReAct)...")
-                    from agentd.tools.loop import ToolLoop, build_tool_registry
+                    from agentd.tools.loop import PatchResult, PlanHandoff, ToolLoop, build_tool_registry
                     registry = build_tool_registry(shadow_path, self._retrieval_client)
                     tool_loop = ToolLoop(
                         self._reasoning_engine,
@@ -762,12 +781,20 @@ class AgentOrchestrator:
                         self.broadcaster,
                         task.task_id,
                     )
-                    patch_raw, tool_trace = await tool_loop.run(
+                    step_outcome = await tool_loop.run(
                         step,
                         {**patch_request_context, "plan_markdown": task.plan_markdown},
                         task.budget,
                         task.usage,
                     )
+
+                    if isinstance(step_outcome, PlanHandoff):
+                        self._restore_shadow_checkpoint(shadow_path, checkpoint.checkpoint_path)
+                        task.modified_files = previous_modified_files
+                        return step_outcome
+
+                    patch_raw = step_outcome.patch_document
+                    tool_trace = step_outcome.tool_trace
                     self._write_debug_artifact(
                         task.task_id,
                         "tool-trace",
