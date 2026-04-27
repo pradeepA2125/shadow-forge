@@ -25,6 +25,16 @@ class _DummyReasoningEngine:
     async def create_tool_step(self, step_context, history, tool_definitions):  # type: ignore[no-untyped-def]
         raise RuntimeError("not used in scoring tests")
 
+    async def create_planning_step(self, plan_context, history, tool_definitions):  # type: ignore[no-untyped-def]
+        _ = (plan_context, history, tool_definitions)
+        return {
+            "type": "emit_plan",
+            "thought": "stub: planning agent bypassed",
+            "plan_markdown": "# Stub Plan\n\n- Review generated changes",
+            "files_examined": [],
+            "confidence": "high",
+        }
+
 
 class _DummyValidator:
     async def run(self, workspace_path: str) -> ValidationResult:

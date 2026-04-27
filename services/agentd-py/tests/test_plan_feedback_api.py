@@ -119,6 +119,21 @@ class SpecFirstReasoner:
             ],
         }
 
+    async def create_planning_step(
+        self,
+        plan_context: dict,
+        history: list,
+        tool_definitions: list,
+    ) -> dict:
+        _ = (plan_context, history, tool_definitions)
+        return {
+            "type": "emit_plan",
+            "thought": "stub: planning agent bypassed",
+            "plan_markdown": "# Stub Plan\n\n- Review generated changes",
+            "files_examined": [],
+            "confidence": "high",
+        }
+
 
 class AutoCritiqueReasoner(SpecFirstReasoner):
     def __init__(self) -> None:
