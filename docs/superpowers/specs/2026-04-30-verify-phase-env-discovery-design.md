@@ -129,7 +129,18 @@ class ToolLoop:
     ) -> None: ...
 ```
 
-When transitioning to verify phase, `ToolLoop` creates a second `ToolRegistry` instance with `phase="verify"` to expose `setup_env` and regenerates `tool_defs`. The explore-phase registry (without `setup_env`) is used for all turns before `emit_patch` fires.
+**History is owned by `ToolLoop` — a single `list[dict]` that spans both phases.** Switching phase only changes which `tool_defs` are passed to `create_tool_step()`; the full explore-phase conversation remains visible to the agent in verify phase (useful context for deciding what linter to run).
+
+```python
+explore_tool_defs = registry.definitions(phase="explore")
+verify_tool_defs  = registry.definitions(phase="verify")
+
+# Each iteration picks based on self._phase — same history either way
+tool_defs = explore_tool_defs if self._phase == "explore" else verify_tool_defs
+response = await reasoning.create_tool_step(step_context, history, tool_defs)
+```
+
+No second registry instance needed. `ToolRegistry.definitions()` takes a `phase` argument and omits `setup_env`/`find_binary` when `phase="explore"`.
 
 ---
 
@@ -149,7 +160,9 @@ parameters:
   path (required): relative path to list, e.g. "." or ".venv/bin"
 ```
 
-Returns one line per entry: `file  pytest` or `dir   __pycache__`. Capped at 200 entries. Path traversal rejected (must stay within shadow_root).
+Returns one line per entry: `file  pytest` or `dir   __pycache__`. Capped at 200 entries. Path traversal rejected (must stay within real_workspace_path).
+
+**Read path principle:** `read_file` and `list_directory` in `ToolRegistry` always operate on the real workspace — not the shadow. Shadow is mutable mid-task (incremental patches, checkpoint rollbacks, delta replan revisions); reading from it produces inconsistent state depending on which step has applied. The real workspace is immutable until `PROMOTING` and is the stable read reference for the entire task lifetime. The only exception is `setup_env` (`cwd=shadow_root`), which deliberately reads the dep file the agent just patched — a bounded, intentional read of a specific file the agent authored, not exploratory codebase reading.
 
 ### `setup_env` (new file: `agentd/tools/env.py`)
 
@@ -218,7 +231,14 @@ if binary_name not in allowlist:
     return error
 ```
 
-This allows the agent to use full paths returned by `find_binary` without allowlist bypass.
+Full paths to outside-workspace binaries are intentionally allowed. Test runners
+live wherever the package manager installs them — poetry envs at
+`~/.cache/pypoetry/virtualenvs/`, conda at `/opt/conda/envs/`, pyenv at
+`~/.pyenv/`. Blocking by location would break all non-standard env layouts.
+
+The security boundary remains the binary **name**: the agent can execute
+`/any/path/to/pytest` because `pytest` is allowlisted, but cannot execute
+`/any/path/to/malicious_script` because `malicious_script` is not.
 
 ### `ToolRegistry` constructor change
 
@@ -229,36 +249,36 @@ class ToolRegistry:
         shadow_root: Path,
         real_workspace_path: Path,         # NEW
         semantic_index: object | None = None,
-        phase: Literal["explore", "verify"] = "explore",  # NEW
     ) -> None: ...
+
+def definitions(self, phase: Literal["explore", "verify"] = "explore") -> list[ToolDefinition]:
+    ...  # omits setup_env and find_binary when phase="explore"
 ```
 
-The `phase` parameter gates `setup_env` visibility in `definitions()`.
+`phase` is a parameter on `definitions()`, not the constructor — the same registry instance is used for both phases.
 
 ---
 
-## ShadowWorkspaceManager — Env Symlinks
+## ShadowWorkspaceManager — No Env Symlinks
 
-`prepare()` is extended to symlink pre-existing real workspace envs into the shadow, giving the agent natural visibility into available binaries:
+`prepare()` is **not changed** for env directories. Symlinks were considered but rejected:
 
-```python
-# After shutil.copytree() in prepare():
-for env_dir in (".venv", "venv", "env", "node_modules"):
-    real_env = real_path / env_dir
-    shadow_env = shadow_path / env_dir
-    if real_env.exists() and not shadow_env.exists():
-        shadow_env.symlink_to(real_env)
+A hardcoded list like `(".venv", "venv", "env", "node_modules")` only covers standard layouts and misses poetry (`~/.cache/pypoetry/virtualenvs/`), pipenv (`~/.local/share/virtualenvs/`), conda, pyenv, and any custom path. There is no reliable way to enumerate which directories are env dirs without guessing.
+
+`find_binary` already handles all layouts uniformly:
+1. `which {name}` — catches system PATH, pyenv shims, conda activations
+2. `find {real_workspace} -name {name} -maxdepth 6 -type f` — catches local `.venv/`, `venv/`, and non-standard paths
+
+The agent flow is consistent regardless of env layout:
+
+```
+run_command pytest tests/...        →  "not found" (shadow has no .venv)
+find_binary pytest                  →  /real/workspace/.venv/bin/pytest
+                                        (or ~/.cache/pypoetry/.../bin/pytest)
+run_command /full/path/pytest ...   →  works
 ```
 
-Effect:
-- `list_directory(".venv/bin")` → agent sees real workspace's installed binaries
-- If binary exists → agent skips `setup_env`
-- If binary missing → agent calls `setup_env` → installs to real workspace → symlink reflects update automatically
-- `run_command {shadow}/.venv/bin/pytest` → resolves through symlink to real binary
-
-**Fallback for freshly-created envs** (no symlink at prepare time): `find_binary` searches the real workspace and returns the full path. Agent uses full path in `run_command`.
-
-Promote is unaffected — it only copies `task.modified_files`, never `.venv` or `node_modules`.
+One extra LLM call compared to a symlink shortcut — a worthwhile trade for correctness across all env layouts. `ShadowWorkspaceManager` requires no changes.
 
 ---
 
@@ -414,21 +434,56 @@ Concrete example (Python/uv, pytest missing):
   verify_done verified=true test_output="1 passed"
 ```
 
-### Phase transition message injected into history
+### Phase transition — history + instruction mechanics
 
-When ToolLoop transitions to verify phase after successful `emit_patch`:
+When the agent emits `emit_patch`, `ToolLoop` does NOT return. It appends two
+entries to the shared `history` list and continues the loop:
 
 ```python
+# 1. Record agent's emit_patch as assistant turn
+history.append({"role": "assistant", "content": json.dumps(response)})
+
+# 2a. Patch failed — stay in explore phase, agent sees error and corrects
+if result.is_error:
+    history.append({
+        "role": "tool_result",
+        "tool": "_patch_apply",
+        "content": f"Patch FAILED: {result.error}\nFix your search strings and re-emit.",
+    })
+    continue
+
+# 2b. Patch succeeded — transition to verify phase
+self._phase = "verify"
 history.append({
-    "role": "system",
+    "role": "tool_result",
+    "tool": "_patch_apply",
     "content": (
         "Patch applied successfully.\n"
-        "You are now in VERIFY phase.\n"
-        f"test_command hint: {step.test_command or '(none — emit verify_done immediately)'}\n"
-        "Run linters and tests. Emit verify_done when all checks pass, "
-        "or emit_patch again to correct failures."
-    )
+        "VERIFY PHASE: run linters then tests.\n"
+        f"test_command hint: {step.test_command}\n"
+        "Emit verify_done when all checks pass, or emit_patch again to correct."
+    ),
 })
+continue   # next iteration uses verify_tool_defs; same history carries all explore turns
+```
+
+The `instruction` field in `build_tool_step_payload` also reflects the phase —
+`ToolLoop` passes `phase=self._phase` each iteration:
+
+```python
+def build_tool_step_payload(step_context, history, phase="explore"):
+    if history:
+        payload["instruction"] = (
+            "Continue verifying. Run checks and emit verify_done when all pass."
+            if phase == "verify"
+            else "Continue exploring. Emit patch when confident."
+        )
+    else:
+        payload["instruction"] = "Start gathering context. Output your first action."
+```
+
+The full explore-phase conversation remains in `history` during verify — the agent
+sees every tool call it made before patching, which informs which linter to run.
 ```
 
 ---
@@ -443,7 +498,6 @@ history.append({
 | `agentd/tools/registry.py` | Add `real_workspace_path`, `phase` param; add `list_directory`, `setup_env`, `find_binary`; update `run_command` allowlist check to basename |
 | `agentd/tools/files.py` | Extract `list_directory` implementation (shared with PlanningToolRegistry) |
 | `agentd/tools/env.py` | New — `setup_env` and `find_binary` implementations |
-| `agentd/workspace/shadow.py` | Symlink `.venv`, `venv`, `env`, `node_modules` in `prepare()` |
 | `agentd/orchestrator/engine.py` | Remove 5 validation methods; checkpoint before `tool_loop.run()`; handle `VerifyResult \| PlanHandoff`; pass `patch_engine` + `shadow_path` to `ToolLoop`; pass `real_workspace_path` to `ToolRegistry` |
 | `agentd/planning/registry.py` | Use shared `list_directory` from `tools/files.py` |
 
@@ -456,7 +510,7 @@ history.append({
 1. **Binary already present** — task on pydantic workspace (has `.venv` + pytest): agent calls `list_directory(".venv/bin")` via symlink, sees pytest, skips `setup_env`, runs tests directly.
 2. **Binary missing, declared** — bare workspace with `pyproject.toml` listing pytest but no `.venv`: agent detects `uv.lock`, calls `setup_env "uv sync"`, `find_binary pytest` finds it, tests run.
 3. **Binary missing, undeclared** — workspace with no pytest in `pyproject.toml`: agent adds it via correction patch, calls `setup_env "uv sync"`, tests run.
-4. **Non-standard venv path** — env at `venv/` not `.venv/`: symlink created for both; `find_binary` finds binary regardless.
+4. **Non-standard venv path** — env at `venv/` not `.venv/`, or poetry global env: `find_binary pytest` locates it via `find` or `which`; agent uses full path.
 5. **Node workspace** — `package-lock.json` present: agent detects npm, calls `setup_env "npm ci"`, `find_binary vitest` returns path, tests run.
 6. **Rust** — `cargo` always on PATH: agent skips `setup_env`, runs `cargo check` + `cargo test` directly.
 7. **Verify budget exhausted** — agent runs 4 verify calls without passing: returns `VerifyResult(verified=False)`; engine retries with test output as `last_failure`.

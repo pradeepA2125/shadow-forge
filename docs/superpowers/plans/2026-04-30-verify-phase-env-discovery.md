@@ -398,7 +398,7 @@ async def test_list_directory_shows_files(tmp_path: Path) -> None:
     (tmp_path / "bar.txt").write_text("hello")
     (tmp_path / "subdir").mkdir()
 
-    result = await list_directory(path=".", shadow_root=tmp_path)
+    result = await list_directory(path=".", root=tmp_path)
     assert not result.is_error
     assert "foo.py" in result.output
     assert "bar.txt" in result.output
@@ -407,14 +407,14 @@ async def test_list_directory_shows_files(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_list_directory_rejects_traversal(tmp_path: Path) -> None:
-    result = await list_directory(path="../../etc", shadow_root=tmp_path)
+    result = await list_directory(path="../../etc", root=tmp_path)
     assert result.is_error
     assert "traversal" in result.output.lower()
 
 
 @pytest.mark.asyncio
 async def test_list_directory_missing_path(tmp_path: Path) -> None:
-    result = await list_directory(path="nonexistent_dir", shadow_root=tmp_path)
+    result = await list_directory(path="nonexistent_dir", root=tmp_path)
     assert result.is_error
 ```
 
@@ -431,17 +431,17 @@ Expected: `ImportError` — `list_directory` not in `tools/files.py` yet.
 Append to the end of `agentd/tools/files.py`:
 
 ```python
-async def list_directory(*, path: str, shadow_root: Path) -> ToolOutput:
-    """List files and directories at path within shadow_root.
+async def list_directory(*, path: str, root: Path) -> ToolOutput:
+    """List files and directories at path within root.
 
     Returns one entry per line: 'file  <name>' or 'dir   <name>'.
     Capped at 200 entries. Path traversal rejected.
     """
     from agentd.tools.registry import ToolOutput  # local import avoids circular
 
-    resolved = (shadow_root / path).resolve()
+    resolved = (root / path).resolve()
     try:
-        resolved.relative_to(shadow_root.resolve())
+        resolved.relative_to(root.resolve())
     except ValueError:
         return ToolOutput(output="Error: path traversal rejected", is_error=True)
 
@@ -490,7 +490,7 @@ if name == "list_directory":
     from agentd.tools.files import list_directory
     return await list_directory(
         path=str(args.get("path", ".")),
-        shadow_root=self._real_path,
+        root=self._real_path,
     )
 ```
 
@@ -766,14 +766,14 @@ async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
             path=str(args.get("path", "")),
             start_line=int(start) if start is not None else None,  # type: ignore[call-overload]
             end_line=int(end) if end is not None else None,  # type: ignore[call-overload]
-            shadow_root=self._shadow_root,
+            shadow_root=self._real_workspace_path,
         )
 
     if name == "list_directory":
         from agentd.tools.files import list_directory
         return await list_directory(
             path=str(args.get("path", ".")),
-            shadow_root=self._shadow_root,
+            root=self._real_workspace_path,
         )
 
     if name == "run_command":
