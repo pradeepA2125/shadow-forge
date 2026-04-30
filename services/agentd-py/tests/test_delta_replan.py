@@ -56,9 +56,6 @@ class RevisionNeededEngine:
 
     async def create_planning_step(self, *a, **kw): return {}
     async def create_plan(self, *a, **kw): return {}
-    async def create_markdown_plan(self, *a, **kw): return ""
-    async def critique_markdown_plan(self, *a, **kw): return {"verdict": "pass", "issues": []}
-    async def critique_json_plan(self, *a, **kw): return {"verdict": "pass", "issues": []}
     async def create_patch(self, *a, **kw): return {}
 
 
@@ -72,7 +69,7 @@ async def test_tool_loop_returns_plan_handoff_on_revision_needed(tmp_path: Path)
     )
     loop = ToolLoop(
         reasoning_engine=RevisionNeededEngine(),
-        registry=ToolRegistry(shadow_root=tmp_path),
+        registry=ToolRegistry(shadow_root=tmp_path, real_workspace_path=tmp_path),
         broadcaster=PatchEventBroadcaster(),
         task_id="t1",
     )
@@ -184,9 +181,6 @@ class DeltaReplanReasoner:
             "affected_steps": [],
         }
 
-    async def create_markdown_plan(self, *a, **kw): return ""
-    async def critique_markdown_plan(self, *a, **kw): return {"verdict": "pass", "issues": []}
-    async def critique_json_plan(self, *a, **kw): return {"verdict": "pass", "issues": []}
     async def create_patch(self, *a, **kw): return {}
 
 

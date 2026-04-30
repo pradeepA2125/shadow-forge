@@ -18,14 +18,16 @@ async def run_command(
     shadow_root: Path,
     allowlist: set[str],
     timeout_sec: int = _DEFAULT_TIMEOUT_SEC,
+    binary_name_override: str | None = None,
 ) -> ToolOutput:
     if not command:
         return ToolOutput(output="Error: command is required", is_error=True)
 
-    if command not in allowlist:
+    check_name = binary_name_override or command
+    if check_name not in allowlist:
         return ToolOutput(
             output=(
-                f"Error: '{command}' is not in the shell allowlist. "
+                f"Error: '{check_name}' is not in the shell allowlist. "
                 f"Allowed: {', '.join(sorted(allowlist))}"
             ),
             is_error=True,

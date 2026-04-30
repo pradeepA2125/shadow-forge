@@ -247,7 +247,12 @@ class ToolLoop:
 def build_tool_registry(
     shadow_root: Path,
     retrieval_client: object | None = None,
+    real_workspace_path: Path | None = None,
 ) -> ToolRegistry:
     """Construct a ToolRegistry for a step, extracting the semantic index if available."""
     semantic_index = getattr(retrieval_client, "_semantic_index", None)
-    return ToolRegistry(shadow_root=shadow_root, semantic_index=semantic_index)
+    return ToolRegistry(
+        shadow_root=shadow_root,
+        real_workspace_path=real_workspace_path or shadow_root,
+        semantic_index=semantic_index,
+    )
