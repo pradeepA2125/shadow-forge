@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -65,6 +66,14 @@ def _validate_no_duplicate_file_targets_engine(steps: list[dict]) -> list[str]:
             else:
                 seen[path] = step_id
     return errors
+
+
+def _merge_validation_results(a: "ValidationResult", b: "ValidationResult") -> "ValidationResult":
+    return ValidationResult(
+        success=a.success and b.success,
+        diagnostics=[*a.diagnostics, *b.diagnostics],
+        duration_ms=max(a.duration_ms, b.duration_ms),
+    )
 
 
 @dataclass(frozen=True)
@@ -753,6 +762,22 @@ class AgentOrchestrator:
         max_files = max(1, min(task.budget.max_files_touched, len(allowed_files)))
         max_ops = max(1, min(12, max_files * 3))
         allowed_files_set = set(allowed_files)
+
+        # Preflight gate for test_command: null it out if the referenced test file doesn't
+        # exist in the shadow workspace and isn't a new target being created in this step.
+        effective_test_command: str | None = step.test_command
+        if effective_test_command:
+            test_path = self._extract_path_from_test_command(effective_test_command)
+            if test_path is not None:
+                step_target_paths = {t.path for t in step.targets}
+                if test_path not in step_target_paths and not (shadow_path / test_path).exists():
+                    logger.warning(
+                        "test_command references non-existent path not in step targets; skipping",
+                        extra={"task_id": task.task_id, "step_id": step.id, "test_path": test_path},
+                    )
+                    print(f"[WARN] test_command path '{test_path}' not found in shadow; skipping for step {step.id}")
+                    effective_test_command = None
+
         trace_entries: list[StepExecutionTrace] = []
         checkpoints: list[CheckpointManifest] = []
         last_result_diagnostics: list[Diagnostic] = [*persistent_diagnostics]
@@ -829,8 +854,12 @@ class AgentOrchestrator:
 
                 if self._tool_loop_enabled:
                     print("\n[PATCH] Entering Tool-Use Loop (ReAct)...")
-                    from agentd.tools.loop import PatchResult, PlanHandoff, ToolLoop, build_tool_registry
-                    registry = build_tool_registry(shadow_path, self._retrieval_client)
+                    from agentd.tools.loop import VerifyResult, PlanHandoff, ToolLoop, build_tool_registry
+                    registry = build_tool_registry(
+                        shadow_path,
+                        self._retrieval_client,
+                        real_workspace_path=Path(task.workspace_path),
+                    )
                     tool_loop = ToolLoop(
                         self._reasoning_engine,
                         registry,
@@ -1003,7 +1032,15 @@ class AgentOrchestrator:
                 )
                 
                 print(f"[VALIDATE] Running fast validation on {len(touched)} files...")
-                validation = await self._run_fast_validation(str(shadow_path), touched)
+                if effective_test_command:
+                    print(f"[VALIDATE] Running test command in parallel: {effective_test_command}")
+                    fast_v, test_v = await asyncio.gather(
+                        self._run_fast_validation(str(shadow_path), touched),
+                        self._run_step_test_command(shadow_path, effective_test_command, task.workspace_path),
+                    )
+                    validation = _merge_validation_results(fast_v, test_v)
+                else:
+                    validation = await self._run_fast_validation(str(shadow_path), touched)
                 validation_path = self._write_debug_artifact(
                     task.task_id,
                     "validation-selected",
@@ -1269,6 +1306,148 @@ class AgentOrchestrator:
             diagnostics=diagnostics,
             duration_ms=0,
         )
+
+    @staticmethod
+    def _extract_path_from_test_command(command: str) -> str | None:
+        """Return the test file path embedded in a test_command string, or None if not identifiable.
+
+        Handles pytest/jest/vitest where the file path is a positional argument.
+        Returns None for cargo/npm test (no file path to validate in those commands).
+        """
+        parts = command.strip().split()
+        if not parts:
+            return None
+        runner = parts[0]
+        if runner == "pytest" and len(parts) > 1:
+            # pytest tests/test_auth.py::TestClass::test_name -> tests/test_auth.py
+            # skip leading flags
+            for part in parts[1:]:
+                if not part.startswith("-"):
+                    return part.split("::")[0]
+        if runner in ("jest", "vitest") and len(parts) > 1:
+            for part in parts[1:]:
+                if not part.startswith("-"):
+                    return part.split("::")[0]
+        return None
+
+    @staticmethod
+    def _build_test_env(shadow_path: Path, real_workspace_path: str) -> dict[str, str]:
+        """Return an env dict with project venv / node_modules injected into PATH.
+
+        Search order (first match wins per runtime):
+          • <shadow>/.venv/bin  — Python venv inside the shadow copy
+          • <real_workspace>/.venv/bin  — Python venv in the original workspace
+          • <shadow>/venv/bin, <real_workspace>/venv/bin  — alternate venv names
+          • <shadow>/node_modules/.bin  — Node tools (jest, vitest, tsc, eslint)
+        All existing directories are prepended so the project's binaries take priority
+        over system PATH.
+        """
+        env = os.environ.copy()
+        real = Path(real_workspace_path)
+        candidates = [
+            shadow_path / ".venv" / "bin",
+            real / ".venv" / "bin",
+            shadow_path / "venv" / "bin",
+            real / "venv" / "bin",
+            shadow_path / "node_modules" / ".bin",
+            real / "node_modules" / ".bin",
+        ]
+        extra = [str(p) for p in candidates if p.is_dir()]
+        if extra:
+            env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
+        return env
+
+    async def _run_step_test_command(
+        self,
+        shadow_path: Path,
+        test_command: str,
+        real_workspace_path: str,
+    ) -> ValidationResult:
+        """Execute test_command inside the shadow workspace with venv-aware PATH.
+
+        Failure semantics:
+          • command not found (FileNotFoundError) → warning, step not blocked
+          • non-zero exit code → hard error, step fails and retries with this output
+        """
+        parts = test_command.strip().split()
+        if not parts:
+            return ValidationResult(success=True, diagnostics=[], duration_ms=0)
+        cmd, args = parts[0], parts[1:]
+
+        allowlist_raw = os.environ.get(
+            "AI_EDITOR_SHELL_ALLOWLIST",
+            "pytest,npm,cargo,ruff,mypy,tsc,eslint,jest,vitest",
+        )
+        allowlist = {c.strip() for c in allowlist_raw.split(",") if c.strip()}
+        if cmd not in allowlist:
+            return ValidationResult(
+                success=True,
+                diagnostics=[
+                    Diagnostic(
+                        source=f"test_command:{cmd}",
+                        message=f"[skipped — '{cmd}' not in shell allowlist]",
+                        level="warning",
+                    )
+                ],
+                duration_ms=0,
+            )
+
+        env = self._build_test_env(shadow_path, real_workspace_path)
+        start_ms = int(time.time() * 1000)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cmd,
+                *args,
+                cwd=str(shadow_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            return ValidationResult(
+                success=False,
+                diagnostics=[
+                    Diagnostic(
+                        source=f"test_command:{cmd}",
+                        message=f"test_command timed out after 120s: {test_command}",
+                        level="error",
+                    )
+                ],
+                duration_ms=120_000,
+            )
+        except FileNotFoundError:
+            # Not on PATH even after venv injection — infra issue, don't block the step.
+            logger.warning("test_command binary not found: %s", cmd)
+            return ValidationResult(
+                success=True,
+                diagnostics=[
+                    Diagnostic(
+                        source=f"test_command:{cmd}",
+                        message=f"[skipped — '{cmd}' not found on PATH]",
+                        level="warning",
+                    )
+                ],
+                duration_ms=0,
+            )
+
+        duration_ms = int(time.time() * 1000) - start_ms
+        output = stdout.decode("utf-8", errors="replace")
+        exit_code = proc.returncode or 0
+        print(f"[TEST] {cmd} exit={exit_code} ({duration_ms}ms)")
+        if exit_code != 0:
+            return ValidationResult(
+                success=False,
+                diagnostics=[
+                    Diagnostic(
+                        source=f"test_command:{cmd}",
+                        message=f"exit {exit_code}\n{output[:2000]}",
+                        level="error",
+                    )
+                ],
+                duration_ms=duration_ms,
+            )
+        return ValidationResult(success=True, diagnostics=[], duration_ms=duration_ms)
 
     def _collect_file_contents(self, shadow_path: Path, allowed_files: list[str]) -> dict[str, str]:
         contents: dict[str, str] = {}
