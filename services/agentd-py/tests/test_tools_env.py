@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agentd.tools.env import find_binary, setup_env
+from agentd.tools.files import list_directory
 from agentd.tools.registry import ToolOutput
 
 
@@ -79,3 +80,29 @@ async def test_setup_env_uv_uses_shadow_cwd(tmp_path: Path, monkeypatch: pytest.
     call = calls[0]
     assert call["cwd"] == str(shadow)
     assert call["env"].get("UV_PROJECT_ENVIRONMENT") == str(real / ".venv")
+
+
+@pytest.mark.asyncio
+async def test_list_directory_shows_files(tmp_path: Path) -> None:
+    (tmp_path / "foo.py").write_text("x = 1")
+    (tmp_path / "bar.txt").write_text("hello")
+    (tmp_path / "subdir").mkdir()
+
+    result = await list_directory(path=".", root=tmp_path)
+    assert not result.is_error
+    assert "foo.py" in result.output
+    assert "bar.txt" in result.output
+    assert "subdir" in result.output
+
+
+@pytest.mark.asyncio
+async def test_list_directory_rejects_traversal(tmp_path: Path) -> None:
+    result = await list_directory(path="../../etc", root=tmp_path)
+    assert result.is_error
+    assert "traversal" in result.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_list_directory_missing_path(tmp_path: Path) -> None:
+    result = await list_directory(path="nonexistent_dir", root=tmp_path)
+    assert result.is_error

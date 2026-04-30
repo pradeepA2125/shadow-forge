@@ -65,3 +65,33 @@ async def read_file(
         result = result[:_MAX_OUTPUT_CHARS] + "\n... (truncated)"
 
     return ToolOutput(output=result)
+
+
+async def list_directory(*, path: str, root: Path) -> ToolOutput:
+    """List files and directories at path within root.
+
+    Returns one entry per line: 'file  <name>' or 'dir   <name>'.
+    Capped at 200 entries. Path traversal rejected.
+    """
+    resolved = (root / path).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        return ToolOutput(output="Error: path traversal rejected", is_error=True)
+
+    if not resolved.exists():
+        return ToolOutput(output=f"Error: '{path}' does not exist", is_error=True)
+
+    if not resolved.is_dir():
+        return ToolOutput(output=f"Error: '{path}' is not a directory", is_error=True)
+
+    entries = sorted(resolved.iterdir(), key=lambda p: (p.is_file(), p.name))
+    lines: list[str] = []
+    for entry in entries[:200]:
+        kind = "file " if entry.is_file() else "dir  "
+        lines.append(f"{kind}  {entry.name}")
+
+    if not lines:
+        return ToolOutput(output=f"(empty directory: {path})")
+
+    return ToolOutput(output=f"Contents of {path}:\n" + "\n".join(lines))

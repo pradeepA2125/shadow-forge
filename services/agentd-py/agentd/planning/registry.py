@@ -35,7 +35,7 @@ class PlanningToolRegistry:
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex or literal pattern"},
-                        "path_filter": {"type": "string", "description": "Glob to restrict search (e.g. '*.py')"},
+                        "path_filter": {"type": "string", "description": "Glob to restrict search (e.g. '*.py', '*.ts', '*.rs')"},
                         "context_lines": {"type": "integer", "description": "Lines of context (default 3)"},
                         "fixed_strings": {"type": "boolean", "description": "Treat as literal string (default false)"},
                     },
@@ -114,9 +114,10 @@ class PlanningToolRegistry:
             )
 
         if name == "list_directory":
-            return await self._list_directory(
+            from agentd.tools.files import list_directory
+            return await list_directory(
                 path=str(args.get("path", ".")),
-                depth=int(args.get("depth", 2)),  # type: ignore[call-overload]
+                root=self._real_path,
             )
 
         if name == "search_semantic":
