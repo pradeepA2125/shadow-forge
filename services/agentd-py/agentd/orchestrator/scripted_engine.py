@@ -4,10 +4,27 @@ from agentd.domain.models import Diagnostic, PlanStep, TaskRecord
 
 
 class ScriptedReasoningEngine:
-    def __init__(self, plan: object, patches: list[object]) -> None:
+    """Deterministic reasoning engine for tests.
+
+    - ``patches``: patch documents returned by ``create_patch`` and by
+      ``create_tool_step`` (when ``tool_step_responses`` is not set).
+    - ``tool_step_responses``: ordered list of raw dicts returned one-at-a-time
+      by ``create_tool_step``.  Use this to script multi-turn ReAct loops that
+      include ``tool_call``, ``emit_patch``, ``verify_done``, etc.  When the list
+      is exhausted, the last element is repeated.
+    """
+
+    def __init__(
+        self,
+        plan: object,
+        patches: list[object],
+        tool_step_responses: list[dict[str, object]] | None = None,
+    ) -> None:
         self._plan = plan
         self._patches = patches
         self._patch_index = 0
+        self._tool_step_responses: list[dict[str, object]] = tool_step_responses or []
+        self._tool_step_index = 0
 
     async def create_plan(
         self,
@@ -17,35 +34,6 @@ class ScriptedReasoningEngine:
     ) -> object:
         _ = (task, workspace_path, retrieval_context)
         return self._plan
-
-    async def create_markdown_plan(
-        self,
-        task: TaskRecord,
-        workspace_path: str,
-        retrieval_context: dict[str, object],
-    ) -> str:
-        _ = (task, workspace_path, retrieval_context)
-        return "# Scripted Plan\n\n- Review generated changes"
-
-    async def critique_markdown_plan(
-        self,
-        task: TaskRecord,
-        workspace_path: str,
-        retrieval_context: dict[str, object],
-        plan_markdown: str,
-    ) -> object:
-        _ = (task, workspace_path, retrieval_context, plan_markdown)
-        return {"verdict": "pass", "issues": []}
-
-    async def critique_json_plan(
-        self,
-        task: TaskRecord,
-        workspace_path: str,
-        retrieval_context: dict[str, object],
-        candidate_plan: dict[str, object],
-    ) -> object:
-        _ = (task, workspace_path, retrieval_context, candidate_plan)
-        return {"verdict": "pass", "issues": []}
 
     async def create_patch(
         self,
@@ -87,6 +75,14 @@ class ScriptedReasoningEngine:
         tool_definitions: list[dict[str, object]],
     ) -> dict[str, object]:
         _ = (step_context, history, tool_definitions)
+
+        # Prefer explicit tool_step_responses when configured
+        if self._tool_step_responses:
+            index = min(self._tool_step_index, len(self._tool_step_responses) - 1)
+            self._tool_step_index += 1
+            return self._tool_step_responses[index]
+
+        # Fallback: unwrap the next patch document into an emit_patch response
         if not self._patches:
             raise RuntimeError("ScriptedReasoningEngine has no patch payloads configured")
 
