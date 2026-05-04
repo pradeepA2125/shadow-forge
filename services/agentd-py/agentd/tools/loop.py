@@ -88,6 +88,7 @@ class ToolLoop:
         verify_calls = 0
         last_patch_document: dict[str, object] = {}
         all_touched_files: list[str] = []
+        last_verify_run_errored: bool = False  # True if last verify-phase run_command failed
 
         retrieval_ctx = patch_request_context.get("retrieval_context") or {}
         if not isinstance(retrieval_ctx, dict):
@@ -126,10 +127,53 @@ class ToolLoop:
 
             # ── verify_done ──────────────────────────────────────────────
             if action_type == "verify_done":
+                # Guard 1: agent must apply a patch before verify_done is valid
+                if phase == "explore":
+                    logger.warning(
+                        "verify_done emitted before any patch was applied (step %s) — pushing back",
+                        step.id, extra={"task_id": self._task_id},
+                    )
+                    history.append({
+                        "role": "assistant",
+                        "content": json.dumps(response, default=str),
+                    })
+                    history.append({
+                        "role": "tool_result", "tool": "_verify_guard",
+                        "content": (
+                            "verify_done is not valid here: no patch has been applied yet. "
+                            "If the change is already present, emit_patch with a no-op "
+                            "(search_replace where search == replace) to enter verify phase, "
+                            "then run the required checks before emitting verify_done."
+                        ),
+                    })
+                    continue
+
+                # Guard 2: claimed verified=True but the last verify-phase run_command failed
+                verified = bool(response.get("verified", False))
+                if verified and last_verify_run_errored:
+                    logger.warning(
+                        "verify_done(verified=True) after failing run_command (step %s)",
+                        step.id, extra={"task_id": self._task_id},
+                    )
+                    history.append({
+                        "role": "assistant",
+                        "content": json.dumps(response, default=str),
+                    })
+                    history.append({
+                        "role": "tool_result", "tool": "_verify_guard",
+                        "content": (
+                            "Cannot claim verified=true: the last run_command exited non-zero. "
+                            "Fix the failure (use setup_env to install missing tools, or "
+                            "correct the code), re-run the check, and emit verify_done "
+                            "only when it passes."
+                        ),
+                    })
+                    continue
+
                 return VerifyResult(
                     patch_document=last_patch_document,
                     touched_files=all_touched_files,
-                    verified=bool(response.get("verified", False)),
+                    verified=verified,
                     test_output=str(response.get("test_output", "")),
                     tool_trace=trace,
                 )
@@ -211,6 +255,7 @@ class ToolLoop:
 
                 # Transition to verify phase
                 phase = "verify"
+                last_verify_run_errored = False
                 history.append({
                     "role": "tool_result", "tool": "_patch_apply",
                     "content": (
@@ -266,6 +311,11 @@ class ToolLoop:
 
             tool_output = await self._registry.execute(tool_name, args)
             usage.tool_calls_used += 1
+
+            # Track verify-phase run_command failures so verify_done(verified=True) can be
+            # rejected if the agent claims pass despite a failing check.
+            if phase == "verify" and tool_name == "run_command":
+                last_verify_run_errored = tool_output.is_error
 
             self._broadcaster.broadcast(self._task_id, {
                 "type": "tool_result", "tool": tool_name,
