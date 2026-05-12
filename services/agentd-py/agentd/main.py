@@ -301,15 +301,28 @@ _chat_thread_store = ChatThreadStore(_chat_db_path)
 
 # workspace_path for ChatAgent — the real repo being edited; defaults to cwd if not set
 _chat_workspace_path = os.getenv("AI_EDITOR_WORKSPACE_PATH", str(Path.cwd()))
-# In the scripted backend, no provider transport exists — skip chat agent wiring.
-_chat_transport = locals().get("transport")
+_BACKEND_MODEL_ENVVAR: dict[str, str] = {
+    "anthropic":   "AI_EDITOR_ANTHROPIC_MODEL",
+    "gemini":      "AI_EDITOR_GEMINI_MODEL",
+    "huggingface": "AI_EDITOR_HUGGINGFACE_MODEL",
+    "groq":        "AI_EDITOR_GROQ_MODEL",
+    "openrouter":  "AI_EDITOR_OPENROUTER_MODEL",
+    "watsonx":     "AI_EDITOR_WATSONX_MODEL",
+    "ollama":      "AI_EDITOR_OLLAMA_MODEL",
+    "openai":      "AI_EDITOR_OPENAI_MODEL",
+}
+_chat_model = os.getenv(
+    _BACKEND_MODEL_ENVVAR.get(reasoning_backend, "AI_EDITOR_OPENAI_MODEL"), "gpt-4o"
+)
+
+# scripted backend has no provider transport — ChatAgent requires a real one
 _chat_agent = ChatAgent(
     workspace_path=_chat_workspace_path,
-    transport=_chat_transport or reasoning_engine,
-    model=os.getenv("AI_EDITOR_GEMINI_MODEL", os.getenv("AI_EDITOR_OPENAI_MODEL", "gpt-4o")),
+    transport=transport,  # type: ignore[possibly-unbound]  # defined for all real backends
+    model=_chat_model,
     thread_store=_chat_thread_store,
     orchestrator=orchestrator,
-) if _chat_transport is not None else None
+) if reasoning_backend != "scripted" else None
 
 app.include_router(build_router(store, orchestrator, workspace_manager, retrieval_client, _chat_agent))
 
