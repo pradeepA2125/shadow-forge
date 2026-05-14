@@ -31,17 +31,17 @@ class ChatThreadStore:
 
     def create_thread(self, workspace_path: str, title: str = "New Chat") -> ChatThread:
         thread_id = f"chat-{uuid.uuid4().hex[:12]}"
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             "INSERT INTO chat_threads (thread_id, workspace_path, title, created_at) VALUES (?, ?, ?, ?)",
-            (thread_id, workspace_path, title, created_at.isoformat()),
+            (thread_id, workspace_path, title, created_at),
         )
         self._conn.commit()
         return ChatThread(
             thread_id=thread_id,
             workspace_path=workspace_path,
             title=title,
-            created_at=created_at,
+            created_at=datetime.fromisoformat(created_at),
         )
 
     def list_threads(self, workspace_path: str) -> list[ChatThread]:
