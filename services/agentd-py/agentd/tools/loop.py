@@ -226,8 +226,8 @@ class ToolLoop:
                 logger.info("Tool loop revision_needed: %s", reason[:200],
                             extra={"task_id": self._task_id, "step_id": step.id})
                 self._broadcaster.broadcast(self._task_id, {
-                    "type": "revision_needed", "step_id": step.id,
-                    "reason": reason, "evidence": evidence[:300],
+                    "type": "revision_needed",
+                    "payload": {"step_id": step.id, "reason": reason, "evidence": evidence[:300]},
                 })
                 return PlanHandoff(
                     step_id=step.id, reason=reason, evidence=evidence,
@@ -284,8 +284,8 @@ class ToolLoop:
                                         ),
                                     })
                                     self._broadcaster.broadcast(self._task_id, {
-                                        "type": "patch_failed", "step_id": step.id,
-                                        "error": new_err,
+                                        "type": "patch_failed",
+                                        "payload": {"step_id": step.id, "error": new_err},
                                     })
                                     continue
                                 # Patch succeeded after extension — fall through to success path.
@@ -303,8 +303,8 @@ class ToolLoop:
                                     "content": feedback,
                                 })
                                 self._broadcaster.broadcast(self._task_id, {
-                                    "type": "patch_failed", "step_id": step.id,
-                                    "error": error_msg,
+                                    "type": "patch_failed",
+                                    "payload": {"step_id": step.id, "error": error_msg},
                                 })
                                 continue  # stay in explore, agent corrects/revises
                         else:
@@ -317,7 +317,8 @@ class ToolLoop:
                                 "content": feedback,
                             })
                             self._broadcaster.broadcast(self._task_id, {
-                                "type": "patch_failed", "step_id": step.id, "error": error_msg,
+                                "type": "patch_failed",
+                                "payload": {"step_id": step.id, "error": error_msg},
                             })
                             continue  # stay in explore, agent corrects and re-emits
 
@@ -362,8 +363,8 @@ class ToolLoop:
                     ),
                 })
                 self._broadcaster.broadcast(self._task_id, {
-                    "type": "patch_applied", "step_id": step.id,
-                    "phase": "verify", "touched_files": all_touched_files,
+                    "type": "patch_applied",
+                    "payload": {"step_id": step.id, "phase": "verify", "touched_files": all_touched_files},
                 })
                 continue
 
@@ -387,9 +388,12 @@ class ToolLoop:
                             step.id, extra={"task_id": self._task_id},
                         )
                         self._broadcaster.broadcast(self._task_id, {
-                            "type": "revision_needed", "step_id": step.id,
-                            "reason": "Scope violation: required file not in step targets",
-                            "evidence": "Patch rejected for out-of-scope file; agent exhausted budget without emitting revision_needed",  # noqa: E501
+                            "type": "revision_needed",
+                            "payload": {
+                                "step_id": step.id,
+                                "reason": "Scope violation: required file not in step targets",
+                                "evidence": "Patch rejected for out-of-scope file; agent exhausted budget without emitting revision_needed",  # noqa: E501
+                            },
                         })
                         return PlanHandoff(
                             step_id=step.id,
@@ -426,8 +430,8 @@ class ToolLoop:
             args: dict[str, object] = raw_args if isinstance(raw_args, dict) else {}
 
             self._broadcaster.broadcast(self._task_id, {
-                "type": "tool_call", "tool": tool_name,
-                "thought": thought[:300], "iteration": iteration + 1, "phase": phase,
+                "type": "tool_call",
+                "payload": {"tool": tool_name, "thought": thought[:300], "iteration": iteration + 1, "phase": phase},
             })
 
             tool_output = await self._registry.execute(tool_name, args)
@@ -447,9 +451,8 @@ class ToolLoop:
                 last_verify_run_errored = False
 
             self._broadcaster.broadcast(self._task_id, {
-                "type": "tool_result", "tool": tool_name,
-                "output": tool_output.output[:500], "is_error": tool_output.is_error,
-                "iteration": iteration + 1,
+                "type": "tool_result",
+                "payload": {"tool": tool_name, "output": tool_output.output[:500], "is_error": tool_output.is_error, "iteration": iteration + 1},
             })
 
             call_id = f"{step.id}-{uuid4().hex[:8]}"

@@ -1002,7 +1002,7 @@ class PatchEngine:
                     msg = f"Unsupported patch operation type: {type(operation).__name__}"
                     raise RuntimeError(msg)
                 if on_patch_event:
-                    on_patch_event({"type": "operation_success", "op_type": operation.op, "path": operation.file})
+                    on_patch_event({"type": "operation_success", "payload": {"op_type": operation.op, "path": operation.file}})
                 touched.add(operation.file)
                 if is_write and incremental_validator is not None:
                     iv_result = await incremental_validator([operation.file])
@@ -1011,7 +1011,7 @@ class PatchEngine:
                             incremental_errors.append(f"{operation.file}: {diag.message}")
             except Exception as exc:
                 if on_patch_event:
-                    on_patch_event({"type": "operation_error", "op_type": operation.op, "path": operation.file, "error": str(exc)})
+                    on_patch_event({"type": "operation_error", "payload": {"op_type": operation.op, "path": operation.file, "error": str(exc)}})
                 incremental_errors.append(f"{operation.file}: {exc}")
 
         if incremental_errors:

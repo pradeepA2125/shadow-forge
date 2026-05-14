@@ -121,8 +121,7 @@ class PlanningLoop:
                     confidence = "medium"
                 self._broadcaster.broadcast(self._task_id, {
                     "type": "planning_complete",
-                    "files_examined": files_examined,
-                    "confidence": confidence,
+                    "payload": {"files_examined": files_examined, "confidence": confidence},
                 })
                 return PlanningResult(
                     plan_markdown=str(plan_markdown),
@@ -176,19 +175,14 @@ class PlanningLoop:
 
             self._broadcaster.broadcast(self._task_id, {
                 "type": "planning_tool_call",
-                "tool": tool_name,
-                "thought": thought[:300],
-                "iteration": iteration + 1,
+                "payload": {"tool": tool_name, "thought": thought[:300], "iteration": iteration + 1},
             })
 
             tool_output = await self._registry.execute(tool_name, args)
 
             self._broadcaster.broadcast(self._task_id, {
                 "type": "planning_tool_result",
-                "tool": tool_name,
-                "output": tool_output.output[:500],
-                "is_error": tool_output.is_error,
-                "iteration": iteration + 1,
+                "payload": {"tool": tool_name, "output": tool_output.output[:500], "is_error": tool_output.is_error, "iteration": iteration + 1},
             })
 
             call_id = f"plan-{uuid4().hex[:8]}"

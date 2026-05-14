@@ -29,6 +29,10 @@ from agentd.domain.models import (
     PlanRevisionResult,
     PlanStep,
     PlanTargetIntent,
+    ScopeExtensionRequest,
+    ScopePolicy,
+    ScopeRemember,
+    ScopeTrigger,
     StepExecutionTrace,
     StepRunResult,
     TaskMilestoneSnapshot,
@@ -47,10 +51,61 @@ from agentd.retrieval.chunker import ScoredChunk
 from agentd.runtime.adapters import GenericPlanningAdapter, PlanningAdapter
 from agentd.runtime.artifacts import task_artifacts_root
 from agentd.storage.base import TaskStore
-from agentd.tools.loop import PlanHandoff
+from agentd.tools.loop import PlanHandoff, ScopeDecision, ScopeExtensionCallback
 from agentd.workspace.shadow import ShadowWorkspace, ShadowWorkspaceManager
 
 logger = logging.getLogger(__name__)
+
+
+_NEARBY_PATTERN_NAMES: frozenset[str] = frozenset({"__init__.py", "conftest.py"})
+
+
+def _resolve_test_command(
+    revised: object,
+    reverted_steps: list[PlanStep],
+) -> str | None:
+    """Pick the test_command for a revised step.
+
+    Prefer the model's explicit value. Fall back by scanning ALL reverted steps
+    for a test_command that covers a file the revised step also targets. This
+    handles the common delta-replan pattern where multiple steps are collapsed
+    into one: the model writes the new step but omits the test_command that was
+    on one of the steps being replaced.
+    """
+    from agentd.domain.models import RevisedStep
+    assert isinstance(revised, RevisedStep)
+    if revised.test_command:
+        return revised.test_command
+    revised_paths = {t["path"] for t in revised.targets if isinstance(t, dict)}
+    for step in reverted_steps:
+        if step.test_command:
+            original_paths = {t.path for t in step.targets}
+            if revised_paths & original_paths:
+                return step.test_command
+    return None
+
+
+def _is_nearby_file(out_of_scope: str, allowed: list[str]) -> bool:
+    """True iff `out_of_scope` is plausibly within the spirit of the step's scope:
+      - is a conventional Python pattern (__init__.py, conftest.py), OR
+      - shares a parent directory with one of the allowed targets, OR
+      - lives inside a directory listed as an allowed target.
+    """
+    if not allowed:
+        return False
+    out_path = Path(out_of_scope)
+    if out_path.name in _NEARBY_PATTERN_NAMES:
+        return True
+    for t in allowed:
+        t_path = Path(t)
+        if out_path.parent == t_path.parent:
+            return True
+        try:
+            out_path.relative_to(t_path)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _validate_no_duplicate_file_targets_engine(steps: list[dict]) -> list[str]:
@@ -133,6 +188,10 @@ class AgentOrchestrator:
         max_attempts_per_step: int = 3,
         step_scoped_mode: bool = True,
         patch_candidate_count: int = 3,
+        scope_policy: ScopePolicy = ScopePolicy.STRICT,
+        scope_trigger: ScopeTrigger = ScopeTrigger.NEARBY,
+        scope_remember: ScopeRemember = ScopeRemember.TASK,
+        scope_timeout_sec: float = 600.0,
     ) -> None:
         self._store = store
         self._reasoning_engine = reasoning_engine
@@ -146,6 +205,11 @@ class AgentOrchestrator:
         self._patch_candidate_count = max(1, patch_candidate_count)
         self.broadcaster = PatchEventBroadcaster()
         self._running_tasks: set[str] = set()
+        self._scope_policy = scope_policy
+        self._scope_trigger = scope_trigger
+        self._scope_remember = scope_remember
+        self._scope_timeout_sec = max(0.0, scope_timeout_sec)
+        self._pending_scope_decisions: dict[str, asyncio.Future[ScopeDecision]] = {}
         import os
         self._tool_loop_enabled: bool = os.environ.get("AI_EDITOR_TOOL_LOOP_ENABLED", "true") not in ("0", "false", "False")
 
@@ -241,7 +305,7 @@ class AgentOrchestrator:
                 pass
             await self._store.save(task)
             self._running_tasks.discard(task_id)
-            self.broadcaster.broadcast(task_id, {"type": "done"})
+            self.broadcaster.broadcast(task_id, {"type": "done", "payload": {}})
             return task
 
     async def continue_task(self, task_id: str, feedback: str | None = None) -> TaskRecord:
@@ -377,7 +441,7 @@ class AgentOrchestrator:
             task = transition(task, TaskStatus.FAILED, "continuation failed")
             await self._store.save(task)
             self._running_tasks.discard(task_id)
-            self.broadcaster.broadcast(task_id, {"type": "done"})
+            self.broadcaster.broadcast(task_id, {"type": "done", "payload": {}})
             return task
 
     async def resume_task(self, task_id: str) -> TaskRecord:
@@ -410,7 +474,7 @@ class AgentOrchestrator:
             task = transition(task, TaskStatus.FAILED, "resume failed")
             await self._store.save(task)
             self._running_tasks.discard(task_id)
-            self.broadcaster.broadcast(task_id, {"type": "done"})
+            self.broadcaster.broadcast(task_id, {"type": "done", "payload": {}})
             return task
 
     async def _execute_plan(
@@ -608,6 +672,21 @@ class AgentOrchestrator:
                     "excerpt": "\n".join(d.message for d in validation.diagnostics[:10]),
                 },
             )
+            # Repair cannot delta-replan (the plan is already done by this point);
+            # if the agent kept hitting scope violations, fail out cleanly with the
+            # PlanHandoff's evidence rather than crashing in _merge_step_result.
+            if isinstance(repair_result, PlanHandoff):
+                task.diagnostics.append(Diagnostic(
+                    source="orchestrator",
+                    message=(
+                        f"Repair step needs files outside its scope: {repair_result.reason}. "
+                        f"Evidence: {repair_result.evidence}"
+                    ),
+                    level="error",
+                ))
+                task = transition(task, TaskStatus.FAILED, "repair scope violation")
+                await self._store.save(task)
+                return task
             self._merge_step_result(task, repair_result, persistent_diagnostics)
             await self._store.save(task)
             if repair_result.outcome != "step_completed":
@@ -647,7 +726,7 @@ class AgentOrchestrator:
             return task
         finally:
             self._running_tasks.discard(task.task_id)
-            self.broadcaster.broadcast(task.task_id, {"type": "done"})
+            self.broadcaster.broadcast(task.task_id, {"type": "done", "payload": {}})
             if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.ABORTED}:
                 try:
                     await self._workspace_manager.prune_checkpoints()
@@ -656,6 +735,95 @@ class AgentOrchestrator:
                         "Checkpoint pruning failed",
                         extra={"task_id": task.task_id},
                     )
+
+    def _build_scope_callback(
+        self,
+        task_id: str,
+        step_id: str,
+        step: PlanStep,
+    ) -> ScopeExtensionCallback:
+        """Return a scope-extension callback bound to this task + the orchestrator's policy."""
+
+        async def _cb(files: list[str], reason: str) -> ScopeDecision:
+            # Filter against already-approved files from earlier in this task.
+            try:
+                task = await self._store.get(task_id)
+            except KeyError:
+                return ScopeDecision(approve=False, extended_files=[], reason="task missing")
+            already_approved = set(task.execution_state.auto_approved_scope_files)
+            truly_new = [f for f in files if f not in already_approved]
+            if not truly_new:
+                return ScopeDecision(approve=True, extended_files=files)
+
+            # Trigger filter: with `nearby`, gate as long as AT LEAST ONE requested
+            # file is plausibly in-scope (same dir as a target, conventional pattern,
+            # or under a directory-shaped target). The user sees the whole batch and
+            # decides — partial-nearby batches are still worth surfacing.
+            if self._scope_trigger == ScopeTrigger.NEARBY:
+                target_paths = [t.path for t in step.targets]
+                if not any(_is_nearby_file(f, target_paths) for f in truly_new):
+                    return ScopeDecision(
+                        approve=False, extended_files=[], reason="no nearby files in batch",
+                    )
+
+            if self._scope_policy == ScopePolicy.STRICT:
+                return ScopeDecision(approve=False, extended_files=[], reason="strict policy")
+
+            if self._scope_policy == ScopePolicy.AUTO:
+                self._write_debug_artifact(
+                    task_id, "scope-auto-approve",
+                    {"step_id": step_id, "files": truly_new, "reason": reason},
+                    artifacts_root_path=task.artifacts_root_path,
+                )
+                return ScopeDecision(approve=True, extended_files=truly_new)
+
+            # ASK policy — pause + future + broadcast event.
+            decision_id = uuid4().hex
+            future: asyncio.Future[ScopeDecision] = asyncio.get_event_loop().create_future()
+            self._pending_scope_decisions[task_id] = future
+
+            task.execution_state.pending_scope_request = ScopeExtensionRequest(
+                decision_id=decision_id, files=truly_new, reason=reason, step_id=step_id,
+            )
+            try:
+                task = transition(task, TaskStatus.AWAITING_SCOPE_DECISION, "scope gate")
+            except ValueError:
+                # Already in AWAITING_SCOPE_DECISION (re-entrant edge); leave status alone.
+                pass
+            await self._store.save(task)
+            self.broadcaster.broadcast(task_id, {
+                "type": "scope_extension_requested",
+                "payload": {"decision_id": decision_id, "files": truly_new, "reason": reason, "step_id": step_id},
+            })
+
+            decision = ScopeDecision(approve=False, extended_files=[], reason="cancelled")
+            try:
+                if self._scope_timeout_sec > 0:
+                    decision = await asyncio.wait_for(future, timeout=self._scope_timeout_sec)
+                else:
+                    decision = await future
+            except asyncio.TimeoutError:
+                decision = ScopeDecision(approve=False, extended_files=[], reason="timeout")
+            finally:
+                self._pending_scope_decisions.pop(task_id, None)
+                # Resume EXECUTING regardless of outcome.
+                task = await self._store.get(task_id)
+                task.execution_state.pending_scope_request = None
+                if task.status == TaskStatus.AWAITING_SCOPE_DECISION:
+                    task = transition(task, TaskStatus.EXECUTING, "scope decision received")
+                if (
+                    decision.approve
+                    and decision.remember
+                    and self._scope_remember == ScopeRemember.TASK
+                ):
+                    for path in decision.extended_files:
+                        if path not in task.execution_state.auto_approved_scope_files:
+                            task.execution_state.auto_approved_scope_files.append(path)
+                await self._store.save(task)
+
+            return decision
+
+        return _cb
 
     def _merge_step_result(
         self,
@@ -736,6 +904,9 @@ class AgentOrchestrator:
         # Apply revised step definitions
         revised_by_id = {r.step_id: r for r in revision.revised_steps}
         existing_ids = {s.id for s in task.plan.steps}
+        # All original steps being reverted — used for test_command fallback so
+        # that merging multiple steps into one doesn't silently drop test coverage.
+        reverted_step_objects = [s for s in task.plan.steps if s.id in revert_ids]
         new_steps: list[PlanStep] = []
 
         for step in task.plan.steps:
@@ -751,6 +922,7 @@ class AgentOrchestrator:
                     "implementation_details": revised.implementation_details,
                     "edge_cases": revised.edge_cases or None,
                     "testing_strategy": revised.testing_strategy or None,
+                    "test_command": _resolve_test_command(revised, reverted_step_objects),
                 }))
             else:
                 new_steps.append(step)
@@ -766,6 +938,7 @@ class AgentOrchestrator:
                     "implementation_details": revised.implementation_details,
                     "edge_cases": revised.edge_cases or None,
                     "testing_strategy": revised.testing_strategy or None,
+                    "test_command": _resolve_test_command(revised, reverted_step_objects),
                 }))
 
         task.plan = PlanDocument(
@@ -876,7 +1049,7 @@ class AgentOrchestrator:
                     snapshot_age_sec=retrieval_context.snapshot_age_sec,
                     snapshot_stats=retrieval_context.snapshot_stats,
                     file_contents=self._collect_chunk_scoped_contents(
-                        shadow_path, context_files, step.goal, retrieval_context
+                        Path(task.workspace_path), context_files, step.goal, retrieval_context
                     ),
                     planner_evidence=retrieval_context.planner_evidence,
                 )
@@ -890,6 +1063,7 @@ class AgentOrchestrator:
                     "last_failure": last_failure,
                     "diagnostics": [item.model_dump(mode="json") for item in task.diagnostics],
                     "retrieval_context": retrieval_payload,
+                    "prior_step_files": list(task.modified_files),
                 }
                 self._write_debug_artifact(
                     task.task_id,
@@ -915,6 +1089,9 @@ class AgentOrchestrator:
                         task.task_id,
                         self._patch_engine,
                         shadow_path,
+                        scope_extension_callback=self._build_scope_callback(
+                            task.task_id, step.id, step,
+                        ),
                     )
                     step_outcome = await tool_loop.run(
                         step,
@@ -1356,12 +1533,18 @@ class AgentOrchestrator:
             failed_lines = re.findall(r"^FAILED\s+(\S+)", msg, re.MULTILINE)
             if failed_lines:
                 return "pytest:FAILED:" + ",".join(sorted(failed_lines))
-            # No FAILED lines means zero failures; treat as empty (shouldn't reach here)
             return "pytest:FAILED:"
+        # Detect cargo test output — extract failed test names from the "failures:" block.
+        # Shadow paths and timing in cargo output make raw comparison unstable.
+        if "test result: FAILED" in msg or ("failures:" in msg and "test result:" in msg):
+            failed_tests = re.findall(r"^    (\S+)\s*$", msg, re.MULTILINE)
+            return "cargo:FAILED:" + ",".join(sorted(failed_tests))
         # Strip pytest/cargo timing: "N error(s) in X.XXs" at end of output
         msg = re.sub(r"\d+ errors? in \d+\.\d+s\s*$", "", msg, flags=re.MULTILINE).rstrip()
         # Strip compiler/linter line:col numbers so shifted lines still match
         msg = re.sub(r"(?m)(:\d+){1,2}(?=:|\s|$)", "", msg)
+        # Strip absolute paths that embed shadow task UUIDs
+        msg = re.sub(r"/[^\s]*/\.agentd/shadows/[^\s/]+", "<shadow>", msg)
         return msg
 
     def _filter_baseline_errors(
