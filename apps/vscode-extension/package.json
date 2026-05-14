@@ -13,7 +13,8 @@
     "onCommand:aiEditor.acceptPatch",
     "onCommand:aiEditor.rejectPatch",
     "onCommand:aiEditor.refreshTask",
-    "onCommand:aiEditor.attachToTask"
+    "onCommand:aiEditor.attachToTask",
+    "onCommand:aiEditor.openChat"
   ],
   "contributes": {
     "commands": [
@@ -40,6 +41,10 @@
       {
         "command": "aiEditor.attachToTask",
         "title": "AI Editor: Attach to Task"
+      },
+      {
+        "command": "aiEditor.openChat",
+        "title": "AI Editor: Open Chat"
       }
     ],
     "configuration": {

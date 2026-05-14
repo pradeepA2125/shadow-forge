@@ -1,5 +1,7 @@
 import type {
   BackendTaskClient,
+  ChatMessage,
+  ChatThreadSummary,
   PatchStreamEvent,
   ResumeTaskResponse,
   TaskResult,
@@ -26,6 +28,17 @@ export interface SettingsProvider {
   getPollIntervalMs(): number;
 }
 
+export interface ScopeDecisionPromptInput {
+  files: string[];
+  reason: string;
+  stepId: string;
+}
+
+export interface ScopeDecisionPromptResult {
+  decision: "approve" | "reject";
+  remember: boolean;
+}
+
 export interface ControllerUI {
   getWorkspacePath(): string | null;
   promptForGoal(): Promise<string | undefined>;
@@ -33,10 +46,20 @@ export interface ControllerUI {
   promptForRejectReason(): Promise<string | undefined>;
   promptForResumeStage(): Promise<"plan" | "feedback" | "execute" | undefined>;
   promptForMaxIterationsOverride(): Promise<number | undefined>;
+  promptForScopeDecision(input: ScopeDecisionPromptInput): Promise<ScopeDecisionPromptResult | undefined>;
   showInfo(message: string): void;
   showWarning(message: string): void;
   showError(message: string): void;
   updatePanel(model: ReviewPanelViewModel): void;
+  openChatPanel(): void;
+  appendChatMessage(message: ChatMessage): void;
+  appendChatChunk(chunk: string): void;
+  showChatThinking(message: string): void;
+  updateChatThinking(message: string): void;
+  hideChatThinking(): void;
+  setChatInputEnabled(enabled: boolean): void;
+  renderChatThreadList(threads: ChatThreadSummary[], activeThreadId: string): void;
+  clearChatThread(): void;
 }
 
 export interface DiffService {
@@ -52,6 +75,7 @@ export class AiEditorController {
   private poller: TaskPoller | null = null;
   private streamController: AbortController | null = null;
   private patchEvents: PatchStreamEvent[] = [];
+  private activeThreadId: string | null = null;
 
   constructor(
     private readonly createClient: BackendClientFactory,
@@ -350,6 +374,147 @@ export class AiEditorController {
     }
   }
 
+  async openChat(): Promise<void> {
+    const workspacePath = this.ui.getWorkspacePath() ?? "";
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    let threads: ChatThreadSummary[];
+    try {
+      threads = await client.listChatThreads(workspacePath);
+    } catch {
+      threads = [];
+    }
+    const first = threads[0];
+    if (first && !this.activeThreadId) {
+      this.activeThreadId = first.threadId;
+    } else if (!this.activeThreadId) {
+      const thread = await client.createChatThread(workspacePath);
+      this.activeThreadId = thread.threadId;
+      threads = [thread];
+    }
+    this.ui.openChatPanel();
+    this.ui.renderChatThreadList(threads, this.activeThreadId ?? "");
+  }
+
+  async newChatThread(): Promise<void> {
+    const workspacePath = this.ui.getWorkspacePath() ?? "";
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    const thread = await client.createChatThread(workspacePath);
+    this.activeThreadId = thread.threadId;
+    this.ui.clearChatThread();
+    let threads: ChatThreadSummary[];
+    try {
+      threads = await client.listChatThreads(workspacePath);
+    } catch {
+      threads = [thread];
+    }
+    this.ui.renderChatThreadList(threads, thread.threadId);
+  }
+
+  async switchChatThread(threadId: string): Promise<void> {
+    this.activeThreadId = threadId;
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    const thread = await client.getChatThread(threadId);
+    this.ui.clearChatThread();
+    for (const message of thread.messages) {
+      this.ui.appendChatMessage(message);
+    }
+  }
+
+  async sendChatMessage(text: string): Promise<void> {
+    const workspacePath = this.ui.getWorkspacePath() ?? "";
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+
+    if (!this.activeThreadId) {
+      const thread = await client.createChatThread(workspacePath);
+      this.activeThreadId = thread.threadId;
+      this.ui.openChatPanel();
+    }
+
+    const threadId = this.activeThreadId;
+
+    this.ui.appendChatMessage({
+      role: "user",
+      content: text,
+      type: "text",
+      timestamp: this.now(),
+      metadata: {},
+    });
+
+    this.ui.setChatInputEnabled(false);
+    try {
+      for await (const event of client.sendChatMessage(threadId, text)) {
+        if (event.type === "chat_agent_thinking") {
+          const message = (event.payload["message"] as string) ?? "Thinking…";
+          this.ui.showChatThinking(message);
+        } else if (event.type === "explore_tool_call") {
+          const tool = (event.payload["tool"] as string) ?? "";
+          const args = event.payload["args"] as Record<string, unknown> | undefined;
+          const argValues = args ? Object.values(args).map(String).join(", ") : "";
+          this.ui.updateChatThinking(`${tool}: ${argValues}`);
+        } else if (event.type === "chat_response") {
+          const chunk = (event.payload["chunk"] as string) ?? "";
+          this.ui.appendChatChunk(chunk);
+        } else if (event.type === "chat_done") {
+          break;
+        }
+      }
+    } finally {
+      this.ui.hideChatThinking();
+      this.ui.setChatInputEnabled(true);
+    }
+  }
+
+  async handlePlanCardAction(
+    taskId: string,
+    action: "implement" | "feedback",
+    feedback?: string
+  ): Promise<void> {
+    if (action === "implement") {
+      await this.streamTaskIntoChatThread(taskId);
+    } else {
+      if (!feedback?.trim()) return;
+      const client = this.createClient(this.settings.getBackendBaseUrl());
+      try {
+        await client.providePlanFeedback(taskId, feedback.trim());
+        this.ui.showInfo("Plan feedback submitted.");
+      } catch (error) {
+        this.ui.showError(`Failed to submit plan feedback: ${formatError(error)}`);
+      }
+    }
+  }
+
+  async streamTaskIntoChatThread(taskId: string): Promise<void> {
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    this.ui.setChatInputEnabled(false);
+    try {
+      for await (const event of client.streamPatchEvents(taskId)) {
+        if (event.type === "operation_success") {
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: `✓ ${event.op_type}: ${event.path}`,
+            type: "text",
+            timestamp: this.now(),
+            metadata: {},
+          });
+        } else if (event.type === "operation_error") {
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: `✗ ${event.op_type}: ${event.path} — ${event.error}`,
+            type: "text",
+            timestamp: this.now(),
+            metadata: {},
+          });
+        } else if (event.type === "done") {
+          break;
+        }
+      }
+    } catch (error) {
+      this.ui.showError(`Stream error: ${formatError(error)}`);
+    } finally {
+      this.ui.setChatInputEnabled(true);
+    }
+  }
+
   dispose(): void {
     this.stopPolling();
     this.stopStream();
@@ -364,6 +529,10 @@ export class AiEditorController {
       .streamPatch(taskId, (event) => {
         this.patchEvents = [...this.patchEvents, event];
         this.pushPanel();
+        if (event.type === "scope_extension_requested") {
+          // Fire and forget — prompt the user; on response, post the decision.
+          void this.handleScopeExtensionRequest(taskId, event);
+        }
       }, signal)
       .catch((err: unknown) => {
         if (err instanceof Error && err.name === "AbortError") return;
@@ -372,6 +541,31 @@ export class AiEditorController {
       .finally(() => {
         this.streamController = null;
       });
+  }
+
+  private async handleScopeExtensionRequest(
+    taskId: string,
+    event: Extract<PatchStreamEvent, { type: "scope_extension_requested" }>
+  ): Promise<void> {
+    const result = await this.ui.promptForScopeDecision({
+      files: event.files,
+      reason: event.reason,
+      stepId: event.step_id
+    });
+    if (!result) return; // user dismissed — task stays paused until timeout
+
+    const client = this.clientForSession();
+    try {
+      await client.sendScopeDecision(taskId, {
+        decision: result.decision,
+        files: result.decision === "approve" ? event.files : [],
+        remember: result.remember
+      });
+    } catch (err) {
+      this.ui.showError(
+        `Failed to send scope decision: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   private stopStream(): void {

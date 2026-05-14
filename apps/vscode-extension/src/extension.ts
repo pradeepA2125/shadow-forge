@@ -1,6 +1,7 @@
 import { HttpBackendClient } from "@ai-editor/editor-client";
 import * as vscode from "vscode";
 
+import { ChatPanel } from "./chat-panel.js";
 import {
   AiEditorController,
   type BackendClientFactory,
@@ -16,6 +17,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const sessionStore = new VscodeSessionStore(context.workspaceState);
 
   let controller: AiEditorController;
+
+  const chatPanel = new ChatPanel(
+    (message) => controller.sendChatMessage(message),
+    (taskId, action, feedback) => controller.handlePlanCardAction(taskId, action, feedback),
+    () => controller.newChatThread(),
+    (threadId) => controller.switchChatThread(threadId)
+  );
 
   const panel = new ReviewPanel({
     onOpenDiff: (relativePath) => {
@@ -81,6 +89,48 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         placeHolder: "task-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
         ignoreFocusOut: true,
       }),
+    promptForScopeDecision: async ({ files, reason, stepId }) => {
+      const fileList = files.length === 1 ? files[0] : `${files.length} files (${files.join(", ")})`;
+      const choice = await vscode.window.showInformationMessage(
+        `[Step ${stepId}] Agent wants to also modify ${fileList}.\n\nReason: ${reason}`,
+        { modal: true },
+        "Approve",
+        "Approve & Remember",
+        "Reject"
+      );
+      if (!choice) return undefined;
+      return {
+        decision: choice.startsWith("Approve") ? "approve" : "reject",
+        remember: choice === "Approve & Remember",
+      };
+    },
+    openChatPanel: () => {
+      chatPanel.show();
+    },
+    appendChatMessage: (message) => {
+      chatPanel.appendMessage(message);
+    },
+    appendChatChunk: (chunk) => {
+      chatPanel.appendChunk(chunk);
+    },
+    showChatThinking: (message) => {
+      chatPanel.showThinking(message);
+    },
+    updateChatThinking: (message) => {
+      chatPanel.updateThinking(message);
+    },
+    hideChatThinking: () => {
+      chatPanel.hideThinking();
+    },
+    setChatInputEnabled: (enabled) => {
+      chatPanel.setInputEnabled(enabled);
+    },
+    renderChatThreadList: (threads, activeThreadId) => {
+      chatPanel.renderThreadList(threads, activeThreadId);
+    },
+    clearChatThread: () => {
+      chatPanel.clearThread();
+    },
   };
 
   const clientFactory: BackendClientFactory = (baseUrl) => new HttpBackendClient({ baseUrl });
@@ -114,6 +164,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("aiEditor.attachToTask", async () => {
       await controller.attachToTask();
       panel.show();
+    })
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("aiEditor.openChat", () => {
+      void controller.openChat();
     })
   );
   context.subscriptions.push({

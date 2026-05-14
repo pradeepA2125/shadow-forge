@@ -1,5 +1,7 @@
 import type {
   BackendTaskClient,
+  ChatMessage,
+  ChatThreadSummary,
   Diagnostic,
   TaskResult,
   TaskSubmission,
@@ -122,7 +124,28 @@ function createStubBackend(state: StubBackendState): BackendTaskClient {
       };
     },
     resumeTask: async (_taskId) => ({ taskId: "task-child", resumeOfTaskId: _taskId }),
+    sendScopeDecision: async (taskId, _decision) => ({ taskId, status: "EXECUTING" }),
     streamPatch: async (_taskId, _onEvent, _signal) => {},
+    streamPatchEvents: async function* (_taskId: string) {
+      yield { type: "done" as const };
+    },
+    listChatThreads: async () => [],
+    createChatThread: async (workspacePath: string, title?: string) => ({
+      threadId: "chat-stub",
+      workspacePath,
+      title: title ?? "New Chat",
+      createdAt: "2026-01-01T00:00:00Z",
+    }),
+    getChatThread: async (threadId: string) => ({
+      threadId,
+      workspacePath: "/tmp/workspace",
+      title: "New Chat",
+      messages: [],
+      touchedFiles: [],
+    }),
+    sendChatMessage: async function* (_threadId: string, _message: string) {
+      yield { type: "chat_done", payload: {} };
+    },
   };
 }
 
@@ -134,10 +157,20 @@ function createUi(overrides?: Partial<ControllerUI>): ControllerUI {
     promptForRejectReason: async () => "Needs changes",
     promptForResumeStage: async () => undefined,
     promptForMaxIterationsOverride: async () => undefined,
+    promptForScopeDecision: async () => undefined,
     showInfo: () => {},
     showWarning: () => {},
     showError: () => {},
     updatePanel: (_model: ReviewPanelViewModel) => {},
+    openChatPanel: () => {},
+    appendChatMessage: (_msg: ChatMessage) => {},
+    appendChatChunk: (_chunk: string) => {},
+    showChatThinking: (_message: string) => {},
+    updateChatThinking: (_message: string) => {},
+    hideChatThinking: () => {},
+    setChatInputEnabled: (_enabled: boolean) => {},
+    renderChatThreadList: (_threads: ChatThreadSummary[], _activeThreadId: string) => {},
+    clearChatThread: () => {},
     ...overrides,
   };
 }
@@ -311,5 +344,110 @@ describe("AiEditorController", () => {
     ]);
     expect(infos.some((message) => message.includes("Plan approved"))).toBe(true);
     expect(infos.some((message) => message.includes("Submitted plan feedback"))).toBe(true);
+  });
+
+});
+
+describe("AiEditorController — chat", () => {
+  test("sendChatMessage appends user message and streams agent response", async () => {
+    const appendedMessages: Array<{ role: string; content: string }> = [];
+    const chunks: string[] = [];
+
+    const chatBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [],
+        rejectCalls: [], getResultCalls: [], planFeedbackCalls: [],
+      }),
+      createChatThread: async (workspacePath) => ({
+        threadId: "chat-new",
+        workspacePath,
+        title: "New Chat",
+        createdAt: "2026-05-11T00:00:00Z",
+      }),
+      listChatThreads: async () => [],
+      getChatThread: async (threadId) => ({
+        threadId,
+        workspacePath: "/tmp/workspace",
+        title: "New Chat",
+        messages: [],
+        touchedFiles: [],
+      }),
+      sendChatMessage: async function* () {
+        yield { type: "chat_agent_thinking", payload: { message: "Exploring…" } };
+        yield { type: "intent_classified", payload: { intent: "qa" } };
+        yield { type: "chat_response", payload: { chunk: "The answer is 42." } };
+        yield { type: "chat_done", payload: {} };
+      },
+    };
+
+    const store = new MemorySessionStore();
+    const controller = new AiEditorController(
+      () => chatBackend,
+      store,
+      createSettings(),
+      createUi({
+        appendChatMessage: (m) => appendedMessages.push({ role: m.role, content: m.content }),
+        appendChatChunk: (c) => chunks.push(c),
+      }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-05-11T00:00:00.000Z"
+    );
+
+    await controller.sendChatMessage("What is the answer?");
+    controller.dispose();
+
+    expect(appendedMessages[0].role).toBe("user");
+    expect(appendedMessages[0].content).toBe("What is the answer?");
+    expect(chunks).toContain("The answer is 42.");
+  });
+
+  test("thinking indicator: show on chat_agent_thinking, update on explore_tool_call, hide in finally", async () => {
+    const thinkingMessages: string[] = [];
+
+    const chatBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [],
+        rejectCalls: [], getResultCalls: [], planFeedbackCalls: [],
+      }),
+      createChatThread: async (workspacePath) => ({
+        threadId: "chat-th",
+        workspacePath,
+        title: "New Chat",
+        createdAt: "2026-05-11T00:00:00Z",
+      }),
+      listChatThreads: async () => [],
+      getChatThread: async (threadId) => ({
+        threadId, workspacePath: "/tmp/workspace",
+        title: "New Chat", messages: [], touchedFiles: [],
+      }),
+      sendChatMessage: async function* () {
+        yield { type: "chat_agent_thinking", payload: { message: "Exploring workspace…" } };
+        yield { type: "explore_tool_call", payload: { tool: "search_code", args: { pattern: "auth" } } };
+        yield { type: "intent_classified", payload: { intent: "qa" } };
+        yield { type: "chat_response", payload: { chunk: "It handles auth." } };
+        yield { type: "chat_done", payload: {} };
+      },
+    };
+
+    const store = new MemorySessionStore();
+    const controller = new AiEditorController(
+      () => chatBackend,
+      store,
+      createSettings(),
+      createUi({
+        showChatThinking: (m) => thinkingMessages.push(`show:${m}`),
+        updateChatThinking: (m) => thinkingMessages.push(`update:${m}`),
+        hideChatThinking: () => thinkingMessages.push("hide"),
+      }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-05-11T00:00:00.000Z"
+    );
+
+    await controller.sendChatMessage("What does auth do?");
+    controller.dispose();
+
+    expect(thinkingMessages[0]).toBe("show:Exploring workspace…");
+    expect(thinkingMessages[1]).toBe("update:search_code: auth");
+    expect(thinkingMessages).toContain("hide");
   });
 });
