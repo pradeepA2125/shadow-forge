@@ -20,7 +20,9 @@ from agentd.domain.models import (
     CandidateScoreBreakdown,
     CheckpointManifest,
     DeltaReplanRequest,
+    DiffEntry,
     Diagnostic,
+    InlineChangeResult,
     PatchCandidateV2,
     PatchDocumentV2,
     PatchFailureCode,
@@ -28,6 +30,7 @@ from agentd.domain.models import (
     PlanDocument,
     PlanRevisionResult,
     PlanStep,
+    PlanTarget,
     PlanTargetIntent,
     ScopeExtensionRequest,
     ScopePolicy,
@@ -35,9 +38,11 @@ from agentd.domain.models import (
     ScopeTrigger,
     StepExecutionTrace,
     StepRunResult,
+    TaskBudget,
     TaskMilestoneSnapshot,
     TaskRecord,
     TaskStatus,
+    TaskUsage,
     ValidationResult,
 )
 from agentd.domain.state_machine import assert_budget, bump_usage, transition
@@ -210,6 +215,7 @@ class AgentOrchestrator:
         self._scope_remember = scope_remember
         self._scope_timeout_sec = max(0.0, scope_timeout_sec)
         self._pending_scope_decisions: dict[str, asyncio.Future[ScopeDecision]] = {}
+        self._inline_shadows: dict[str, dict[str, object]] = {}  # inline_task_id → meta
         import os
         self._tool_loop_enabled: bool = os.environ.get("AI_EDITOR_TOOL_LOOP_ENABLED", "true") not in ("0", "false", "False")
 
@@ -477,6 +483,214 @@ class AgentOrchestrator:
             self._running_tasks.discard(task_id)
             self.broadcaster.broadcast(task_id, {"type": "done", "payload": {}})
             return task
+
+    async def run_inline_change(
+        self,
+        *,
+        thread_id: str,
+        goal: str,
+        workspace_path: str,
+        plan_markdown: str,
+        explore_context: list[dict[str, object]],
+        channel_id: str,
+        store: object,
+    ) -> None:
+        """Run a small inline change within a chat thread.
+
+        Creates a lightweight shadow containing only the target files, runs a
+        single-step ToolLoop with skip_verify=True routed to channel_id, then
+        broadcasts diff_ready with the computed file diffs.  The shadow is
+        retained until the user promotes or discards it.
+        """
+        from agentd.tools.loop import ToolLoop, VerifyResult, build_tool_registry
+
+        inline_task_id = f"inline-{uuid4().hex[:12]}"
+        real_path = Path(workspace_path)
+
+        # Collect target files from the explore phase
+        target_files: list[str] = []
+        for entry in explore_context:
+            tool = entry.get("tool", "")
+            if tool in ("read_file", "list_directory"):
+                result_text = str(entry.get("result", ""))
+                # extract path from first line of result if available
+                args_val = entry.get("args")
+                if isinstance(args_val, dict) and "path" in args_val:
+                    candidate = str(args_val["path"])
+                    # only include files (not directories) that exist
+                    candidate_path = real_path / candidate
+                    if candidate_path.is_file() and candidate not in target_files:
+                        target_files.append(candidate)
+                _ = result_text  # used for type narrowing only
+
+        if not target_files:
+            # Fall back to workspace root — ToolLoop will read what it needs
+            target_files = []
+
+        shadow = await self._workspace_manager.prepare_lightweight(
+            inline_task_id, workspace_path, target_files
+        )
+        shadow_path = Path(shadow.shadow_path)
+
+        self._inline_shadows[inline_task_id] = {
+            "shadow_path": str(shadow_path),
+            "workspace_path": workspace_path,
+            "touched_files": [],
+        }
+
+        # Build a single-step plan targeting all collected files
+        plan_targets = [
+            PlanTarget(path=f, intent=PlanTargetIntent.EXISTING)
+            for f in target_files
+        ]
+        step = PlanStep(
+            id="s1",
+            goal=goal,
+            targets=plan_targets,
+            risk="low",
+            testing_strategy="none — inline change, no verify",
+        )
+
+        registry = build_tool_registry(
+            shadow_path,
+            self._retrieval_client,
+            real_workspace_path=real_path,
+        )
+        tool_loop = ToolLoop(
+            self._reasoning_engine,
+            registry,
+            self.broadcaster,
+            inline_task_id,
+            self._patch_engine,
+            shadow_path,
+            broadcast_key=channel_id,
+            skip_verify=True,
+        )
+
+        try:
+            outcome = await tool_loop.run(
+                step,
+                {"goal": goal, "workspace_path": workspace_path, "plan_markdown": plan_markdown},
+                TaskBudget(),
+                TaskUsage(),
+            )
+        except Exception as exc:
+            logger.exception("run_inline_change tool loop failed", extra={"inline_task_id": inline_task_id})
+            self.broadcaster.broadcast(channel_id, {
+                "type": "patch_failed",
+                "payload": {"step_id": "s1", "error": str(exc)},
+            })
+            self.broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
+            return
+
+        touched_files: list[str] = []
+        if isinstance(outcome, VerifyResult):
+            touched_files = outcome.touched_files
+
+        self._inline_shadows[inline_task_id]["touched_files"] = touched_files
+
+        # Compute diff entries
+        diff_entries = self._compute_diff_entries(
+            real_path, shadow_path, touched_files, inline_task_id
+        )
+
+        self.broadcaster.broadcast(channel_id, {
+            "type": "diff_ready",
+            "payload": {
+                "task_id": inline_task_id,
+                "diff_entries": [
+                    {
+                        "path": e.path,
+                        "additions": e.additions,
+                        "deletions": e.deletions,
+                        "temp_path": e.temp_path,
+                    }
+                    for e in diff_entries
+                ],
+                "completed_steps": 1,
+                "total_steps": 1,
+            },
+        })
+        self.broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
+
+    def _compute_diff_entries(
+        self,
+        real_path: Path,
+        shadow_path: Path,
+        touched_files: list[str],
+        inline_task_id: str,
+    ) -> list[DiffEntry]:
+        entries: list[DiffEntry] = []
+        for rel in touched_files:
+            shadow_file = shadow_path / rel
+            real_file = real_path / rel
+            if not shadow_file.exists():
+                continue
+            shadow_lines = shadow_file.read_text(errors="replace").splitlines(keepends=True)
+            real_lines = real_file.read_text(errors="replace").splitlines(keepends=True) if real_file.exists() else []
+            diff = list(difflib.unified_diff(real_lines, shadow_lines, lineterm=""))
+            additions = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+            deletions = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+            entries.append(DiffEntry(
+                path=rel,
+                additions=additions,
+                deletions=deletions,
+                temp_path=str(shadow_file),
+            ))
+        return entries
+
+    async def promote_inline_change(self, inline_task_id: str) -> None:
+        """Copy shadow files into the real workspace."""
+        meta = self._inline_shadows.get(inline_task_id)
+        if meta is None:
+            raise KeyError(f"Unknown inline change: {inline_task_id!r}")
+        shadow_path = Path(str(meta["shadow_path"]))
+        real_path = Path(str(meta["workspace_path"]))
+        touched: list[str] = list(meta.get("touched_files", []))  # type: ignore[arg-type]
+        for rel in touched:
+            src = shadow_path / rel
+            dst = real_path / rel
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        self._inline_shadows.pop(inline_task_id, None)
+
+    async def discard_inline_change(self, inline_task_id: str) -> None:
+        """Remove the inline change shadow without touching the real workspace."""
+        meta = self._inline_shadows.pop(inline_task_id, None)
+        if meta:
+            shadow_path = Path(str(meta["shadow_path"]))
+            if shadow_path.exists():
+                shutil.rmtree(shadow_path, ignore_errors=True)
+
+    async def create_task_from_chat(
+        self,
+        *,
+        thread_id: str,
+        goal: str,
+        workspace_path: str,
+        explore_context: list[dict[str, object]],
+        store: object,
+    ) -> str:
+        """Create a full planning task pre-seeded with chat explore context."""
+        from agentd.domain.models import TaskCreateRequest
+        request = TaskCreateRequest(
+            goal=goal,
+            workspace_path=workspace_path,
+            mode="project_edit",
+            initial_explore_context=explore_context,
+        )
+        task = TaskRecord(
+            task_id=f"task-{uuid4().hex[:12]}",
+            goal=request.goal,
+            workspace_path=request.workspace_path,
+            mode=request.mode,
+            status=TaskStatus.QUEUED,
+            initial_explore_context=explore_context,
+        )
+        await self._store.create(task)
+        asyncio.create_task(self.run_task(task.task_id))
+        return task.task_id
 
     async def _execute_plan(
         self,
