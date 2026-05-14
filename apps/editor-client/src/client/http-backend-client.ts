@@ -301,6 +301,20 @@ export class HttpBackendClient implements BackendTaskClient {
     }
   }
 
+  async applyInlineChange(inlineTaskId: string): Promise<void> {
+    await this.fetchJson(
+      `/v1/chat/inline-changes/${encodeURIComponent(inlineTaskId)}/promote`,
+      { method: "POST" }
+    );
+  }
+
+  async discardInlineChange(inlineTaskId: string): Promise<void> {
+    await this.fetchFn(
+      `${this.options.baseUrl}/v1/chat/inline-changes/${encodeURIComponent(inlineTaskId)}`,
+      { method: "DELETE", headers: { "content-type": "application/json" } }
+    );
+  }
+
   private async fetchJson(path: string, init: RequestInit = {}): Promise<unknown> {
     const response = await this.fetchFn(`${this.options.baseUrl}${path}`, {
       ...init,

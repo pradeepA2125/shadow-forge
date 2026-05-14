@@ -146,6 +146,8 @@ function createStubBackend(state: StubBackendState): BackendTaskClient {
     sendChatMessage: async function* (_threadId: string, _message: string) {
       yield { type: "chat_done" as const, payload: {} as Record<string, never> };
     },
+    applyInlineChange: async (_inlineTaskId: string) => {},
+    discardInlineChange: async (_inlineTaskId: string) => {},
   };
 }
 

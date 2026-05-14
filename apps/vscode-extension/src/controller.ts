@@ -473,6 +473,38 @@ export class AiEditorController {
         } else if (event.type === "chat_response") {
           const chunk = (event.payload["chunk"] as string) ?? "";
           this.ui.appendChatChunk(chunk);
+        } else if (event.type === "diff_ready") {
+          const taskId = (event.payload["task_id"] as string) ?? "";
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: taskId,
+            type: "diff_card",
+            taskId,
+            timestamp: this.now(),
+            metadata: { diff_entries: event.payload["diff_entries"] },
+          });
+        } else if (event.type === "task_card") {
+          const taskId = (event.payload["task_id"] as string) ?? "";
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: taskId,
+            type: "task_card",
+            taskId,
+            timestamp: this.now(),
+            metadata: {},
+          });
+        } else if (event.type === "task_status_changed") {
+          const taskId = (event.payload["task_id"] as string) ?? "";
+          const status = (event.payload["status"] as string) ?? "";
+          const planMarkdown = event.payload["plan_markdown"] as string | undefined;
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: `Task ${taskId}: ${status}`,
+            type: planMarkdown ? "plan_card" : "text",
+            taskId,
+            timestamp: this.now(),
+            metadata: planMarkdown ? { plan_markdown: planMarkdown } : {},
+          });
         } else if (event.type === "chat_done") {
           break;
         }
@@ -531,6 +563,25 @@ export class AiEditorController {
       this.ui.showError(`Stream error: ${formatError(error)}`);
     } finally {
       this.ui.setChatInputEnabled(true);
+    }
+  }
+
+  async applyInlineChange(inlineTaskId: string): Promise<void> {
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    try {
+      await client.applyInlineChange(inlineTaskId);
+      this.ui.showInfo("Changes applied to workspace.");
+    } catch (error) {
+      this.ui.showError(`Failed to apply inline change: ${formatError(error)}`);
+    }
+  }
+
+  async discardInlineChange(inlineTaskId: string): Promise<void> {
+    const client = this.createClient(this.settings.getBackendBaseUrl());
+    try {
+      await client.discardInlineChange(inlineTaskId);
+    } catch (error) {
+      this.ui.showError(`Failed to discard inline change: ${formatError(error)}`);
     }
   }
 

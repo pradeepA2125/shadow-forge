@@ -167,4 +167,6 @@ export interface BackendTaskClient {
   createChatThread(workspacePath: string, title?: string): Promise<ChatThreadSummary>;
   getChatThread(threadId: string): Promise<ChatThread>;
   sendChatMessage(threadId: string, message: string): AsyncIterable<StreamEvent>;
+  applyInlineChange(inlineTaskId: string): Promise<void>;
+  discardInlineChange(inlineTaskId: string): Promise<void>;
 }
