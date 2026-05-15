@@ -581,12 +581,9 @@ class AgentOrchestrator:
             testing_strategy="none — inline change, no verify",
         )
 
-        # Convert the chat explore phase results into pre-seeded ToolLoop history.
-        # This mirrors how the PlanningAgent's retrieval works: the model starts
-        # already knowing what search_code and read_file found, so it only fetches
-        # what it genuinely still needs (e.g. an offset range it hasn't seen yet).
-        # This avoids dumping whole files and lets the model discover exactly the
-        # lines it needs via targeted additional reads.
+        # Seed the ToolLoop with the explore phase results as pre-populated history.
+        # The model starts knowing what was already found and only fetches what it
+        # genuinely still needs (e.g. a specific line range it hasn't seen yet).
         initial_history: list[dict[str, object]] = []
         for entry in explore_context:
             tool_name = entry.get("tool", "")
@@ -595,7 +592,6 @@ class AgentOrchestrator:
             is_error = bool(entry.get("is_error", False))
             if not tool_name or not result_text:
                 continue
-            # Reconstruct as assistant tool_call + tool_result pair
             initial_history.append({
                 "role": "assistant",
                 "content": json.dumps({
