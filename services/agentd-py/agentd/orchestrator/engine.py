@@ -510,6 +510,7 @@ class AgentOrchestrator:
         workspace_path: str,
         plan_markdown: str,
         explore_context: list[dict[str, object]],
+        likely_targets: list[str] | None = None,
         channel_id: str,
         store: object,
     ) -> None:
@@ -525,25 +526,32 @@ class AgentOrchestrator:
         inline_task_id = f"inline-{uuid4().hex[:12]}"
         real_path = Path(workspace_path)
 
-        # Collect target files from the explore phase
+        # Collect target files from the explore phase.
+        # Priority: (1) read_file entries from explore, (2) likely_targets from
+        # the intent classifier (relative paths), (3) empty (ToolLoop self-discovers).
         target_files: list[str] = []
         for entry in explore_context:
             tool = entry.get("tool", "")
-            if tool in ("read_file", "list_directory"):
-                result_text = str(entry.get("result", ""))
-                # extract path from first line of result if available
+            if tool == "read_file":
                 args_val = entry.get("args")
                 if isinstance(args_val, dict) and "path" in args_val:
                     candidate = str(args_val["path"])
-                    # only include files (not directories) that exist
-                    candidate_path = real_path / candidate
-                    if candidate_path.is_file() and candidate not in target_files:
-                        target_files.append(candidate)
-                _ = result_text  # used for type narrowing only
+                    # Strip workspace prefix to get a relative path
+                    try:
+                        rel = str(Path(candidate).relative_to(real_path))
+                        candidate_path = real_path / rel
+                    except ValueError:
+                        rel = candidate
+                        candidate_path = real_path / rel
+                    if candidate_path.is_file() and rel not in target_files:
+                        target_files.append(rel)
 
-        if not target_files:
-            # Fall back to workspace root — ToolLoop will read what it needs
-            target_files = []
+        if not target_files and likely_targets:
+            for t in likely_targets:
+                rel = t.lstrip("/")
+                candidate_path = real_path / rel
+                if candidate_path.is_file() and rel not in target_files:
+                    target_files.append(rel)
 
         shadow = await self._workspace_manager.prepare_lightweight(
             inline_task_id, workspace_path, target_files
@@ -569,6 +577,32 @@ class AgentOrchestrator:
             testing_strategy="none — inline change, no verify",
         )
 
+        # Build file_contents map so the ToolLoop model sees the full file upfront
+        # instead of wasting budget on read_file calls it already did in explore.
+        # Step 1: mine content already fetched by the chat explore phase.
+        file_contents: dict[str, str] = {}
+        for entry in explore_context:
+            if entry.get("tool") != "read_file" or entry.get("is_error"):
+                continue
+            args_val = entry.get("args")
+            if not isinstance(args_val, dict):
+                continue
+            raw_path = str(args_val.get("path", ""))
+            try:
+                rel = str(Path(raw_path).relative_to(real_path))
+            except ValueError:
+                rel = raw_path.lstrip("/")
+            content = str(entry.get("result", ""))
+            if rel and content and rel not in file_contents:
+                file_contents[rel] = content
+        # Step 2: for any target not already in explore_context, read from disk.
+        for rel in target_files:
+            if rel not in file_contents:
+                try:
+                    file_contents[rel] = (real_path / rel).read_text(errors="replace")
+                except OSError:
+                    pass
+
         registry = build_tool_registry(
             shadow_path,
             self._retrieval_client,
@@ -585,11 +619,21 @@ class AgentOrchestrator:
             skip_verify=True,
         )
 
+        # Use a higher per-step budget for inline changes (no verify phase needed)
+        inline_budget = TaskBudget(max_tool_calls_per_step=16)
+        patch_context: dict[str, object] = {
+            "goal": goal,
+            "workspace_path": workspace_path,
+            "plan_markdown": plan_markdown,
+        }
+        if file_contents:
+            patch_context["retrieval_context"] = {"file_contents": file_contents}
+
         try:
             outcome = await tool_loop.run(
                 step,
-                {"goal": goal, "workspace_path": workspace_path, "plan_markdown": plan_markdown},
-                TaskBudget(),
+                patch_context,
+                inline_budget,
                 TaskUsage(),
             )
         except Exception as exc:

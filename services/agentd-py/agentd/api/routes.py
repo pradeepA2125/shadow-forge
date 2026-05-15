@@ -714,6 +714,9 @@ def build_router(
             import json as _json
             message = request.get("content") or request.get("message", "")
             channel_id = f"chat:{thread_id}"
+            # Clear stale replay events from the previous message so a new subscriber
+            # doesn't receive old events (including a stale chat_done).
+            _chat_agent._broadcaster.clear_replay(channel_id)
             queue = _chat_agent._broadcaster.subscribe(channel_id)
 
             async def _run_agent() -> None:
@@ -724,9 +727,13 @@ def build_router(
                     _logging.getLogger(__name__).exception("ChatAgent.handle_message failed")
                     _chat_agent._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
 
-            _asyncio_chat.create_task(_run_agent())
-
             async def event_stream():
+                # Start the agent task INSIDE the generator so it is scheduled
+                # after Starlette has begun consuming the stream. This guarantees
+                # the first `await queue.get()` suspends before the agent runs,
+                # which produces proper per-event streaming instead of a bulk
+                # dump when the model responds fast.
+                agent_task = _asyncio_chat.create_task(_run_agent())
                 try:
                     while True:
                         event = await queue.get()
@@ -735,6 +742,7 @@ def build_router(
                             break
                 finally:
                     _chat_agent._broadcaster.unsubscribe(channel_id, queue)
+                    agent_task.cancel()
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 

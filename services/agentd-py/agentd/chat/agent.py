@@ -27,7 +27,13 @@ _EXPLORE_PROMPT = """\
 You are exploring a codebase to gather context before classifying a user request.
 conversation_history contains recent turns — if the answer is already in history, emit action=done immediately without calling any tools.
 Only use tools to find information that is not already covered by history or prior tool_results.
-When you have enough evidence to judge scope, emit action=done.
+
+Strategy:
+1. Use search_code or list_directory to locate the relevant files.
+2. Once you find the file most likely to be changed, READ IT with read_file so the content is available for the change.
+3. Emit action=done when you have read the key file(s).
+
+If the request involves modifying a specific file (e.g. adding an endpoint, changing a function), you MUST call read_file on that file before emitting done.
 
 Tools: search_code (ripgrep), list_directory, read_file, search_semantic.
 Cap: you will be stopped after a fixed number of calls regardless.
@@ -126,9 +132,9 @@ class ChatAgent:
 
             try:
                 tool_output = await self._registry.execute(tool_name, args)
-                context.append({"tool": tool_name, "result": tool_output.output, "is_error": tool_output.is_error})
+                context.append({"tool": tool_name, "args": args, "result": tool_output.output, "is_error": tool_output.is_error})
             except Exception as exc:
-                context.append({"tool": tool_name, "result": str(exc), "is_error": True})
+                context.append({"tool": tool_name, "args": args, "result": str(exc), "is_error": True})
 
             if tool_name in ("read_file", "list_directory"):
                 path = args.get("path", "")
@@ -185,6 +191,7 @@ class ChatAgent:
                     workspace_path=self._workspace_path,
                     plan_markdown=plan_md,
                     explore_context=context,
+                    likely_targets=classification.likely_targets,
                     channel_id=channel_id,
                     store=self._store,
                 )

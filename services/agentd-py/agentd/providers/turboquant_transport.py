@@ -202,10 +202,20 @@ class TurboQuantTransport(ModelJsonTransport):
 
     @staticmethod
     def _parse_output_object(output_text: str, schema_name: str) -> dict[str, object]:
+        text = output_text.strip()
+        # Find the start of the JSON object (skip any leading thinking trace)
+        start = text.find("{")
+        if start == -1:
+            raise RuntimeError(
+                f"TurboQuant output is not valid JSON for {schema_name}: {text[:500]}"
+            )
+        text = text[start:]
         try:
-            payload = json.loads(output_text)
+            # raw_decode consumes exactly one JSON value and ignores trailing garbage
+            # (e.g. extra closing braces emitted by qwen3-family models)
+            payload, _ = json.JSONDecoder().raw_decode(text)
         except json.JSONDecodeError as exc:
-            msg = f"TurboQuant output is not valid JSON for {schema_name}: {output_text[:500]}"
+            msg = f"TurboQuant output is not valid JSON for {schema_name}: {text[:500]}"
             raise RuntimeError(msg) from exc
         if not isinstance(payload, dict):
             msg = "TurboQuant output must be a JSON object"
