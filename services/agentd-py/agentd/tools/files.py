@@ -5,6 +5,10 @@ from pathlib import Path
 
 from agentd.tools.registry import ToolOutput
 
+_MAX_LINES = 2000
+_MAX_OUTPUT_CHARS = 100_000
+
+
 async def read_file(
     *,
     path: str,
@@ -45,8 +49,22 @@ async def read_file(
     e = min(total, e)
     selected = all_lines[s:e]
 
+    if len(selected) > _MAX_LINES:
+        selected = selected[:_MAX_LINES]
+        truncated = True
+    else:
+        truncated = False
+
     numbered = [f"{s + i + 1:4d}: {line}" for i, line in enumerate(selected)]
-    return ToolOutput(output="\n".join(numbered))
+    result = "\n".join(numbered)
+
+    if truncated:
+        result += f"\n... (file has {total} lines; showing {s+1}–{s+_MAX_LINES})"
+
+    if len(result) > _MAX_OUTPUT_CHARS:
+        result = result[:_MAX_OUTPUT_CHARS] + "\n... (truncated)"
+
+    return ToolOutput(output=result)
 
 
 async def list_directory(*, path: str, root: Path) -> ToolOutput:
