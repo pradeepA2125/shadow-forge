@@ -577,31 +577,16 @@ class AgentOrchestrator:
             testing_strategy="none — inline change, no verify",
         )
 
-        # Build file_contents map so the ToolLoop model sees the full file upfront
-        # instead of wasting budget on read_file calls it already did in explore.
-        # Step 1: mine content already fetched by the chat explore phase.
+        # Read target files from disk (not from explore_context) so the ToolLoop
+        # model always gets the full, untruncated content. The explore phase
+        # tool caps output at 500 lines, which causes the model to still make
+        # extra read_file calls for any file longer than that limit.
         file_contents: dict[str, str] = {}
-        for entry in explore_context:
-            if entry.get("tool") != "read_file" or entry.get("is_error"):
-                continue
-            args_val = entry.get("args")
-            if not isinstance(args_val, dict):
-                continue
-            raw_path = str(args_val.get("path", ""))
-            try:
-                rel = str(Path(raw_path).relative_to(real_path))
-            except ValueError:
-                rel = raw_path.lstrip("/")
-            content = str(entry.get("result", ""))
-            if rel and content and rel not in file_contents:
-                file_contents[rel] = content
-        # Step 2: for any target not already in explore_context, read from disk.
         for rel in target_files:
-            if rel not in file_contents:
-                try:
-                    file_contents[rel] = (real_path / rel).read_text(errors="replace")
-                except OSError:
-                    pass
+            try:
+                file_contents[rel] = (real_path / rel).read_text(errors="replace")
+            except OSError:
+                pass
 
         registry = build_tool_registry(
             shadow_path,
