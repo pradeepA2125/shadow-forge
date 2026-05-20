@@ -22,9 +22,19 @@ from agentd.domain.models import (
 )
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster
 from agentd.reasoning.contracts import ReasoningEngine
+from agentd.tools.post_patch import AnalyzerBuilder
 from agentd.tools.registry import ToolRegistry
+from agentd.tools.verify_phase_sm import (
+    MAX_PATCH_RETRIES,
+    VerifyPhaseEvent,
+    VerifyPhaseExhausted,
+    VerifyPhaseState,
+    VerifyPhaseStateMachine,
+)
 
 logger = logging.getLogger(__name__)
+
+_POST_PATCH_ANALYZER = AnalyzerBuilder.default()
 
 _MAX_OUTPUT_INJECT_CHARS = int(os.environ.get("AI_EDITOR_TOOL_RESULT_MAX_CHARS", "100000"))
 
@@ -83,6 +93,15 @@ class ToolBudgetExceededError(Exception):
     """Raised when the explore budget exhausts before emitting a patch."""
 
 
+def _build_patch_key(patch_ops: list[object]) -> tuple:
+    """Stable hashable key for a list of patch ops — used for emit_patch dedup."""
+    return tuple(
+        json.dumps(op, sort_keys=True, default=str)
+        for op in patch_ops
+        if isinstance(op, dict)
+    )
+
+
 class ToolLoop:
     """Two-phase ReAct loop for a single plan step.
 
@@ -102,6 +121,8 @@ class ToolLoop:
         scope_extension_callback: ScopeExtensionCallback | None = None,
         broadcast_key: str | None = None,
         skip_verify: bool = False,
+        thinking_log: list[str] | None = None,
+        static_baseline: frozenset[str] | None = None,
     ) -> None:
         self._reasoning = reasoning_engine
         self._registry = registry
@@ -111,6 +132,8 @@ class ToolLoop:
         self._skip_verify = skip_verify
         self._patch_engine = patch_engine
         self._shadow_path = shadow_path
+        self._thinking_log = thinking_log
+        self._static_baseline = static_baseline
         self._scope_cb: ScopeExtensionCallback = (
             scope_extension_callback or _default_reject_callback
         )
@@ -125,13 +148,14 @@ class ToolLoop:
     ) -> StepOutcome:
         trace = AgentToolTrace(step_id=step.id)
         history: list[dict[str, object]] = list(initial_history) if initial_history else []
-        phase = "explore"
+        sm = VerifyPhaseStateMachine()
         explore_calls = 0
         verify_calls = 0
         last_patch_document: dict[str, object] = {}
         all_touched_files: list[str] = []
-        last_verify_run_errored: bool = False  # True if last verify-phase run_command failed
         had_scope_violation: bool = False     # True if any patch was rejected for out-of-scope file
+        _last_auto_checks_error: str = ""     # first ~300 chars of postpatch output when blocking
+        _last_test_failure: str = ""          # first ~300 chars of last failing run_command output
 
         retrieval_ctx = patch_request_context.get("retrieval_context") or {}
         if not isinstance(retrieval_ctx, dict):
@@ -146,36 +170,96 @@ class ToolLoop:
             "design_rationale": step.design_rationale,
             "testing_strategy": step.testing_strategy,
             "allowed_files": patch_request_context.get("allowed_files"),
-            "file_contents": retrieval_ctx.get("file_contents"),
+            "file_contents": None,  # agent reads on demand via read_file
             "diagnostics": patch_request_context.get("diagnostics"),
             "last_failure": patch_request_context.get("last_failure"),
             "plan_markdown": patch_request_context.get("plan_markdown"),
             "prior_step_files": patch_request_context.get("prior_step_files") or [],
+            "prior_step_patches": patch_request_context.get("prior_step_patches") or {},
         }
 
         max_explore = budget.max_tool_calls_per_step
         max_verify = budget.max_verify_calls_per_step
         total_budget = max_explore + max_verify + 10  # generous outer cap
-
         for iteration in range(total_budget):
-            tool_defs = [t.model_dump() for t in self._registry.definitions(phase=phase)]
+            phase = "explore" if sm.state == VerifyPhaseState.EXPLORE else "verify"
+            _all_defs = self._registry.definitions(phase=phase)
+            _allowed = sm.allowed_tools()
+            tool_defs = [t.model_dump() for t in _all_defs if t.name in _allowed]
+            # Schema snippets injected into patch-failure feedback so the model knows exact arg names.
+            _rf_json = json.dumps(next((t for t in tool_defs if t["name"] == "read_file"), {}), indent=2)
+            _sc_json = json.dumps(next((t for t in tool_defs if t["name"] == "search_code"), {}), indent=2)
 
-            response = await self._reasoning.create_tool_step(
-                step_context=step_context,
-                history=history,
-                tool_definitions=tool_defs,
-            )
+            _thinking_chunks: list[str] = []
+
+            def _on_thinking(chunk: str) -> None:
+                _thinking_chunks.append(chunk)
+                self._broadcaster.broadcast(self._broadcast_key, {
+                    "type": "tool_thinking_chunk",
+                    "payload": {"chunk": chunk},
+                })
+
+            try:
+                response = await self._reasoning.create_tool_step(
+                    step_context=step_context,
+                    history=history,
+                    tool_definitions=tool_defs,
+                    on_thinking=_on_thinking,
+                    state_description=sm.state_description(
+                        iteration=iteration + 1,
+                        error_summary=_last_auto_checks_error,
+                        failure_summary=_last_test_failure,
+                    ),
+                )
+            except RuntimeError as exc:
+                # Malformed / non-JSON response from the model. Inject into history
+                # so the model self-corrects on the next iteration rather than losing
+                # all explore context via a step restart.
+                logger.warning(
+                    "[loop] create_tool_step malformed response (iter=%d step=%s): %s",
+                    iteration + 1, step.id, exc,
+                )
+                history.append({"role": "assistant", "content": "(malformed response)"})
+                history.append({
+                    "role": "tool_result", "tool": "_parse_error",
+                    "content": (
+                        f"Your previous response could not be parsed as valid JSON: {exc}. "
+                        "Please retry with a well-formed JSON object matching the schema."
+                    ),
+                })
+                continue
+            finally:
+                if _thinking_chunks:
+                    logger.info(
+                        "[loop] thinking: task=%s step=%s iter=%d\n%s",
+                        self._task_id, step.id, iteration + 1,
+                        "".join(_thinking_chunks),
+                    )
 
             action_type = str(response.get("type", ""))
             thought = str(response.get("thought", ""))
+            logger.info(
+                "[loop] iter=%d phase=%s action=%s task=%s step=%s thought=%r",
+                iteration + 1, phase, action_type, self._task_id, step.id,
+                thought[:300] if thought else "",
+            )
 
             # ── verify_done ──────────────────────────────────────────────
             if action_type == "verify_done":
-                # Guard 1: agent must apply a patch before verify_done is valid
-                if phase == "explore":
+                verified_flag = bool(response.get("verified", False))
+                logger.info(
+                    "[loop] verify_done: task=%s step=%s state=%s verified=%s",
+                    self._task_id, step.id, sm.state.value, verified_flag,
+                )
+                # State machine owns when verify_done is valid; it's only present in the
+                # schema for POSTPATCH_CLEAN and TEST_PASSED. This guard catches crafted
+                # calls from other states (model bypassing the schema).
+                if sm.state not in (
+                    VerifyPhaseState.POSTPATCH_CLEAN, VerifyPhaseState.TEST_PASSED,
+                ):
                     logger.warning(
-                        "verify_done emitted before any patch was applied (step %s) — pushing back",
-                        step.id, extra={"task_id": self._task_id},
+                        "verify_done called from invalid state %s (step %s)",
+                        sm.state.value, step.id, extra={"task_id": self._task_id},
                     )
                     history.append({
                         "role": "assistant",
@@ -184,32 +268,8 @@ class ToolLoop:
                     history.append({
                         "role": "tool_result", "tool": "_verify_guard",
                         "content": (
-                            "verify_done is not valid here: no patch has been applied yet. "
-                            "If the change is already present, emit_patch with a no-op "
-                            "(search_replace where search == replace) to enter verify phase, "
-                            "then run the required checks before emitting verify_done."
-                        ),
-                    })
-                    continue
-
-                # Guard 2: claimed verified=True but the last verify-phase run_command failed
-                verified = bool(response.get("verified", False))
-                if verified and last_verify_run_errored:
-                    logger.warning(
-                        "verify_done(verified=True) after failing run_command (step %s)",
-                        step.id, extra={"task_id": self._task_id},
-                    )
-                    history.append({
-                        "role": "assistant",
-                        "content": json.dumps(response, default=str),
-                    })
-                    history.append({
-                        "role": "tool_result", "tool": "_verify_guard",
-                        "content": (
-                            "Cannot claim verified=true: the last run_command exited non-zero. "
-                            "Fix the failure (use setup_env to install missing tools, or "
-                            "correct the code), re-run the check, and emit verify_done "
-                            "only when it passes."
+                            "verify_done is not valid in the current state.\n"
+                            f"{sm.state_description()}"
                         ),
                     })
                     continue
@@ -217,7 +277,7 @@ class ToolLoop:
                 return VerifyResult(
                     patch_document=last_patch_document,
                     touched_files=all_touched_files,
-                    verified=verified,
+                    verified=verified_flag,
                     test_output=str(response.get("test_output", "")),
                     tool_trace=trace,
                 )
@@ -247,6 +307,28 @@ class ToolLoop:
                         f"Step {step.id!r}: emit_patch has non-list 'patch_ops'"
                         f" at iteration {iteration}"
                     )
+
+                # Dedup: block exact-repeat emit_patch within the current SM state stay.
+                # The cache clears on every transition, so reads / patch failures / postpatch
+                # events all reset it. Same-args retries are possible after the model reads.
+                patch_key = _build_patch_key(patch_ops)
+                if sm.check_patch_dedup(patch_key):
+                    logger.warning(
+                        "[loop] emit_patch dedup blocked: task=%s step=%s state=%s",
+                        self._task_id, step.id, sm.state.value,
+                    )
+                    history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                    history.append({
+                        "role": "tool_result", "tool": "_patch_apply",
+                        "content": (
+                            "DUPLICATE PATCH BLOCKED: you already attempted this exact patch "
+                            "in the current state. Read the file with read_file to get current "
+                            "content, then emit a corrected patch.\n"
+                            f"{sm.state_description()}"
+                        ),
+                    })
+                    continue
+                sm.record_patch_attempt(patch_key)
 
                 patch_document = self._wrap_as_patch_document(patch_ops)
                 history.append({"role": "assistant", "content": json.dumps(response, default=str)})
@@ -292,6 +374,24 @@ class ToolLoop:
                                         "type": "patch_failed",
                                         "payload": {"step_id": step.id, "error": new_err},
                                     })
+                                    try:
+                                        sm.transition(VerifyPhaseEvent.PATCH_FAILED)
+                                    except VerifyPhaseExhausted:
+                                        logger.warning(
+                                            "[loop] patch retries exhausted: task=%s step=%s",
+                                            self._task_id, step.id,
+                                        )
+                                        return VerifyResult(
+                                            patch_document=last_patch_document,
+                                            touched_files=all_touched_files,
+                                            verified=False,
+                                            test_output=(
+                                                f"Step {step.id!r}: emit_patch failed "
+                                                f"{MAX_PATCH_RETRIES} consecutive times — "
+                                                "giving up on this step attempt."
+                                            ),
+                                            tool_trace=trace,
+                                        )
                                     continue
                                 # Patch succeeded after extension — fall through to success path.
                             else:
@@ -313,10 +413,35 @@ class ToolLoop:
                                 })
                                 continue  # stay in explore, agent corrects/revises
                         else:
-                            feedback = (
-                                f"Patch FAILED: {error_msg}\n"
-                                "Fix your search strings and re-emit."
-                            )
+                            if "appears" in error_msg and "times" in error_msg:
+                                feedback = (
+                                    f"Patch FAILED: {error_msg}\n"
+                                    "Your search string matches multiple locations — it is not unique.\n"
+                                    "DO NOT re-emit immediately. Instead:\n"
+                                    "  1. Call search_code with the ambiguous text to see all occurrences.\n"
+                                    "  2. Pick a longer, unique surrounding context from one occurrence.\n"
+                                    "  3. Re-emit using that longer string as your search field.\n"
+                                    "\nsearch_code tool schema:\n" + _sc_json
+                                )
+                            elif "not found" in error_msg.lower():
+                                feedback = (
+                                    f"Patch FAILED: {error_msg}\n"
+                                    "The search text does not exist in the file.\n"
+                                    "DO NOT re-emit immediately. You MUST read the file first:\n"
+                                    "  1. Call read_file on the target file to get its exact current content.\n"
+                                    "  2. Find the exact text as it exists now.\n"
+                                    "  3. Re-emit using ONLY text returned by read_file as your search field.\n"
+                                    "\nread_file tool schema:\n" + _rf_json + "\n"
+                                    "\nsearch_code tool schema (alternative):\n" + _sc_json
+                                )
+                            else:
+                                feedback = (
+                                    f"Patch FAILED: {error_msg}\n"
+                                    "Call read_file or search_code to get the current file content, "
+                                    "then re-emit using only text you just read.\n"
+                                    "\nread_file tool schema:\n" + _rf_json + "\n"
+                                    "\nsearch_code tool schema:\n" + _sc_json
+                                )
                             history.append({
                                 "role": "tool_result", "tool": "_patch_apply",
                                 "content": feedback,
@@ -325,7 +450,25 @@ class ToolLoop:
                                 "type": "patch_failed",
                                 "payload": {"step_id": step.id, "error": error_msg},
                             })
-                            continue  # stay in explore, agent corrects and re-emits
+                            try:
+                                sm.transition(VerifyPhaseEvent.PATCH_FAILED)
+                            except VerifyPhaseExhausted:
+                                logger.warning(
+                                    "[loop] patch retries exhausted: task=%s step=%s",
+                                    self._task_id, step.id,
+                                )
+                                return VerifyResult(
+                                    patch_document=last_patch_document,
+                                    touched_files=all_touched_files,
+                                    verified=False,
+                                    test_output=(
+                                        f"Step {step.id!r}: emit_patch failed "
+                                        f"{MAX_PATCH_RETRIES} consecutive times — "
+                                        "giving up on this step attempt."
+                                    ),
+                                    tool_trace=trace,
+                                )
+                            continue  # SM moved to PATCH_FAILED_MUST_READ; model must read
 
                     # Patch succeeded
                     touched = apply_result.get("touched_files", [])
@@ -350,21 +493,44 @@ class ToolLoop:
                     },
                 )
 
-                # Always enter verify phase — execution agent decides what to run
-                phase = "verify"
-                last_verify_run_errored = False
+                # Patch succeeded — switch to shadow reads, run postpatch analyzer,
+                # fire POSTPATCH_BLOCKING or POSTPATCH_CLEAN event.
+                self._registry.use_shadow_for_reads()
                 touched_files_str = ", ".join(all_touched_files) or "none"
                 testing_strategy = step.testing_strategy or "not specified"
-                test_cmd_hint = step.test_command or "none — discover from testing_strategy and touched files"
+                test_cmd_hint = step.test_command or "none — derive from testing_strategy and touched files"
+                _shadow_root = getattr(self._registry, "_shadow_root", None)
+                auto_checks, _blocking_clean = (
+                    await _POST_PATCH_ANALYZER.analyze(
+                        _shadow_root,
+                        all_touched_files,
+                        baseline=self._static_baseline,
+                    )
+                    if _shadow_root is not None
+                    else ("", True)
+                )
+                _last_auto_checks_error = (
+                    auto_checks.strip() if (not _blocking_clean and auto_checks) else ""
+                )
+                _last_test_failure = ""  # a fresh patch invalidates any prior test failure
+                postpatch_event = (
+                    VerifyPhaseEvent.POSTPATCH_CLEAN
+                    if _blocking_clean
+                    else VerifyPhaseEvent.POSTPATCH_BLOCKING
+                )
+                sm.transition(postpatch_event)
+                logger.info(
+                    "[loop] patch applied: task=%s step=%s touched=%s state→%s",
+                    self._task_id, step.id, all_touched_files, sm.state.value,
+                )
                 history.append({
                     "role": "tool_result", "tool": "_patch_apply",
                     "content": (
-                        "Patch applied successfully. Entering VERIFY PHASE.\n"
+                        f"Patch applied.\n"
                         f"Touched files: {touched_files_str}\n"
                         f"testing_strategy: {testing_strategy}\n"
                         f"test_command hint: {test_cmd_hint}\n"
-                        "Run linters then tests. Emit verify_done when all pass, "
-                        "or emit_patch again to correct failures."
+                        + auto_checks
                     ),
                 })
                 self._broadcaster.broadcast(self._broadcast_key, {
@@ -382,6 +548,9 @@ class ToolLoop:
                 continue
 
             # ── tool_call ────────────────────────────────────────────────
+            # Reads are no longer deduped — re-reading a file is harmless and often
+            # necessary after a patch. Only emit_patch is dedup-checked, via the SM.
+
             if action_type != "tool_call":
                 raise ToolBudgetExceededError(
                     f"Step {step.id!r}: unexpected response type '{action_type}'"
@@ -442,26 +611,93 @@ class ToolLoop:
             raw_args = response.get("args")
             args: dict[str, object] = raw_args if isinstance(raw_args, dict) else {}
 
+            args_repr = json.dumps(args, default=str)[:300]
+            logger.info(
+                "[loop] tool_call: task=%s step=%s phase=%s iter=%d tool=%s args=%s",
+                self._task_id, step.id, phase, iteration + 1, tool_name, args_repr,
+            )
             self._broadcaster.broadcast(self._broadcast_key, {
                 "type": "tool_call",
-                "payload": {"tool": tool_name, "thought": thought[:300], "iteration": iteration + 1, "phase": phase},
+                "payload": {"tool": tool_name, "thought": thought[:300], "iteration": iteration + 1, "phase": phase, "args": args},
             })
+            if self._thinking_log is not None:
+                path = str(args.get("path", "")) if isinstance(args, dict) else ""
+                file_label = f" {path.split('/')[-1]}" if path else ""
+                self._thinking_log.append(f"{tool_name}{file_label} — {thought[:200]}" if thought else f"{tool_name}{file_label}")
 
             tool_output = await self._registry.execute(tool_name, args)
             usage.tool_calls_used += 1
 
-            # Track verify-phase run_command failures so verify_done(verified=True) can be
-            # rejected if the agent claims pass despite a failing check.
-            if phase == "verify" and tool_name == "run_command":
-                last_verify_run_errored = tool_output.is_error
-
-            # A successful setup_env or init_workspace clears the previous
-            # "binary not found" failure — the binary is now expected to exist.
+            # READ_CALLED fires only when the model reads while in PATCH_FAILED_MUST_READ.
+            # In all other states reads execute without a SM transition.
             if (
-                tool_name in ("setup_env", "init_workspace")
+                tool_name in ("read_file", "search_code")
+                and sm.state == VerifyPhaseState.PATCH_FAILED_MUST_READ
                 and not tool_output.is_error
             ):
-                last_verify_run_errored = False
+                sm.transition(VerifyPhaseEvent.READ_CALLED)
+                logger.info(
+                    "[loop] READ_CALLED: task=%s step=%s state→%s",
+                    self._task_id, step.id, sm.state.value,
+                )
+
+            # Prior-step file nudge: if the model reads a file touched by an accepted
+            # earlier step, remind it that the content is current (already promoted)
+            # and it should not re-implement what was already done.
+            if tool_name == "read_file" and not tool_output.is_error:
+                _read_path = str(args.get("path", ""))
+                _prior_files: list[str] = step_context.get("prior_step_files") or []  # type: ignore[assignment]
+                _target_paths = {t["path"] for t in (step_context.get("targets") or []) if isinstance(t, dict)}  # type: ignore[index]
+                if _read_path in _prior_files:
+                    _is_target = _read_path in _target_paths
+                    _scope_note = (
+                        "It is one of your targets — you may patch it directly."
+                        if _is_target
+                        else "It is not in your targets — patching it will trigger a scope-extension prompt."
+                    )
+                    _prior_nudge = (
+                        f"\n\n⚠️  PRIOR-STEP FILE: `{_read_path}` was modified and accepted by an earlier step. "
+                        "The content above already reflects those changes — do NOT re-implement what is already there. "
+                        f"{_scope_note} "
+                        "Only add changes NEW to your step's goal."
+                    )
+                    from agentd.tools.registry import ToolOutput as _ToolOutput
+                    tool_output = _ToolOutput(
+                        output=tool_output.output + _prior_nudge,
+                        is_error=False,
+                    )
+                    logger.info(
+                        "[loop] prior-step nudge injected: task=%s step=%s file=%s",
+                        self._task_id, step.id, _read_path,
+                    )
+
+            out_preview = tool_output.output[:200].replace("\n", "↵")
+            logger.info(
+                "[loop] tool_result: task=%s step=%s tool=%s is_error=%s chars=%d preview=%r",
+                self._task_id, step.id, tool_name, tool_output.is_error, len(tool_output.output), out_preview,
+            )
+
+            # Fire TEST_PASSED / TEST_FAILED on run_command result (only from states
+            # where run_command is in the allowed set; the schema enforces this, but
+            # we still gate the SM dispatch to avoid InvalidVerifyPhaseTransition).
+            if tool_name == "run_command" and sm.state in (
+                VerifyPhaseState.POSTPATCH_CLEAN, VerifyPhaseState.TEST_FAILED,
+            ):
+                test_event = (
+                    VerifyPhaseEvent.TEST_PASSED
+                    if not tool_output.is_error
+                    else VerifyPhaseEvent.TEST_FAILED
+                )
+                sm.transition(test_event)
+                _last_test_failure = (
+                    tool_output.output[:300] if tool_output.is_error else ""
+                )
+                logger.info(
+                    "[loop] run_command result: task=%s step=%s is_error=%s state→%s",
+                    self._task_id, step.id, tool_output.is_error, sm.state.value,
+                )
+            # find_binary / setup_env / init_workspace are diagnostic — they don't
+            # fire SM events. Their result text stays in history for the model to read.
 
             self._broadcaster.broadcast(self._broadcast_key, {
                 "type": "tool_result",
