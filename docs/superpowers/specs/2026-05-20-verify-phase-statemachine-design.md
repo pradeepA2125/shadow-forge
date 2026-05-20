@@ -73,7 +73,7 @@ in the prompt as informational context.
 
 ```python
 class VerifyPhaseEvent(str, Enum):
-    PATCH_FAILED       = "patch_failed"       # search text not found / apply error
+    PATCH_FAILED       = "patch_failed"       # any patch op failed (stale state, bad range, missing node, etc.)
     READ_CALLED        = "read_called"        # read_file or search_code dispatched
     POSTPATCH_BLOCKING = "postpatch_blocking" # py_compile/mypy errors after patch
     POSTPATCH_CLEAN    = "postpatch_clean"    # no blocking errors after patch
@@ -204,8 +204,8 @@ the same file is harmless and necessary for model reasoning across retry cycles.
 **Cache clear on transition.** Every call to `transition()` resets `_seen_patch_calls` before
 entering the new state. This covers:
 
-- After `patch_failed` → `PATCH_FAILED_MUST_READ`: cache clears. After reading, the same patch
-  body can be submitted again (with corrected search text).
+- After `patch_failed` → `PATCH_FAILED_MUST_READ`: cache clears. After reading, the model can
+  retry with corrected arguments based on actual file state.
 - After `postpatch_blocking` / `postpatch_clean` (patch applied + analyzer ran): cache clears.
   Model can patch a different location in the same file without the prior patch key blocking it.
 - After `test_failed` → `TEST_FAILED`: cache clears. Model can re-apply a fix to the same
@@ -363,13 +363,12 @@ Available tools: read_file, search_code, list_directory, emit_patch
 **`PATCH_FAILED_MUST_READ`**
 
 ```
-Your last patch failed — the search text was not found in the file. This usually means the
-file content differs from what you expected, either because a prior patch changed it or the
-search string doesn't match exactly (whitespace, indentation, nearby lines).
+Your last patch failed — the file content doesn't match what your patch expected. This applies
+to any op type: search text not found, diff doesn't apply, AST node missing, byte range wrong.
+The file may have changed since you last read it, or your assumptions were off.
 
-To help you correct the patch, emit_patch is unavailable right now. Read the actual file
-content first so you have the exact text to search for. Once you call read_file or
-search_code, emit_patch becomes available again.
+To help you correct the patch, emit_patch is unavailable right now. Read the actual current
+file content first. Once you call read_file or search_code, emit_patch becomes available again.
 
 Available tools: read_file, search_code, list_directory
 Next: read the file → emit_patch unlocks
@@ -381,9 +380,9 @@ Next: read the file → emit_patch unlocks
 
 ```
 You've read the file. emit_patch is available again (retry {retry_count} of {MAX_PATCH_RETRIES}).
-Use the exact text from your last read as the search string — copy it verbatim, including
-indentation and surrounding lines. If the same search string keeps failing, try a smaller,
-more distinctive excerpt, or switch to a different operation type.
+Use what you just read to construct a correct patch — exact text, correct line range, or the
+right AST node, depending on your op type. If the same approach keeps failing, try a different
+operation type (e.g. apply_diff instead of search_replace).
 
 Available tools: read_file, search_code, list_directory, emit_patch
 ```

@@ -197,12 +197,12 @@ class VerifyPhaseStateMachine:
         if s == _S.PATCH_FAILED_MUST_READ:
             return (
                 "CURRENT STATE: PATCH_FAILED — MUST READ BEFORE RETRYING\n"
-                "Your last patch failed — the search text was not found in the file. "
-                "This usually means the file content differs from what you expected "
-                "(whitespace, indentation, or a prior patch changed it).\n\n"
-                "emit_patch is unavailable right now. Read the actual file content first "
-                "so you have the exact text to search for. Once you call read_file or "
-                "search_code, emit_patch becomes available again.\n"
+                "Your last patch failed — the file content doesn't match what your patch "
+                "expected. This applies to any op type: search text not found, diff doesn't "
+                "apply, AST node missing, byte range wrong. The file may have changed since "
+                "you last read it, or your assumptions were off.\n\n"
+                "emit_patch is unavailable right now. Read the actual current file content "
+                "first. Once you call read_file or search_code, emit_patch becomes available again.\n"
                 "Available tools: read_file, search_code, list_directory\n"
                 "Next: read the file → emit_patch unlocks"
             )
@@ -211,10 +211,10 @@ class VerifyPhaseStateMachine:
             return (
                 f"CURRENT STATE: PATCH_FAILED — RETRY {rc} of {mx}\n"
                 "You've read the file. emit_patch is available again. "
-                "Use the exact text from your last read as the search string — "
-                "copy it verbatim including indentation and surrounding lines. "
-                "If the same string keeps failing, try a smaller distinctive excerpt "
-                "or switch to apply_diff.\n"
+                "Use what you just read to construct a correct patch — exact text, correct "
+                "line range, or the right AST node, depending on your op type. "
+                "If the same approach keeps failing, try a different operation type "
+                "(e.g. apply_diff instead of search_replace).\n"
                 "Available tools: read_file, search_code, list_directory, emit_patch"
             )
 
