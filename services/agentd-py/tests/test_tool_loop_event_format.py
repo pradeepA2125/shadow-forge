@@ -6,7 +6,7 @@ from agentd.domain.models import PlanStep, TaskBudget, TaskUsage
 
 class _ToolCallEngine:
     """Scripted engine: one tool_call then emit_patch."""
-    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description=""):
+    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description="", allowed_action_types=None):
         if not history:
             return {"type": "tool_call", "thought": "t", "tool": "read_file", "args": {"path": "a.py"}}
         if len(history) == 2:  # after tool_result

@@ -99,6 +99,7 @@ class ReplanningReasoner:
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (step_context, tool_definitions, on_thinking)
         in_verify = any(
@@ -129,6 +130,7 @@ class ReplanningReasoner:
         tool_definitions: list,
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict:
         _ = (plan_context, history, tool_definitions)
         return {
@@ -249,6 +251,7 @@ class MarkdownBlueprintReasoner(ReplanningReasoner):
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (step_context, tool_definitions, on_thinking)
         in_verify = any(
@@ -329,6 +332,7 @@ class NewFileIntentReasoner(ReplanningReasoner):
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (step_context, tool_definitions, on_thinking)
         in_verify = any(

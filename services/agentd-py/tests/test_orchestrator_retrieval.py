@@ -25,6 +25,7 @@ class RecordingReasoningEngine:
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (history, tool_definitions)
         self.planning_step_calls.append({"plan_context": plan_context})
@@ -105,6 +106,7 @@ class RecordingReasoningEngine:
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (tool_definitions, on_thinking)
         in_verify = any(

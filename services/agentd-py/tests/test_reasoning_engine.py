@@ -11,14 +11,8 @@ from agentd.reasoning.engine import DefaultReasoningEngine
 
 
 class FakeTransport:
-    def __init__(
-        self,
-        *,
-        json_outputs: list[dict[str, object]] | None = None,
-        text_outputs: list[str] | None = None,
-    ) -> None:
+    def __init__(self, *, json_outputs: list[dict[str, object]] | None = None) -> None:
         self._json_outputs = json_outputs or []
-        self._text_outputs = text_outputs or []
         self.calls: list[dict[str, Any]] = []
 
     async def generate_json(
@@ -29,7 +23,9 @@ class FakeTransport:
         schema: dict[str, object],
         system_instructions: str,
         user_payload: dict[str, object],
+        on_thinking: object = None,
     ) -> dict[str, object]:
+        _ = on_thinking
         self.calls.append(
             {
                 "kind": "json",
@@ -42,22 +38,8 @@ class FakeTransport:
         )
         return self._json_outputs.pop(0)
 
-    async def generate_text(
-        self,
-        *,
-        model: str,
-        system_instructions: str,
-        user_payload: dict[str, object],
-    ) -> str:
-        self.calls.append(
-            {
-                "kind": "text",
-                "model": model,
-                "system_instructions": system_instructions,
-                "user_payload": user_payload,
-            }
-        )
-        return self._text_outputs.pop(0)
+    async def generate_text(self, **_: object) -> str:
+        raise NotImplementedError("generate_text is not used")
 
 
 @pytest.mark.asyncio
@@ -131,91 +113,46 @@ async def test_reasoning_engine_rejects_schema_mismatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reasoning_engine_builds_markdown_plan_with_transport(tmp_path: Path) -> None:
-    transport = FakeTransport(text_outputs=["# Plan\n\n- Update endpoint"])
+async def test_create_tool_step_filters_type_enum_by_allowed_action_types() -> None:
+    """When allowed_action_types is passed, the schema's outer `type` enum is
+    restricted to that subset — closes the schema-bypass gap for emit_patch
+    and verify_done that aren't covered by the inner tool-list filter."""
+    transport = FakeTransport(
+        json_outputs=[{"type": "tool_call", "thought": "t",
+                        "tool": "read_file", "args": {"path": "a.py"}}],
+    )
     engine = DefaultReasoningEngine(model="gpt-5", transport=transport)
-    task = TaskRecord(task_id="t1", goal="goal", workspace_path=str(tmp_path), plan_markdown="# Existing")
 
-    markdown = await engine.create_markdown_plan(
-        task,
-        str(tmp_path),
-        retrieval_context={"related_files": ["a.py"], "plan_feedback": "tighten scope"},
+    await engine.create_tool_step(
+        step_context={"goal": "g", "targets": []},
+        history=[],
+        tool_definitions=[],
+        allowed_action_types=frozenset({"tool_call", "revision_needed"}),
     )
 
-    assert markdown == "# Plan\n\n- Update endpoint"
-    assert len(transport.calls) == 1
     call = transport.calls[0]
-    assert call["kind"] == "text"
-    assert call["user_payload"]["plan_markdown"] == "# Existing"
-    assert call["user_payload"]["plan_feedback"] == "tighten scope"
+    type_enum = call["schema"]["properties"]["type"]["enum"]
+    assert type_enum == ["tool_call", "revision_needed"]
+    assert "emit_patch" not in type_enum
+    assert "verify_done" not in type_enum
 
 
 @pytest.mark.asyncio
-async def test_reasoning_engine_builds_plan_critiques_with_transport(tmp_path: Path) -> None:
+async def test_create_tool_step_unfiltered_when_allowed_action_types_none() -> None:
+    """Default (None) keeps all four action types — legacy back-compat."""
     transport = FakeTransport(
-        json_outputs=[
-            {
-                "verdict": "revise",
-                "issues": [
-                    {
-                        "code": "invented_file",
-                        "message": "tasks.py is not a real target",
-                        "file": "agentd/api/tasks.py",
-                    }
-                ],
-            },
-            {
-                "verdict": "pass",
-                "issues": [],
-            },
-        ]
+        json_outputs=[{"type": "tool_call", "thought": "t",
+                        "tool": "read_file", "args": {"path": "a.py"}}],
     )
     engine = DefaultReasoningEngine(model="gpt-5", transport=transport)
-    task = TaskRecord(
-        task_id="t1",
-        goal="goal",
-        workspace_path=str(tmp_path),
-        plan_markdown="# Approved\n\n- Update `src/routes.py`",
-    )
-    retrieval_context = {
-        "planner_evidence": {
-            "workspace_files_index": ["src/routes.py"],
-            "evidence_files": [{"path": "src/routes.py", "excerpt": "def route():\n    pass"}],
-            "evidence_symbols": [],
-            "evidence_routes_models_storage": {"routes": [], "models": [], "storage": []},
-            "diagnostics_excerpt": [],
-            "confidence_notes": [],
-        },
-        "plan_feedback": "use existing route",
-    }
 
-    markdown_critique = await engine.critique_markdown_plan(
-        task,
-        str(tmp_path),
-        retrieval_context,
-        "# Draft\n\n- Update `agentd/api/tasks.py`",
-    )
-    json_critique = await engine.critique_json_plan(
-        task,
-        str(tmp_path),
-        retrieval_context,
-        {
-            "analysis": "x",
-            "steps": [
-                {
-                    "id": "s1",
-                    "goal": "x",
-                    "targets": [{"path": "src/routes.py", "intent": "existing"}],
-                    "risk": "low",
-                }
-            ],
-            "expected_files": ["src/routes.py"],
-            "stop_conditions": ["tests pass"],
-        },
+    await engine.create_tool_step(
+        step_context={"goal": "g", "targets": []},
+        history=[],
+        tool_definitions=[],
     )
 
-    assert markdown_critique["verdict"] == "revise"
-    assert markdown_critique["issues"][0]["code"] == "invented_file"
-    assert json_critique["verdict"] == "pass"
-    assert transport.calls[0]["schema_name"] == "markdown_plan_critique"
-    assert transport.calls[1]["schema_name"] == "json_plan_critique"
+    type_enum = transport.calls[0]["schema"]["properties"]["type"]["enum"]
+    assert set(type_enum) == {"tool_call", "emit_patch", "verify_done", "revision_needed"}
+
+

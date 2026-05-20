@@ -22,7 +22,7 @@ class _DummyReasoningEngine:
         _ = (task, workspace_path, diagnostics, retrieval_context, kwargs)
         raise RuntimeError("not used in scoring tests")
 
-    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description=""):  # type: ignore[no-untyped-def]
+    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description="", allowed_action_types=None):  # type: ignore[no-untyped-def]
         raise RuntimeError("not used in scoring tests")
 
     async def create_planning_step(self, plan_context, history, tool_definitions, on_thinking=None):  # type: ignore[no-untyped-def]

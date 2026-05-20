@@ -191,8 +191,9 @@ async def test_verify_context_message_contains_touched_files_and_strategy(tmp_pa
             tool_definitions: list[dict],
             on_thinking: object = None,
             state_description: str = "",
+            allowed_action_types: frozenset[str] | None = None,
         ) -> dict:
-            _ = state_description
+            _ = (state_description, allowed_action_types)
             captured_histories.append(list(history))
             return await super().create_tool_step(step_context, history, tool_definitions)
 
@@ -276,7 +277,7 @@ async def test_state_machine_verify_done_allowed_in_postpatch_clean_without_test
 
         async def create_tool_step(
             self, step_context, history, tool_definitions,
-            on_thinking=None, state_description="",
+            on_thinking=None, state_description="", allowed_action_types=None,
         ):
             _ = (step_context, history, on_thinking)
             self.turn += 1
@@ -357,7 +358,7 @@ async def test_state_machine_patch_retry_exhaustion_returns_verify_result(tmp_pa
 
         async def create_tool_step(
             self, step_context, history, tool_definitions,
-            on_thinking=None, state_description="",
+            on_thinking=None, state_description="", allowed_action_types=None,
         ):
             _ = (step_context, history, tool_definitions, on_thinking)
             # In MUST_READ the model must read before emit_patch unlocks.

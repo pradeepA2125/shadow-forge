@@ -27,7 +27,7 @@ class _ScriptedReasoning:
         self._responses = list(responses)
         self.received: list[tuple[dict, list, list]] = []
 
-    async def create_tool_step(self, *, step_context, history, tool_definitions, on_thinking=None, state_description=""):
+    async def create_tool_step(self, *, step_context, history, tool_definitions, on_thinking=None, state_description="", allowed_action_types=None):
         self.received.append((dict(step_context), list(history), list(tool_definitions)))
         return self._responses.pop(0)
 

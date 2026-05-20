@@ -16,7 +16,7 @@ class _EmitPatchEngine:
         self._search = search
         self._replace = replace
 
-    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description=""):
+    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description="", allowed_action_types=None):
         in_verify = any(
             isinstance(msg.get("content"), str) and "Patch applied successfully" in msg["content"]
             for msg in history

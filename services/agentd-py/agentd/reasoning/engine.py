@@ -128,7 +128,10 @@ class DefaultReasoningEngine(ReasoningEngine):
         tool_definitions: list[dict[str, object]],
         on_thinking: Callable[[str], None] | None = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
+        import copy
+
         from agentd.reasoning.tool_prompts import (
             AGENT_STEP_RESPONSE_SCHEMA,
             build_tool_step_payload,
@@ -140,10 +143,27 @@ class DefaultReasoningEngine(ReasoningEngine):
         )
         inject_tools_into_payload(user_payload, tool_definitions)
         system_instructions = format_tool_system_prompt()
+
+        # Filter the outer `type` enum per SM state when caller specifies what's
+        # allowed. Deep-copy the module-level schema so other callers aren't affected.
+        schema: dict[str, object] = AGENT_STEP_RESPONSE_SCHEMA
+        if allowed_action_types is not None:
+            schema = copy.deepcopy(AGENT_STEP_RESPONSE_SCHEMA)
+            props = schema.get("properties")
+            if isinstance(props, dict):
+                type_prop = props.get("type")
+                if isinstance(type_prop, dict):
+                    # Preserve original ordering for stability.
+                    original_enum = type_prop.get("enum")
+                    if isinstance(original_enum, list):
+                        type_prop["enum"] = [
+                            t for t in original_enum if t in allowed_action_types
+                        ]
+
         result = await self._transport.generate_json(
             model=self._model,
             schema_name="agent_step_response",
-            schema=AGENT_STEP_RESPONSE_SCHEMA,
+            schema=schema,
             system_instructions=system_instructions,
             user_payload=user_payload,
             on_thinking=on_thinking,

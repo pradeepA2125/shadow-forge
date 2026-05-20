@@ -37,12 +37,18 @@ class ReasoningEngine(Protocol):
         tool_definitions: list[dict[str, object]],
         on_thinking: Callable[[str], None] | None = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         """Run one turn of the ReAct loop: given history + tools, return the next action.
 
         state_description is the per-turn output of
         VerifyPhaseStateMachine.state_description() — injected into the user
         payload so the model knows which state it is in and what is available.
+
+        allowed_action_types restricts the top-level response 'type' enum
+        (tool_call / emit_patch / verify_done / revision_needed) to the subset
+        valid in the current SM state. When None, all four are allowed (legacy
+        behaviour for callers not wired to the SM).
 
         Returns a dict with at minimum {"type": "tool_call"|"emit_patch", "thought": str}.
         For tool_call: also "tool" (name) and "args" (dict).

@@ -61,9 +61,11 @@ _TRANSITIONS: dict[tuple[_S, _E], _S] = {
     (_S.POSTPATCH_CLEAN,        _E.TEST_FAILED):        _S.TEST_FAILED,
     (_S.POSTPATCH_CLEAN,        _E.TEST_PASSED):        _S.TEST_PASSED,
     # Defensive: emit_patch is not in the POSTPATCH_CLEAN schema, but a model bypassing
-    # the schema (or a scripted test) may still emit one. If it fails, recover into
-    # MUST_READ rather than blowing up the loop.
+    # the schema (or a scripted test) may still emit one. Cover all three outcomes so
+    # the SM never blows up the loop on bypass.
     (_S.POSTPATCH_CLEAN,        _E.PATCH_FAILED):       _S.PATCH_FAILED_MUST_READ,
+    (_S.POSTPATCH_CLEAN,        _E.POSTPATCH_CLEAN):    _S.POSTPATCH_CLEAN,
+    (_S.POSTPATCH_CLEAN,        _E.POSTPATCH_BLOCKING): _S.POSTPATCH_BLOCKING,
 
     (_S.TEST_FAILED,            _E.PATCH_FAILED):       _S.PATCH_FAILED_MUST_READ,
     (_S.TEST_FAILED,            _E.POSTPATCH_BLOCKING): _S.POSTPATCH_BLOCKING,
@@ -72,7 +74,11 @@ _TRANSITIONS: dict[tuple[_S, _E], _S] = {
     (_S.TEST_FAILED,            _E.TEST_PASSED):        _S.TEST_PASSED,
 
     # Defensive (same rationale as POSTPATCH_CLEAN + PATCH_FAILED above).
+    # All three patch-outcome events covered so successful schema-bypass patches
+    # don't crash the loop.
     (_S.TEST_PASSED,            _E.PATCH_FAILED):       _S.PATCH_FAILED_MUST_READ,
+    (_S.TEST_PASSED,            _E.POSTPATCH_CLEAN):    _S.POSTPATCH_CLEAN,
+    (_S.TEST_PASSED,            _E.POSTPATCH_BLOCKING): _S.POSTPATCH_BLOCKING,
 }
 
 _ALLOWED_TOOLS: dict[_S, frozenset[str]] = {
@@ -83,7 +89,8 @@ _ALLOWED_TOOLS: dict[_S, frozenset[str]] = {
     _S.PATCH_FAILED_CAN_RETRY: frozenset({"read_file", "search_code", "list_directory",
                                            "search_semantic", "emit_patch"}),
     _S.POSTPATCH_BLOCKING:     frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "emit_patch"}),
+                                           "search_semantic", "emit_patch",
+                                           "find_binary", "setup_env", "init_workspace"}),
     _S.POSTPATCH_CLEAN:        frozenset({"read_file", "search_code", "list_directory",
                                            "search_semantic", "run_command", "verify_done",
                                            "find_binary", "setup_env", "init_workspace"}),
@@ -142,6 +149,26 @@ class VerifyPhaseStateMachine:
     def allowed_tools(self) -> frozenset[str]:
         """Tool names available in the current state. Used to filter the JSON schema."""
         return _ALLOWED_TOOLS[self.state]
+
+    def allowed_action_types(self) -> frozenset[str]:
+        """Top-level response 'type' values allowed in the current state.
+
+        Derived from allowed_tools: emit_patch and verify_done membership in the
+        allowed-tools table mirrors their availability as response action types.
+        tool_call and revision_needed are always allowed — the former because
+        any tool execution flows through it, the latter as an escape hatch
+        when the plan is wrong (model needs to be able to signal that anywhere).
+
+        Used to filter AGENT_STEP_RESPONSE_SCHEMA.type.enum per turn so a model
+        cannot bypass state gating by crafting an off-schema action type.
+        """
+        allowed = _ALLOWED_TOOLS[self.state]
+        types: set[str] = {"tool_call", "revision_needed"}
+        if "emit_patch" in allowed:
+            types.add("emit_patch")
+        if "verify_done" in allowed:
+            types.add("verify_done")
+        return frozenset(types)
 
     def check_patch_dedup(self, patch_key: tuple) -> bool:
         """True if this exact patch was already attempted in the current state stay."""

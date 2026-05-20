@@ -169,6 +169,19 @@ def test_allowed_tools_must_read_excludes_emit_patch():
     assert "run_command" not in sm.allowed_tools()
 
 
+def test_allowed_tools_postpatch_blocking_includes_binary_discovery():
+    """POSTPATCH_BLOCKING permits find_binary/setup_env/init_workspace so the
+    model can fix missing-dependency blocking errors. run_command stays gated."""
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_BLOCKING)
+    tools = sm.allowed_tools()
+    assert "find_binary" in tools
+    assert "setup_env" in tools
+    assert "init_workspace" in tools
+    assert "emit_patch" in tools
+    assert "run_command" not in tools, "run_command must stay gated until static checks pass"
+
+
 def test_allowed_tools_postpatch_clean_includes_run_verify_and_env():
     sm = make_sm()
     sm.transition(E.POSTPATCH_CLEAN)
@@ -266,3 +279,114 @@ def test_state_description_iteration_header():
     sm = make_sm()
     desc = sm.state_description(iteration=7)
     assert "[iteration 7]" in desc
+
+
+# ── defensive transitions (schema bypass with success) ────────────────────────
+
+def test_postpatch_clean_self_loop_on_postpatch_clean():
+    """Schema bypass: emit_patch from POSTPATCH_CLEAN succeeds, analyzer clean.
+    SM should idempotently stay in POSTPATCH_CLEAN."""
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    sm.transition(E.POSTPATCH_CLEAN)
+    assert sm.state == S.POSTPATCH_CLEAN
+
+
+def test_postpatch_clean_to_blocking_on_schema_bypass_success():
+    """Schema bypass: emit_patch from POSTPATCH_CLEAN succeeds but introduces a
+    blocking error. SM moves to POSTPATCH_BLOCKING rather than crashing."""
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    sm.transition(E.POSTPATCH_BLOCKING)
+    assert sm.state == S.POSTPATCH_BLOCKING
+
+
+def test_test_passed_to_postpatch_clean_on_schema_bypass_success():
+    """Schema bypass: emit_patch from TEST_PASSED succeeds, analyzer clean.
+    SM moves back to POSTPATCH_CLEAN (the new patch invalidates the test result)."""
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    sm.transition(E.TEST_PASSED)
+    sm.transition(E.POSTPATCH_CLEAN)
+    assert sm.state == S.POSTPATCH_CLEAN
+
+
+def test_test_passed_to_postpatch_blocking_on_schema_bypass_success():
+    """Schema bypass: emit_patch from TEST_PASSED succeeds but introduces a
+    blocking error."""
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    sm.transition(E.TEST_PASSED)
+    sm.transition(E.POSTPATCH_BLOCKING)
+    assert sm.state == S.POSTPATCH_BLOCKING
+
+
+# ── allowed_action_types (top-level response type filtering) ──────────────────
+
+def test_allowed_action_types_explore_includes_emit_patch_not_verify_done():
+    sm = make_sm()
+    types = sm.allowed_action_types()
+    assert "tool_call" in types
+    assert "revision_needed" in types
+    assert "emit_patch" in types
+    assert "verify_done" not in types
+
+
+def test_allowed_action_types_must_read_excludes_emit_patch():
+    sm = make_sm()
+    sm.transition(E.PATCH_FAILED)
+    types = sm.allowed_action_types()
+    assert "tool_call" in types
+    assert "revision_needed" in types
+    assert "emit_patch" not in types
+    assert "verify_done" not in types
+
+
+def test_allowed_action_types_postpatch_clean_has_verify_done_not_emit_patch():
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    types = sm.allowed_action_types()
+    assert "verify_done" in types
+    assert "emit_patch" not in types
+    # tool_call always available so run_command can be invoked
+    assert "tool_call" in types
+
+
+def test_allowed_action_types_test_passed_only_terminal_actions():
+    sm = make_sm()
+    sm.transition(E.POSTPATCH_CLEAN)
+    sm.transition(E.TEST_PASSED)
+    types = sm.allowed_action_types()
+    assert "verify_done" in types
+    assert "emit_patch" not in types
+    assert "tool_call" in types  # reads still need to work
+    assert "revision_needed" in types  # escape hatch
+
+
+def test_allowed_action_types_revision_needed_always_available():
+    """revision_needed is the escape hatch — must be available from every state."""
+    sm = make_sm()
+    states_to_check = [
+        S.EXPLORE,
+        S.PATCH_FAILED_MUST_READ,
+        S.POSTPATCH_BLOCKING,
+        S.POSTPATCH_CLEAN,
+        S.TEST_FAILED,
+        S.TEST_PASSED,
+    ]
+    # Walk through each state via valid transitions and check
+    sm2 = make_sm()  # EXPLORE
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.PATCH_FAILED)  # MUST_READ
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.READ_CALLED)  # CAN_RETRY
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.POSTPATCH_BLOCKING)  # BLOCKING
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.POSTPATCH_CLEAN)  # CLEAN
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.TEST_FAILED)  # FAILED
+    assert "revision_needed" in sm2.allowed_action_types()
+    sm2.transition(E.TEST_PASSED)  # PASSED
+    assert "revision_needed" in sm2.allowed_action_types()
+    _ = states_to_check  # sanity reference

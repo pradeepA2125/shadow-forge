@@ -45,7 +45,7 @@ class AlwaysPassValidator:
 class RevisionNeededEngine:
     """Engine that immediately emits revision_needed."""
 
-    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description=""):
+    async def create_tool_step(self, step_context, history, tool_definitions, on_thinking=None, state_description="", allowed_action_types=None):
         return {
             "type": "revision_needed",
             "thought": "Target file is wrong",
@@ -100,6 +100,7 @@ class DeltaReplanReasoner:
         tool_definitions: list,
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict:
         _ = (history, tool_definitions)
         self.planning_step_calls += 1
@@ -160,6 +161,7 @@ class DeltaReplanReasoner:
         tool_definitions: list,
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict:
         _ = (tool_definitions, on_thinking)
         self.tool_step_calls += 1
@@ -263,6 +265,7 @@ class AlwaysRevisionNeededReasoner:
         tool_definitions: list,
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict:
         _ = (history, tool_definitions)
         self.planning_step_calls += 1
@@ -321,6 +324,7 @@ class AlwaysRevisionNeededReasoner:
         tool_definitions: list,
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict:
         _ = (step_context, history, tool_definitions, on_thinking)
         self.tool_step_calls += 1

@@ -210,6 +210,7 @@ class ToolLoop:
                         error_summary=_last_auto_checks_error,
                         failure_summary=_last_test_failure,
                     ),
+                    allowed_action_types=sm.allowed_action_types(),
                 )
             except RuntimeError as exc:
                 # Malformed / non-JSON response from the model. Inject into history
@@ -399,9 +400,11 @@ class ToolLoop:
                                 feedback = (
                                     f"Patch FAILED: {error_msg}\n"
                                     f"Scope extension was not granted ({decision.reason}). "
-                                    "Options: (1) implement the change using only your allowed "
-                                    "files, or (2) emit revision_needed explaining which file "
-                                    "must be added to the plan and why."
+                                    "This exact patch is now blocked from re-submission "
+                                    "in the current state (dedup). "
+                                    "Options: (1) emit a different patch using only your "
+                                    "allowed files, or (2) emit revision_needed explaining "
+                                    "which file must be added to the plan and why."
                                 )
                                 history.append({
                                     "role": "tool_result", "tool": "_patch_apply",

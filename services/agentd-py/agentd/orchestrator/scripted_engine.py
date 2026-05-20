@@ -76,6 +76,7 @@ class ScriptedReasoningEngine:
         tool_definitions: list[dict[str, object]],
         on_thinking: object = None,
         state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (step_context, history, tool_definitions, on_thinking, state_description)
 

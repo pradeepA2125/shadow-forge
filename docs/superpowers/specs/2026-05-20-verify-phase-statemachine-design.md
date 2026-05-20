@@ -173,7 +173,7 @@ call a tool that is absent from the schema — no prompt-level "please don't do 
 | `EXPLORE` | ✓ | ✓ | ✗ | ✗ |
 | `PATCH_FAILED_MUST_READ` | ✓ | ✗ | ✗ | ✗ |
 | `PATCH_FAILED_CAN_RETRY` | ✓ | ✓ | ✗ | ✗ |
-| `POSTPATCH_BLOCKING` | ✓ | ✓ | ✗ | ✗ |
+| `POSTPATCH_BLOCKING` | ✓ | ✓ | ✓† | ✗ |
 | `POSTPATCH_CLEAN` | ✓ | ✗ | ✓ | ✓ |
 | `TEST_FAILED` | ✓ | ✓ | ✓ | ✗ |
 | `TEST_PASSED` | ✓ | ✗ | ✗ | ✓ |
@@ -186,6 +186,10 @@ Notes:
   message the model uses to decide its next action (`setup_env`, `init_workspace`, or
   `revision_needed`). The state machine only cares about `test_passed` / `test_failed`
   from `run_command` results.
+- † `find_binary`, `setup_env`, `init_workspace` (but **not** `run_command`) are
+  available in `POSTPATCH_BLOCKING` so the model can install a missing dependency
+  when the blocking error is actually a missing-module symptom (e.g. mypy reporting
+  `Cannot find module 'X'`). `run_command` stays gated until static checks pass.
 - `emit_patch` is absent from `POSTPATCH_CLEAN` — once static checks pass, the model
   must either run tests or call `verify_done`. Re-patching happens from `TEST_FAILED`.
 - `verify_done` is available in `POSTPATCH_CLEAN` for steps where no tests are required
