@@ -168,7 +168,7 @@ rows are not listed and not needed.
 Hard-enforced by removing tools from the JSON schema before each model call. The model cannot
 call a tool that is absent from the schema — no prompt-level "please don't do X" required.
 
-| State | read / search / list | emit_patch | run_command | verify_done |
+| State | read / search / list | emit_patch | run_command / find_binary / setup_env / init_workspace | verify_done |
 |---|:---:|:---:|:---:|:---:|
 | `EXPLORE` | ✓ | ✓ | ✗ | ✗ |
 | `PATCH_FAILED_MUST_READ` | ✓ | ✗ | ✗ | ✗ |
@@ -179,17 +179,20 @@ call a tool that is absent from the schema — no prompt-level "please don't do 
 | `TEST_PASSED` | ✓ | ✗ | ✗ | ✓ |
 
 Notes:
+- `run_command`, `find_binary`, `setup_env`, `init_workspace` are grouped together — they
+  are only meaningful when the model is about to run or install something. Gating them
+  together keeps the schema clean in patch-focused states.
+- `find_binary` failure does not fire a state machine event — it returns a diagnostic
+  message the model uses to decide its next action (`setup_env`, `init_workspace`, or
+  `revision_needed`). The state machine only cares about `test_passed` / `test_failed`
+  from `run_command` results.
 - `emit_patch` is absent from `POSTPATCH_CLEAN` — once static checks pass, the model
-  must either run tests or call `verify_done`. If tests expose problems, re-patching
-  happens from `TEST_FAILED`. This prevents the model from silently adding more changes
-  after a clean postpatch without ever validating them.
+  must either run tests or call `verify_done`. Re-patching happens from `TEST_FAILED`.
 - `verify_done` is available in `POSTPATCH_CLEAN` for steps where no tests are required
-  (e.g. doc edits, config changes, comment-only patches). The model can call
-  `verify_done(True)` directly without running `run_command`.
+  (doc edits, config changes, comment-only patches).
 - `run_command` stays available in `TEST_FAILED` so the model can re-run a narrow test
-  subset after patching without waiting for a full postpatch cycle.
-- Read operations (`read_file`, `search_code`, `list_directory`) are available in every
-  state including `TEST_PASSED` — reading is never the wrong action.
+  subset after patching without a full postpatch cycle.
+- Read operations are available in every state — reading is never the wrong action.
 - `emit_patch` is absent from `TEST_PASSED` because the tests already passed; re-patching
   would invalidate the result.
 
