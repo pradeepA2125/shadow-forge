@@ -465,28 +465,19 @@ def build_tool_step_payload(
             )
         else:
             iteration = len(history) // 2
-            # Detect recent patch failures — count consecutive "search text not found" errors
             recent = [str(m.get("content", "")) for m in history[-6:]]
-            patch_fail_count = sum(1 for m in recent if "search text not found" in m or "not found in" in m)
+            patch_fail_count = sum(1 for m in recent if "patch failed" in m.lower() or "not found in" in m)
 
             if patch_fail_count >= 2:
                 payload["instruction"] = (
-                    f"⚠ search_replace has failed {patch_fail_count} times. "
-                    "STOP using search_replace for these locations — switch ops NOW:\n"
-                    "  • apply_diff: call read_file on the target lines first, then emit apply_diff "
-                    "with a unified diff using those exact lines as context.\n"
-                    "  • create_file: if apply_diff is also failing or >30% of the file changes — "
-                    "read_file the full file (start_line=1 to end), then overwrite with create_file.\n"
-                    "Do NOT emit another search_replace with the same or similar search string."
+                    f"⚠ Patch has failed {patch_fail_count} times recently. "
+                    "Reading the file before retrying often helps — the content may differ "
+                    "from what you expected. Consider a different op type if the current one keeps failing."
                 )
             elif patch_fail_count >= 1:
                 payload["instruction"] = (
-                    "⚠ Last patch failed: 'search text not found'. "
-                    "Your search string does not exactly match the file. "
-                    "Call read_file on the specific line range you want to change — "
-                    "use only the text returned by that read as your search field. "
-                    "If read_file confirms the text still doesn't match, switch to apply_diff or create_file "
-                    "(see WHEN search_replace FAILS in the system prompt)."
+                    "⚠ Last patch failed. The file content may not match your expectations — "
+                    "reading it first can help you get the right content before retrying."
                 )
             elif iteration >= 12:
                 payload["instruction"] = (
@@ -498,20 +489,9 @@ def build_tool_step_payload(
                     f"Tool calls used: {iteration}. Consider wrapping up exploration soon."
                 )
             else:
-                payload["instruction"] = (
-                    "Continue. Pattern: search_code to locate a symbol (use context_lines=10) → "
-                    "read_file with start_line/end_line from the search result → "
-                    "search_code again for the next unknown symbol → read_file chunk → emit_patch. "
-                    "Every search hit with a line number REQUIRES an immediate read_file at that line. "
-                    "Do NOT search again before reading the result you just found. "
-                    "Output your NEXT action as a JSON object."
-                )
+                payload["instruction"] = "Continue."
     else:
-        payload["instruction"] = (
-            "Start by calling search_code for a key function or class name from the step goal. "
-            "Do NOT call read_file as your first action — search first to get line numbers, "
-            "then read targeted sections. Output your first action as a JSON object."
-        )
+        payload["instruction"] = "Start exploring — search or read to understand the code before making changes."
 
     return payload
 
