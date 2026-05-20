@@ -253,3 +253,151 @@ async def test_verify_done_empty_output_accepted_when_no_test_command(tmp_path: 
     await orchestrator.run_task("task-empty")
     result = await orchestrator.continue_task("task-empty", feedback=None)
     assert result.status == TaskStatus.READY_FOR_REVIEW
+
+
+# ── State machine integration via ToolLoop ────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_state_machine_verify_done_allowed_in_postpatch_clean_without_test(tmp_path):
+    """POSTPATCH_CLEAN allows verify_done directly — no run_command required for
+    no-test steps (doc edits, config changes, comment-only patches)."""
+    from agentd.domain.models import PlanStep, PlanTarget, PlanTargetIntent
+    from agentd.orchestrator.broadcaster import EventBroadcaster
+    from agentd.tools.loop import ToolLoop, VerifyResult
+    from agentd.tools.registry import ToolRegistry
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    class _PatchThenDoneEngine:
+        def __init__(self) -> None:
+            self.turn = 0
+            self.state_descriptions: list[str] = []
+
+        async def create_tool_step(
+            self, step_context, history, tool_definitions,
+            on_thinking=None, state_description="",
+        ):
+            _ = (step_context, history, on_thinking)
+            self.turn += 1
+            self.state_descriptions.append(state_description)
+            tool_names = {t["name"] for t in tool_definitions}
+            if self.turn == 1:
+                # EXPLORE state: emit_patch is an action type, not a registry tool.
+                # Real tools that should be available: read_file, search_code,
+                # list_directory, search_semantic. run_command should NOT be present.
+                assert "run_command" not in tool_names, (
+                    f"run_command should not be in EXPLORE schema, got: {tool_names}"
+                )
+                assert "read_file" in tool_names
+                return {
+                    "type": "emit_patch",
+                    "thought": "create file",
+                    "patch_ops": [{
+                        "op": "create_file", "file": "a.py",
+                        "content": "x = 1\n", "reason": "init",
+                    }],
+                }
+            # POSTPATCH_CLEAN: run_command becomes available (plus find_binary/setup_env/init_workspace).
+            assert "run_command" in tool_names, (
+                f"run_command should be available in POSTPATCH_CLEAN, got: {tool_names}"
+            )
+            return {
+                "type": "verify_done", "thought": "no tests required",
+                "verified": True, "test_output": "no tests",
+            }
+
+        async def create_patch(self, *a, **kw): return {}
+        async def create_planning_step(self, *a, **kw): return {}
+        async def create_plan(self, *a, **kw): return {}
+
+    broadcaster = EventBroadcaster()
+    registry = ToolRegistry(shadow_root=ws, real_workspace_path=ws)
+    engine = _PatchThenDoneEngine()
+    loop = ToolLoop(
+        engine, registry, broadcaster, "task-sm1",
+        patch_engine=PatchEngine(), shadow_path=ws,
+    )
+    step = PlanStep(
+        id="s1", goal="create a.py",
+        targets=[PlanTarget(path="a.py", intent=PlanTargetIntent.NEW)],
+        risk="low",
+    )
+    from agentd.domain.models import TaskBudget, TaskUsage
+    result = await loop.run(step, {}, TaskBudget(), TaskUsage())
+    assert isinstance(result, VerifyResult)
+    assert result.verified is True
+    # Confirms SM drove the state description: turn 1 EXPLORE, turn 2 POSTPATCH—CLEAN.
+    assert engine.turn == 2
+    assert "EXPLORE" in engine.state_descriptions[0]
+    assert "POSTPATCH" in engine.state_descriptions[1] and "CLEAN" in engine.state_descriptions[1]
+
+
+@pytest.mark.asyncio
+async def test_state_machine_patch_retry_exhaustion_returns_verify_result(tmp_path):
+    """Exhausting MAX_PATCH_RETRIES consecutive engine failures returns
+    VerifyResult(verified=False) rather than raising."""
+    from agentd.domain.models import PlanStep, PlanTarget, PlanTargetIntent
+    from agentd.orchestrator.broadcaster import EventBroadcaster
+    from agentd.tools.loop import ToolLoop, VerifyResult
+    from agentd.tools.registry import ToolRegistry
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "a.py").write_text("x = 1\n")
+
+    class _AlwaysFailPatchEngine:
+        """Emits a patch with a search string that will never match, then reads
+        when blocked. The SM cycles MUST_READ → CAN_RETRY → PATCH_FAILED until
+        the retry counter reaches MAX_PATCH_RETRIES.
+
+        State detection uses state_description (emit_patch/verify_done are action
+        types, not registry tools, so they don't appear in tool_definitions).
+        """
+
+        async def create_tool_step(
+            self, step_context, history, tool_definitions,
+            on_thinking=None, state_description="",
+        ):
+            _ = (step_context, history, tool_definitions, on_thinking)
+            # In MUST_READ the model must read before emit_patch unlocks.
+            if "PATCH_FAILED_MUST_READ" in state_description or (
+                "PATCH_FAILED" in state_description and "RETRY" not in state_description
+            ):
+                return {
+                    "type": "tool_call", "thought": "read",
+                    "tool": "read_file", "args": {"path": "a.py"},
+                }
+            # EXPLORE or CAN_RETRY → emit the doomed patch.
+            return {
+                "type": "emit_patch", "thought": "try patch",
+                "patch_ops": [{
+                    "op": "search_replace", "file": "a.py",
+                    "search": "DOES_NOT_EXIST", "replace": "y = 2",
+                    "reason": "retry test",
+                }],
+            }
+
+        async def create_patch(self, *a, **kw): return {}
+        async def create_planning_step(self, *a, **kw): return {}
+        async def create_plan(self, *a, **kw): return {}
+
+    broadcaster = EventBroadcaster()
+    registry = ToolRegistry(shadow_root=ws, real_workspace_path=ws)
+    loop = ToolLoop(
+        _AlwaysFailPatchEngine(), registry, broadcaster, "task-sm2",
+        patch_engine=PatchEngine(), shadow_path=ws,
+    )
+    step = PlanStep(
+        id="s1", goal="patch a.py",
+        targets=[PlanTarget(path="a.py", intent=PlanTargetIntent.EXISTING)],
+        risk="low",
+    )
+    from agentd.domain.models import TaskBudget, TaskUsage
+    result = await loop.run(step, {}, TaskBudget(), TaskUsage())
+    assert isinstance(result, VerifyResult)
+    assert result.verified is False
+    assert (
+        "consecutive" in result.test_output.lower()
+        or "giving up" in result.test_output.lower()
+    ), f"unexpected test_output: {result.test_output!r}"
