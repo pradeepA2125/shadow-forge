@@ -112,11 +112,9 @@ stateDiagram-v2
     POSTPATCH_BLOCKING --> POSTPATCH_BLOCKING     : patch_success → still blocking
     POSTPATCH_BLOCKING --> POSTPATCH_CLEAN        : patch_success → clean
 
-    POSTPATCH_CLEAN --> PATCH_FAILED_MUST_READ : patch_failed
-    POSTPATCH_CLEAN --> POSTPATCH_BLOCKING     : patch_success → blocking errors
-    POSTPATCH_CLEAN --> POSTPATCH_CLEAN        : patch_success → clean
-    POSTPATCH_CLEAN --> TEST_FAILED            : test_failed
-    POSTPATCH_CLEAN --> TEST_PASSED            : test_passed
+    POSTPATCH_CLEAN --> TEST_FAILED : test_failed
+    POSTPATCH_CLEAN --> TEST_PASSED : test_passed
+    POSTPATCH_CLEAN --> [*]         : verify_done (no tests required) ✓
 
     TEST_FAILED --> PATCH_FAILED_MUST_READ : patch_failed
     TEST_FAILED --> POSTPATCH_BLOCKING     : patch_success → blocking errors
@@ -144,11 +142,9 @@ stateDiagram-v2
 | `POSTPATCH_BLOCKING` | `patch_failed` | `PATCH_FAILED_MUST_READ` |
 | `POSTPATCH_BLOCKING` | `postpatch_blocking` | `POSTPATCH_BLOCKING` (self) |
 | `POSTPATCH_BLOCKING` | `postpatch_clean` | `POSTPATCH_CLEAN` |
-| `POSTPATCH_CLEAN` | `patch_failed` | `PATCH_FAILED_MUST_READ` |
-| `POSTPATCH_CLEAN` | `postpatch_blocking` | `POSTPATCH_BLOCKING` |
-| `POSTPATCH_CLEAN` | `postpatch_clean` | `POSTPATCH_CLEAN` (self) |
 | `POSTPATCH_CLEAN` | `test_failed` | `TEST_FAILED` |
 | `POSTPATCH_CLEAN` | `test_passed` | `TEST_PASSED` |
+| `POSTPATCH_CLEAN` | `verify_done` | terminal |
 | `TEST_FAILED` | `patch_failed` | `PATCH_FAILED_MUST_READ` |
 | `TEST_FAILED` | `postpatch_blocking` | `POSTPATCH_BLOCKING` |
 | `TEST_FAILED` | `postpatch_clean` | `POSTPATCH_CLEAN` |
@@ -172,11 +168,18 @@ call a tool that is absent from the schema — no prompt-level "please don't do 
 | `PATCH_FAILED_MUST_READ` | ✓ | ✗ | ✗ | ✗ |
 | `PATCH_FAILED_CAN_RETRY` | ✓ | ✓ | ✗ | ✗ |
 | `POSTPATCH_BLOCKING` | ✓ | ✓ | ✗ | ✗ |
-| `POSTPATCH_CLEAN` | ✓ | ✓ | ✓ | ✗ |
+| `POSTPATCH_CLEAN` | ✓ | ✗ | ✓ | ✓ |
 | `TEST_FAILED` | ✓ | ✓ | ✓ | ✗ |
 | `TEST_PASSED` | ✓ | ✗ | ✗ | ✓ |
 
 Notes:
+- `emit_patch` is absent from `POSTPATCH_CLEAN` — once static checks pass, the model
+  must either run tests or call `verify_done`. If tests expose problems, re-patching
+  happens from `TEST_FAILED`. This prevents the model from silently adding more changes
+  after a clean postpatch without ever validating them.
+- `verify_done` is available in `POSTPATCH_CLEAN` for steps where no tests are required
+  (e.g. doc edits, config changes, comment-only patches). The model can call
+  `verify_done(True)` directly without running `run_command`.
 - `run_command` stays available in `TEST_FAILED` so the model can re-run a narrow test
   subset after patching without waiting for a full postpatch cycle.
 - Read operations (`read_file`, `search_code`, `list_directory`) are available in every
