@@ -157,7 +157,7 @@ resolve_default_model() {
     anthropic) printf '%s' "${AI_EDITOR_ANTHROPIC_MODEL:-claude-3-5-sonnet-latest}" ;;
     huggingface) printf '%s' "${AI_EDITOR_HUGGINGFACE_MODEL:-deepseek-ai/DeepSeek-R1:fastest}" ;;
     ollama) printf '%s' "${AI_EDITOR_OLLAMA_MODEL:-qwen3:latest}" ;;
-    turboquant) printf '%s' "${AI_EDITOR_TURBOQUANT_MODEL:-qwen3.6:35b-a3b-q4_K_M}" ;;
+    turboquant) printf '%s' "${AI_EDITOR_TURBOQUANT_MODEL:-devstral-small-2:24b-q4_k_xl}" ;;
     *)
       echo "Unsupported backend: $1" >&2
       exit 1
@@ -378,8 +378,8 @@ echo "log_file=$LOG_FILE"
       ;;
   esac
 
-  source "$VENV_DIR/bin/activate"
-  "$UVICORN_BIN" agentd.main:app --port "$PORT" 2>&1 | tee "$LOG_FILE"
+  source ".venv/bin/activate" 2>/dev/null || source "$MAIN_VENV_DIR/bin/activate"
+  uvicorn agentd.main:app --port "$PORT" --reload 2>&1 | tee "$LOG_FILE"
 ) &
 _SERVER_PID=$!
 
@@ -423,6 +423,25 @@ if [[ "$SEMANTIC_VALUE" == "true" ]]; then
     done
   fi
 fi
+
+# Self-updating index: launch the incremental indexer watcher. It re-indexes changed source
+# files → rewrites the snapshot (atomic) → notifies the backend via AI_EDITOR_BACKEND_URL, which
+# delta-re-embeds. LSP is off here — embedding only needs the tree-sitter symbol graph, and a
+# full LSP (rust-analyzer/pyright) is memory-heavy.
+_INDEXER_BIN="$AGENTD_DIR/../indexer-rs/target/release/ai-editor-indexer"
+_WATCHER_PID=""
+if [[ "$SEMANTIC_VALUE" == "true" && -x "$_INDEXER_BIN" ]]; then
+  AI_EDITOR_BACKEND_URL="http://localhost:${PORT}" AI_EDITOR_LSP_ENABLED=false \
+    "$_INDEXER_BIN" index --workspace "$WORKSPACE" --snapshot-path "$SNAPSHOT_PATH" --watch true \
+    >> "$LOG_DIR/indexer-watch.log" 2>&1 &
+  _WATCHER_PID=$!
+  echo "==> indexer watch started (self-updating index): pid=$_WATCHER_PID log=$LOG_DIR/indexer-watch.log"
+elif [[ "$SEMANTIC_VALUE" == "true" ]]; then
+  echo "==> indexer watch NOT started — binary missing: $_INDEXER_BIN (build: cargo build --release in services/indexer-rs)" >&2
+fi
+
+# Don't orphan child processes (backend + watcher) on exit/interrupt.
+trap '[[ -n "$_WATCHER_PID" ]] && kill "$_WATCHER_PID" 2>/dev/null; kill "$_SERVER_PID" 2>/dev/null' EXIT INT TERM
 
 echo "==> backend ready — submitting tasks is now safe"
 wait "$_SERVER_PID"
