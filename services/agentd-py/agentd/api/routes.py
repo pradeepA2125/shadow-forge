@@ -298,6 +298,8 @@ def build_router(
         }
 
         async def event_generator():
+            import asyncio
+
             queue = orchestrator.broadcaster.subscribe(task_id)
             try:
                 # Drain replay buffer first so late-connecting clients get history
@@ -318,7 +320,16 @@ def build_router(
                         return
 
                 while True:
-                    event = await queue.get()
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        # Keep-alive ping — prevents Node.js fetch (undici) from
+                        # dropping the connection during the silent gap while the
+                        # model generates a large plan (no task-channel events for
+                        # minutes), which would otherwise lose the
+                        # AWAITING_PLAN_APPROVAL/plan event on slow inference.
+                        yield ": ping\n\n"
+                        continue
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") == "done":
                         break
