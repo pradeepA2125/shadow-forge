@@ -23,6 +23,37 @@ class PostPatchAnalyzer:
     def __init__(self, checkers: list[LanguageChecker]) -> None:
         self._checkers = checkers
 
+    async def collect_baseline(
+        self,
+        root: Path,
+        files: list[str],
+    ) -> frozenset[str]:
+        """Run the same checkers on the PRE-PATCH version of *files* and return the
+        normalized fingerprints of every non-passing output line.
+
+        This produces a baseline in the EXACT format that analyze()'s per-line
+        filter (_normalize_line) expects — unlike the full-validation baseline,
+        whose whole-message fingerprints can never match a per-line lookup. Call
+        with root pointing at the pre-patch content (real workspace) for the files
+        the step is about to modify; pass the result to analyze(baseline=...).
+        """
+        if not files:
+            return frozenset()
+        paths = [Path(f) for f in files]
+        fingerprints: set[str] = set()
+        for checker in self._checkers:
+            matched = [p for p in paths if checker.matches(p)]
+            if not matched:
+                continue
+            results = await checker.check(matched, root)
+            for r in results:
+                if r.skipped or r.passed:
+                    continue
+                for line in r.output.splitlines():
+                    if line.strip():
+                        fingerprints.add(_normalize_line(line))
+        return frozenset(fingerprints)
+
     async def analyze(
         self,
         shadow_root: Path,
