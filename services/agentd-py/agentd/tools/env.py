@@ -82,6 +82,15 @@ async def find_binary(*, name: str, real_workspace: Path) -> ToolOutput:
                 f"\nAGENT SHOULD: emit_patch to declare '{name}' as a dependency, "
                 f'then setup_env "{hint}"'
             )
+        else:
+            # Generic, tool-agnostic escalation hint — let the agent read the
+            # workspace's project manifest to pick the right package manager.
+            miss += (
+                "\nAGENT SHOULD: if this binary belongs to a project-local dev "
+                "environment, inspect the workspace's project manifest "
+                "(pyproject.toml, package.json, Cargo.toml, go.mod, ...) for the "
+                "package manager and call setup_env with its sync/install command."
+            )
         return ToolOutput(output=miss, is_error=False)
 
     # Workspace-local hit (already first); rank remaining by depth (shallowest first).

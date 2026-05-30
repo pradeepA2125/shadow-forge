@@ -114,11 +114,15 @@ Emit the patch first — the system auto-approves conventional boundary files (_
 index.ts, mod.rs, conftest.py). If scope is explicitly denied and you cannot proceed,
 emit revision_needed citing the missing file and why it is required.
 
-BINARY DISCOVERY (when run_command fails with "not found"):
+BINARY DISCOVERY (when run_command fails with "not found", OR when a binary
+runs but its results suggest the workspace env is missing/wrong — e.g. an
+import / missing-module / dependency error):
   1. find_binary <name>  — probes workspace bins then PATH; follow any AGENT SHOULD hint.
-  2. If found: run_command using the resolved path.
-  3. If not found with existing manifest: setup_env "<pm sync command>"
-  4. If bare workspace: init_workspace ecosystem=<lang> dev_deps=[...] then setup_env.
+  2. If found inside the workspace (.venv/bin/, node_modules/.bin/, …): run_command using the resolved path.
+  3. If only a system-PATH hit is found AND the workspace has a project manifest, prefer setup_env over the system binary — the system binary will likely lack the project's dependencies.
+  4. If a subsequent run_command fails with a missing-module / import / dep error, escalate to setup_env (the workspace env needs bootstrapping or syncing) BEFORE assuming the code is broken.
+  5. If not found at all with existing manifest: setup_env "<pm sync command>"
+  6. If bare workspace: init_workspace ecosystem=<lang> dev_deps=[...] then setup_env.
 
 init_workspace ecosystems: python / node / rust / go — emits minimal manifest, refuses to
 overwrite existing ones. setup_env reads your patched shadow files — deps added via
