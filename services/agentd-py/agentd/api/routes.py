@@ -197,18 +197,29 @@ def build_router(
         return json.loads(profile.model_dump_json())
 
     @router.post("/workspaces/env-profile")
-    async def build_env_profile(workspace: str) -> dict:
-        from agentd.env.profile_builder import EnvProfileBuilder
+    async def build_env_profile(workspace: str, channel_id: str | None = None) -> dict:
+        """Force a rebuild of the workspace env profile.
+
+        Uses the orchestrator's ensurer so SSE events (env_profile_building /
+        env_profile_built) fire just like a task-triggered build. When
+        channel_id is supplied, events route there; otherwise they land on the
+        workspace path (no UI subscriber by default).
+        """
         from agentd.env.profile_store import EnvProfileStore
         ws = Path(workspace)
         if not ws.is_dir():
             raise HTTPException(
                 status_code=400, detail=f"workspace not a directory: {workspace}"
             )
-        # Force a rebuild: reuse the orchestrator's reasoner so tests can script it.
-        builder = EnvProfileBuilder(reasoner=orchestrator._reasoning_engine)
-        profile = await builder.build(ws)
-        EnvProfileStore().write(ws, profile)
+        # Wipe the existing profile so ensure()'s is_stale check doesn't short-circuit.
+        store = EnvProfileStore()
+        profile_path = store.path_for(ws)
+        if profile_path.is_file():
+            profile_path.unlink()
+        await orchestrator._env_ensurer.ensure(ws, channel_id=channel_id)
+        profile = store.read(ws)
+        if profile is None:
+            raise HTTPException(status_code=500, detail="env profile build failed")
         return json.loads(profile.model_dump_json())
 
     @router.post("/tasks", response_model=TaskCreateResponse)
@@ -322,6 +333,31 @@ def build_router(
             return await store.get_task_events(task_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get("/channels/{channel_id}/stream")
+    async def stream_channel(channel_id: str) -> StreamingResponse:
+        """Permissive SSE: subscribe to any broadcaster channel without
+        requiring it to be a task_id. Used by env-profile route callers
+        and other admin/dev tooling that need to observe workspace-level
+        SSE events (env_profile_*) before any task exists."""
+
+        async def event_generator():
+            queue = orchestrator.broadcaster.subscribe(channel_id)
+            try:
+                while not queue.empty():
+                    event = queue.get_nowait()
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("type") == "done":
+                        return
+                while True:
+                    event = await queue.get()
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("type") == "done":
+                        return
+            finally:
+                orchestrator.broadcaster.unsubscribe(channel_id, queue)
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @router.get("/tasks/{task_id}/stream-patch")
     async def stream_task_patches(task_id: str) -> StreamingResponse:
