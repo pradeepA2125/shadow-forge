@@ -183,6 +183,34 @@ def build_router(
     _in_flight_validation: set[str] = set()
     _in_flight_command: set[str] = set()
 
+    @router.get("/workspaces/env-profile")
+    async def get_env_profile(workspace: str) -> dict:
+        from agentd.env.profile_store import EnvProfileStore
+        ws = Path(workspace)
+        if not ws.is_dir():
+            raise HTTPException(
+                status_code=400, detail=f"workspace not a directory: {workspace}"
+            )
+        profile = EnvProfileStore().read(ws)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="env profile not built")
+        return json.loads(profile.model_dump_json())
+
+    @router.post("/workspaces/env-profile")
+    async def build_env_profile(workspace: str) -> dict:
+        from agentd.env.profile_builder import EnvProfileBuilder
+        from agentd.env.profile_store import EnvProfileStore
+        ws = Path(workspace)
+        if not ws.is_dir():
+            raise HTTPException(
+                status_code=400, detail=f"workspace not a directory: {workspace}"
+            )
+        # Force a rebuild: reuse the orchestrator's reasoner so tests can script it.
+        builder = EnvProfileBuilder(reasoner=orchestrator._reasoning_engine)
+        profile = await builder.build(ws)
+        EnvProfileStore().write(ws, profile)
+        return json.loads(profile.model_dump_json())
+
     @router.post("/tasks", response_model=TaskCreateResponse)
     async def create_task(request: TaskCreateRequest) -> TaskCreateResponse:
         import asyncio

@@ -10,8 +10,16 @@ from pathlib import Path
 from fastapi import FastAPI
 
 
-def build_app(workspace_path: str) -> FastAPI:
-    """Construct a self-contained FastAPI app for a given workspace path."""
+def build_app(
+    workspace_path: str,
+    *,
+    draft_conventions_responses: list[dict] | None = None,
+) -> FastAPI:
+    """Construct a self-contained FastAPI app for a given workspace path.
+
+    draft_conventions_responses: pre-canned LLM responses for the env profile
+    build path; threaded through to ScriptedReasoningEngine.
+    """
     from agentd.api.routes import build_router
     from agentd.chat.agent import ChatAgent
     from agentd.chat.storage import ChatThreadStore
@@ -41,7 +49,11 @@ def build_app(workspace_path: str) -> FastAPI:
     store = InMemoryTaskStore()
     ws_manager = ShadowWorkspaceManager(Path(workspace_path) / ".agentd" / "shadows")
     chat_store = ChatThreadStore(Path(workspace_path) / "chat.db")
-    scripted_engine = ScriptedReasoningEngine(plan={"analysis": "", "steps": []}, patches=[])
+    scripted_engine = ScriptedReasoningEngine(
+        plan={"analysis": "", "steps": []},
+        patches=[],
+        draft_conventions_responses=draft_conventions_responses,
+    )
     orchestrator = AgentOrchestrator(
         store=store,
         reasoning_engine=scripted_engine,
