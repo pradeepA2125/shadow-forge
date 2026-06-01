@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agentd.tools._paths import resolve_workspace_bin
 from agentd.tools.registry import ToolOutput
+from agentd.tools.shell import _resolve_workspace_cwd
 
 _MAX_OUTPUT_CHARS = 4000
 
@@ -348,6 +349,7 @@ async def setup_env(
     command: str,
     shadow_root: Path,
     real_workspace: Path,
+    cwd: str | None = None,
     timeout_sec: int = _SETUP_ENV_TIMEOUT_SEC,
 ) -> ToolOutput:
     """Run an env setup command in shadow_root (reads patched dep files),
@@ -419,10 +421,11 @@ async def setup_env(
 
     # cargo/go/poetry/rustup: cwd=shadow_root is sufficient; they use global caches/toolchains
 
+    resolved_cwd = _resolve_workspace_cwd(shadow_root, cwd)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd_parts,
-            cwd=str(shadow_root),
+            cwd=str(resolved_cwd),
             stdout=PIPE,
             stderr=STDOUT,
             env=env,

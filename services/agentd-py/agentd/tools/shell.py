@@ -29,12 +29,29 @@ _DEFAULT_TIMEOUT_SEC = 60
 _PY_IMPORT_TOOLS = {"pytest", "mypy", "python", "python3"}
 
 
+def _resolve_workspace_cwd(shadow_root: Path, cwd: str | None) -> Path:
+    """Resolve an agent-supplied cwd to an absolute path INSIDE shadow_root.
+
+    Empty/None → shadow_root. Relative → joined under shadow_root.
+    Absolute paths and paths that escape shadow_root (`..` traversal,
+    foreign absolute roots) are clamped back to shadow_root."""
+    if not cwd:
+        return shadow_root
+    target = (shadow_root / cwd).resolve() if not Path(cwd).is_absolute() else Path(cwd).resolve()
+    try:
+        target.relative_to(shadow_root.resolve())
+    except ValueError:
+        return shadow_root
+    return target if target.is_dir() else shadow_root
+
+
 async def run_command(
     *,
     command: str,
     args: list[str],
     shadow_root: Path,
     real_workspace_path: Path,
+    cwd: str | None = None,
     timeout_sec: int = _DEFAULT_TIMEOUT_SEC,
     binary_name_override: str | None = None,
 ) -> ToolOutput:
@@ -76,11 +93,12 @@ async def run_command(
         ),
     )
 
+    resolved_cwd = _resolve_workspace_cwd(shadow_root, cwd)
     try:
         proc = await asyncio.create_subprocess_exec(
             command,
             *args,
-            cwd=str(shadow_root),
+            cwd=str(resolved_cwd),
             env=env,
             stdout=PIPE,
             stderr=STDOUT,

@@ -117,6 +117,7 @@ class ToolRegistry:
                     "properties": {
                         "command": {"type": "string", "description": "Command name or full path"},
                         "args": {"type": "array", "items": {"type": "string"}, "description": "Command arguments"},
+                        "cwd": {"type": "string", "description": "Optional working directory, RELATIVE to the workspace root (e.g. 'services/agentd-py'). Empty/omitted = workspace root. Paths that escape the workspace are clamped to root."},
                     },
                     "required": ["command"],
                 },
@@ -160,6 +161,7 @@ class ToolRegistry:
                         "type": "object",
                         "properties": {
                             "command": {"type": "string", "description": "Full command string, e.g. 'uv sync' or 'npm ci'"},
+                            "cwd": {"type": "string", "description": "Optional working directory, RELATIVE to the workspace root (e.g. 'services/agentd-py' for a monorepo where pyproject.toml is in a subdir). Empty/omitted = workspace root."},
                         },
                         "required": ["command"],
                     },
@@ -274,7 +276,7 @@ class ToolRegistry:
             raw_args = args.get("args", [])
             cmd_args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
             command = str(args.get("command", ""))
-            cwd = str(args.get("cwd", "")) or ""
+            cwd = str(args.get("cwd", "")) or ""  # relative to shadow_root; "" = shadow_root
             binary_name = Path(command).name  # basename used by binary-rule matching
             if self._command_approval_callback is not None:
                 decision = await self._command_approval_callback(command, cmd_args, cwd)
@@ -292,6 +294,7 @@ class ToolRegistry:
                 args=cmd_args,
                 shadow_root=self._shadow_root,
                 real_workspace_path=self._real_workspace_path,
+                cwd=cwd or None,
                 binary_name_override=binary_name,
             )
 
@@ -308,6 +311,7 @@ class ToolRegistry:
                 command=str(args.get("command", "")),
                 shadow_root=self._shadow_root,
                 real_workspace=self._real_workspace_path,
+                cwd=str(args.get("cwd", "")) or None,
             )
 
         if name == "init_workspace":
