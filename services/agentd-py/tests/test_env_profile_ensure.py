@@ -66,6 +66,30 @@ async def test_ensure_reuses_fresh_profile_skips_llm(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ensure_broadcasts_to_both_task_and_chat_channels(tmp_path: Path):
+    """W1: when chat_channel_id is also supplied (chat-driven resume), events
+    fan out to both channels so both UIs surface env activity."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    canned = {
+        "ecosystems": [{
+            "ecosystem": "python", "subdir": "", "manifest_path": "pyproject.toml",
+            "package_manager": "uv", "install_command": "uv sync",
+            "interpreter_or_runner": ".venv/bin/python", "test_command": "pytest",
+            "declared_dependencies_top": [], "notes": None,
+        }],
+        "conventions_notes": None,
+    }
+    reasoner = ScriptedReasoningEngine(plan=None, patches=[], draft_conventions_responses=[canned])
+    broadcaster = _RecordingBroadcaster()
+    ensurer = EnvProfileEnsurer(reasoner=reasoner, broadcaster=broadcaster)
+
+    await ensurer.ensure(tmp_path, channel_id="task-abc", chat_channel_id="chat-xyz")
+
+    channels = {ch for ch, _ in broadcaster.events}
+    assert channels == {"task-abc", "chat-xyz"}
+
+
+@pytest.mark.asyncio
 async def test_ensure_broadcasts_on_supplied_channel_id(tmp_path: Path):
     """When channel_id is passed (orchestrator passes task_id), SSE events
     must land on that channel — not the workspace path."""

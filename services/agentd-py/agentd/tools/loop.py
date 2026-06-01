@@ -228,6 +228,33 @@ class ToolLoop:
             if isinstance(_real_root_for_profile, Path)
             else None
         )
+        _shadow_root_for_install: Path | None = getattr(
+            self._registry, "_shadow_root", None
+        )
+
+        async def _flush_pending_install() -> None:
+            """W7: drain any pending install before the loop returns success so
+            a manifest write in the final patch isn't lost when the model emits
+            verify_done immediately afterwards."""
+            nonlocal _pending_install_for_scope
+            if _pending_install_for_scope is None:
+                return
+            if not (
+                isinstance(_shadow_root_for_install, Path)
+                and isinstance(_real_root_for_profile, Path)
+            ):
+                _pending_install_for_scope = None
+                return
+            from agentd.env.auto_sync import maybe_run_pending_install
+            await maybe_run_pending_install(
+                scope_key=_pending_install_for_scope,
+                real_workspace=_real_root_for_profile,
+                shadow_root=_shadow_root_for_install,
+                broadcaster=self._broadcaster,
+                broadcast_key=self._broadcast_key,
+            )
+            _pending_install_for_scope = None
+
         had_scope_violation: bool = False     # True if any patch was rejected for out-of-scope file
         _last_auto_checks_error: str = ""     # first ~300 chars of postpatch output when blocking
         _last_test_failure: str = ""          # first ~300 chars of last failing run_command output
@@ -416,6 +443,7 @@ class ToolLoop:
                     })
                     continue
 
+                await _flush_pending_install()
                 return VerifyResult(
                     patch_document=last_patch_document,
                     touched_files=all_touched_files,
@@ -720,6 +748,7 @@ class ToolLoop:
                     "payload": {"step_id": step.id, "phase": "verify", "touched_files": all_touched_files},
                 })
                 if self._skip_verify:
+                    await _flush_pending_install()
                     return VerifyResult(
                         patch_document=last_patch_document,
                         touched_files=all_touched_files,

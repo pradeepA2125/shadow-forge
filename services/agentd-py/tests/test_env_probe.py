@@ -71,6 +71,54 @@ async def test_probe_flags_setuptools_flat_layout_risk(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_probe_flags_venv_absent_for_python_without_venv(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    result = await EcosystemProbe.scan(tmp_path)
+    assert any(d.startswith("VENV_ABSENT:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_probe_no_venv_absent_when_venv_python_exists(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
+    (bin_dir / "python").chmod(0o755)
+    result = await EcosystemProbe.scan(tmp_path)
+    assert not any(d.startswith("VENV_ABSENT:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_probe_flags_node_modules_absent(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"name": "x", "version": "1.0.0"}')
+    result = await EcosystemProbe.scan(tmp_path)
+    assert any(d.startswith("NODE_MODULES_ABSENT:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_probe_no_node_modules_absent_when_directory_exists(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"name": "x", "version": "1.0.0"}')
+    (tmp_path / "node_modules").mkdir()
+    result = await EcosystemProbe.scan(tmp_path)
+    assert not any(d.startswith("NODE_MODULES_ABSENT:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_probe_flags_lockfile_missing_for_python_without_lock(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    result = await EcosystemProbe.scan(tmp_path)
+    assert any(d.startswith("LOCKFILE_MISSING:python:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_probe_no_lockfile_missing_when_uv_lock_present(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    (tmp_path / "uv.lock").write_text("# locked\n")
+    result = await EcosystemProbe.scan(tmp_path)
+    assert not any(d.startswith("LOCKFILE_MISSING:python:") for d in result.diagnostics)
+
+
+@pytest.mark.asyncio
 async def test_probe_skips_node_modules_and_venv_dirs(tmp_path: Path):
     (tmp_path / "package.json").write_text('{"name": "outer"}')
     (tmp_path / "node_modules" / "inner").mkdir(parents=True)

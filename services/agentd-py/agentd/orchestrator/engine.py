@@ -679,7 +679,13 @@ class AgentOrchestrator:
         chat_done itself in this case — this method's background task owns that.
         """
         parent = await self._store.get(parent_task_id)
-        await self._env_ensurer.ensure(Path(parent.workspace_path))
+        # SSE: broadcast to the parent's task channel AND the chat channel (when
+        # this resume is triggered from chat) so both UIs surface env_profile_*.
+        await self._env_ensurer.ensure(
+            Path(parent.workspace_path),
+            channel_id=parent.task_id,
+            chat_channel_id=chat_channel_id,
+        )
         if parent.status not in {TaskStatus.FAILED, TaskStatus.ABORTED}:
             raise ValueError(f"Cannot resume task in {parent.status} state (must be FAILED or ABORTED)")
         if not parent.plan:
@@ -756,6 +762,9 @@ class AgentOrchestrator:
 
         inline_task_id = f"inline-{uuid4().hex[:12]}"
         real_path = Path(workspace_path)
+        # W5: ensure the workspace env profile exists for inline changes too.
+        # Routes SSE to the chat channel so the user sees env activity in chat.
+        await self._env_ensurer.ensure(real_path, channel_id=channel_id)
         logger.info(
             "[inline] run_inline_change start: id=%s goal=%.80s workspace=%s explore_entries=%d",
             inline_task_id, goal, workspace_path, len(explore_context),

@@ -57,31 +57,39 @@ class EnvProfileEnsurer:
         workspace_root: Path,
         *,
         channel_id: str | None = None,
+        chat_channel_id: str | None = None,
     ) -> None:
         try:
             workspace_key = str(workspace_root.resolve())
-            sse_channel = channel_id or workspace_key
+            # Broadcast to every distinct channel the caller cares about so the
+            # chat panel (chat channel) AND the task review-panel (task channel)
+            # both see env_profile_* events during a chat-driven resume.
+            sse_channels = {channel_id or workspace_key}
+            if chat_channel_id:
+                sse_channels.add(chat_channel_id)
             lock = self._locks.setdefault(workspace_key, asyncio.Lock())
             async with lock:
                 if not self._store.is_stale(workspace_root):
                     return
 
-                self._broadcaster.broadcast(sse_channel, {
-                    "type": "env_profile_building",
-                    "payload": {"workspace_root": workspace_key},
-                })
+                for ch in sse_channels:
+                    self._broadcaster.broadcast(ch, {
+                        "type": "env_profile_building",
+                        "payload": {"workspace_root": workspace_key},
+                    })
 
                 builder = EnvProfileBuilder(reasoner=self._reasoner)
                 profile = await builder.build(workspace_root)
                 self._store.write(workspace_root, profile)
 
-                self._broadcaster.broadcast(sse_channel, {
-                    "type": "env_profile_built",
-                    "payload": {
-                        "ecosystems_count": len(profile.ecosystems),
-                        "bootstrap_needed": profile.bootstrap_needed,
-                    },
-                })
+                for ch in sse_channels:
+                    self._broadcaster.broadcast(ch, {
+                        "type": "env_profile_built",
+                        "payload": {
+                            "ecosystems_count": len(profile.ecosystems),
+                            "bootstrap_needed": profile.bootstrap_needed,
+                        },
+                    })
         except Exception as exc:  # noqa: BLE001 — supplementary infra; never block the task
             logger.warning(
                 "env profile ensure failed (continuing with fallback): %s",

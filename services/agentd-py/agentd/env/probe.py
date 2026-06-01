@@ -101,7 +101,11 @@ class EcosystemProbe:
                 lockfiles_present=locks,
             ))
 
-            cls._diagnose(ecosystem, text, top_dirs, rel_manifest, result.diagnostics)
+            cls._diagnose(
+                ecosystem, text, top_dirs, rel_manifest, result.diagnostics,
+                manifest_dir=manifest_abs.parent,
+                lockfiles_present=locks,
+            )
 
         result.workspace_tree = cls._workspace_tree(workspace_root, cap=80)
 
@@ -171,6 +175,9 @@ class EcosystemProbe:
         top_dirs: list[str],
         rel_manifest: str,
         diagnostics: list[str],
+        *,
+        manifest_dir: Path | None = None,
+        lockfiles_present: list[str] | None = None,
     ) -> None:
         if ecosystem == "python":
             if (
@@ -181,4 +188,33 @@ class EcosystemProbe:
                 diagnostics.append(
                     f"SETUPTOOLS_FLAT_LAYOUT_RISK:{rel_manifest}:"
                     f"multiple top-level dirs {top_dirs} and no packages.find stanza"
+                )
+            # W3: venv absence is the most actionable signal for the agent —
+            # tells it 'don't try to run the interpreter directly; setup_env first'.
+            if manifest_dir is not None:
+                venv_python = manifest_dir / ".venv" / "bin" / "python"
+                if not venv_python.is_file():
+                    diagnostics.append(
+                        f"VENV_ABSENT:{rel_manifest}:.venv not yet created — "
+                        "setup_env must run before the interpreter is usable"
+                    )
+        elif ecosystem == "node":
+            if manifest_dir is not None and not (manifest_dir / "node_modules").is_dir():
+                diagnostics.append(
+                    f"NODE_MODULES_ABSENT:{rel_manifest}:node_modules not yet installed"
+                )
+        elif ecosystem == "rust":
+            if manifest_dir is not None and not (manifest_dir / "target").is_dir():
+                diagnostics.append(
+                    f"CARGO_TARGET_ABSENT:{rel_manifest}:target/ not yet built"
+                )
+
+        # W8: lockfile-missing signal (applies to ecosystems where a lockfile is
+        # standard practice — Python and Node especially). Helps the consumer
+        # pick the right install_command (uv sync vs uv lock + sync; npm install
+        # vs npm ci) and warns the agent that reproducibility is lower.
+        if lockfiles_present is not None and ecosystem in ("python", "node", "rust"):
+            if not lockfiles_present:
+                diagnostics.append(
+                    f"LOCKFILE_MISSING:{ecosystem}:{rel_manifest}:no recognized lockfile"
                 )

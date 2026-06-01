@@ -9,6 +9,111 @@ from agentd.orchestrator.scripted_engine import ScriptedReasoningEngine
 
 
 @pytest.mark.asyncio
+async def test_build_skips_llm_when_python_lockfile_is_unambiguous(tmp_path: Path):
+    """W2: python + uv.lock → conventions synthesised, no LLM call."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname=\"x\"\nversion=\"0\"\ndependencies=[\"fastapi\",\"pydantic\"]\n"
+    )
+    (tmp_path / "uv.lock").write_text("# locked\n")
+
+    class WouldRaiseReasoner:
+        async def draft_conventions(self, *, probe):
+            raise AssertionError("LLM must not be called when fast-path applies")
+
+    builder = EnvProfileBuilder(reasoner=WouldRaiseReasoner())
+    profile = await builder.build(tmp_path)
+
+    assert profile.bootstrap_needed is False
+    assert profile.ecosystems[0].package_manager == "uv"
+    assert profile.ecosystems[0].install_command == "uv sync"
+    assert profile.ecosystems[0].interpreter_or_runner == ".venv/bin/python"
+    assert profile.ecosystems[0].test_command == "pytest"
+    assert "fastapi" in profile.ecosystems[0].declared_dependencies_top
+    assert "no LLM call" in (profile.conventions_notes or "")
+
+
+@pytest.mark.asyncio
+async def test_build_synthesises_node_with_package_lock(tmp_path: Path):
+    (tmp_path / "package.json").write_text(
+        '{"name": "x", "version": "1.0.0", "devDependencies": {"vitest": "*"}}'
+    )
+    (tmp_path / "package-lock.json").write_text('{}')
+
+    class WouldRaiseReasoner:
+        async def draft_conventions(self, *, probe):
+            raise AssertionError("must not be called")
+
+    builder = EnvProfileBuilder(reasoner=WouldRaiseReasoner())
+    profile = await builder.build(tmp_path)
+
+    entry = profile.ecosystems[0]
+    assert entry.package_manager == "npm"
+    assert entry.install_command == "npm ci"
+    assert entry.test_command == "vitest run"
+
+
+@pytest.mark.asyncio
+async def test_build_synthesises_with_subdir_prefix_on_paths(tmp_path: Path):
+    """Fast-path interpreter_or_runner must include the subdir (W4 origin)."""
+    sub = tmp_path / "services" / "agentd-py"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    (sub / "uv.lock").write_text("# locked\n")
+
+    builder = EnvProfileBuilder(reasoner=ScriptedReasoningEngine(plan=None, patches=[]))
+    profile = await builder.build(tmp_path)
+
+    entry = profile.ecosystems[0]
+    assert entry.interpreter_or_runner == "services/agentd-py/.venv/bin/python"
+
+
+@pytest.mark.asyncio
+async def test_build_falls_through_to_llm_when_python_has_no_lockfile(tmp_path: Path):
+    """Ambiguous case: pyproject only, no lockfile → LLM call required."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    canned = {
+        "ecosystems": [{
+            "ecosystem": "python", "subdir": "", "manifest_path": "pyproject.toml",
+            "package_manager": "uv", "install_command": "uv sync",
+            "interpreter_or_runner": ".venv/bin/python", "test_command": "pytest",
+            "declared_dependencies_top": [], "notes": None,
+        }],
+        "conventions_notes": "ambiguous, LLM chose uv",
+    }
+    engine = ScriptedReasoningEngine(plan=None, patches=[], draft_conventions_responses=[canned])
+    builder = EnvProfileBuilder(reasoner=engine)
+    profile = await builder.build(tmp_path)
+
+    assert profile.conventions_notes == "ambiguous, LLM chose uv"
+
+
+@pytest.mark.asyncio
+async def test_build_normalises_interpreter_path_from_llm(tmp_path: Path):
+    """W4: LLM returns interpreter_or_runner without subdir prefix → prepend it."""
+    sub = tmp_path / "services" / "agentd-py"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    # No lockfile in subdir → fast-path returns None → LLM call.
+    canned = {
+        "ecosystems": [{
+            "ecosystem": "python",
+            "subdir": "services/agentd-py",
+            "manifest_path": "services/agentd-py/pyproject.toml",
+            "package_manager": "uv", "install_command": "uv sync",
+            "interpreter_or_runner": ".venv/bin/python",  # ← missing subdir
+            "test_command": "pytest",
+            "declared_dependencies_top": [], "notes": None,
+        }],
+        "conventions_notes": None,
+    }
+    engine = ScriptedReasoningEngine(plan=None, patches=[], draft_conventions_responses=[canned])
+    builder = EnvProfileBuilder(reasoner=engine)
+    profile = await builder.build(tmp_path)
+
+    assert profile.ecosystems[0].interpreter_or_runner == "services/agentd-py/.venv/bin/python"
+
+
+@pytest.mark.asyncio
 async def test_build_returns_profile_from_probe_and_llm(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname=\"demo\"\nversion=\"0\"\ndependencies=[\"fastapi\"]\n"
