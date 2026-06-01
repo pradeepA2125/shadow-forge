@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from agentd.domain.models import Diagnostic, PlanStep, TaskRecord
+
+if TYPE_CHECKING:
+    from agentd.env.probe import ProbeResult
 
 
 class ReasoningEngine(Protocol):
@@ -69,5 +72,14 @@ class ReasoningEngine(Protocol):
         For tool_call: also "tool" (name) and "args" (dict).
         For emit_plan: also "plan_markdown", "files_examined", "confidence".
         For emit_revision: also "revised_steps", "reverted_step_ids", "revision_summary".
+        """
+        ...
+
+    async def draft_conventions(self, *, probe: "ProbeResult") -> dict[str, object]:
+        """Single structured LLM call that returns the env_profile body
+        (ecosystems + conventions_notes). Called once per workspace at
+        registration / refresh time. Implementations should pass the probe
+        result to build_draft_conventions_payload and the schema from
+        env_prompts.
         """
         ...

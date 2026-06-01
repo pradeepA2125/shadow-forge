@@ -19,12 +19,16 @@ class ScriptedReasoningEngine:
         plan: object,
         patches: list[object],
         tool_step_responses: list[dict[str, object]] | None = None,
+        draft_conventions_responses: list[dict[str, object]] | None = None,
     ) -> None:
         self._plan = plan
         self._patches = patches
         self._patch_index = 0
         self._tool_step_responses: list[dict[str, object]] = tool_step_responses or []
         self._tool_step_index = 0
+        self._draft_conventions_responses: list[dict[str, object]] = list(
+            draft_conventions_responses or []
+        )
 
     async def create_plan(
         self,
@@ -120,3 +124,9 @@ class ScriptedReasoningEngine:
             "files_examined": [],
             "confidence": "high",
         }
+
+    async def draft_conventions(self, *, probe: object) -> dict[str, object]:
+        _ = probe
+        if not self._draft_conventions_responses:
+            raise RuntimeError("no draft_conventions response scripted")
+        return self._draft_conventions_responses.pop(0)

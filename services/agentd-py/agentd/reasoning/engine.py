@@ -194,3 +194,19 @@ class DefaultReasoningEngine(ReasoningEngine):
             on_thinking=on_thinking,
         )
         return result if isinstance(result, dict) else {}
+
+    async def draft_conventions(self, *, probe: object) -> dict[str, object]:
+        from agentd.reasoning.env_prompts import (
+            DRAFT_CONVENTIONS_RESPONSE_SCHEMA,
+            DRAFT_CONVENTIONS_SYSTEM_PROMPT,
+            build_draft_conventions_payload,
+        )
+        payload = build_draft_conventions_payload(probe)  # type: ignore[arg-type]
+        result = await self._transport.generate_json(
+            model=self._model,
+            schema_name="env_profile_conventions",
+            schema=DRAFT_CONVENTIONS_RESPONSE_SCHEMA,
+            system_instructions=DRAFT_CONVENTIONS_SYSTEM_PROMPT,
+            user_payload=payload,
+        )
+        return result if isinstance(result, dict) else {}
