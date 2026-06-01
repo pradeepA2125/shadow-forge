@@ -10,7 +10,11 @@ from agentd.orchestrator.scripted_engine import ScriptedReasoningEngine
 
 @pytest.mark.asyncio
 async def test_build_skips_llm_when_python_lockfile_is_unambiguous(tmp_path: Path):
-    """W2: python + uv.lock → conventions synthesised, no LLM call."""
+    """W2: python + uv.lock → conventions synthesised, no LLM call.
+
+    interpreter_or_runner is nulled when the .venv isn't present on disk —
+    the VENV_ABSENT diagnostic carries that signal instead.
+    """
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname=\"x\"\nversion=\"0\"\ndependencies=[\"fastapi\",\"pydantic\"]\n"
     )
@@ -26,10 +30,42 @@ async def test_build_skips_llm_when_python_lockfile_is_unambiguous(tmp_path: Pat
     assert profile.bootstrap_needed is False
     assert profile.ecosystems[0].package_manager == "uv"
     assert profile.ecosystems[0].install_command == "uv sync"
-    assert profile.ecosystems[0].interpreter_or_runner == ".venv/bin/python"
+    # No .venv on disk → interpreter_or_runner is null
+    assert profile.ecosystems[0].interpreter_or_runner is None
     assert profile.ecosystems[0].test_command == "pytest"
     assert "fastapi" in profile.ecosystems[0].declared_dependencies_top
     assert "no LLM call" in (profile.conventions_notes or "")
+
+
+@pytest.mark.asyncio
+async def test_build_sets_interpreter_when_venv_actually_exists(tmp_path: Path):
+    """When the .venv/bin/python file exists on disk, interpreter_or_runner
+    is populated. This is the design intent: the field promises a usable binary."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    (tmp_path / "uv.lock").write_text("# locked\n")
+    bin_dir = tmp_path / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
+    (bin_dir / "python").chmod(0o755)
+
+    builder = EnvProfileBuilder(reasoner=ScriptedReasoningEngine(plan=None, patches=[]))
+    profile = await builder.build(tmp_path)
+
+    assert profile.ecosystems[0].interpreter_or_runner == ".venv/bin/python"
+
+
+@pytest.mark.asyncio
+async def test_build_sets_node_runner_when_node_modules_bin_exists(tmp_path: Path):
+    (tmp_path / "package.json").write_text(
+        '{"name": "x", "version": "1.0.0", "devDependencies": {"vitest": "*"}}'
+    )
+    (tmp_path / "package-lock.json").write_text('{}')
+    (tmp_path / "node_modules" / ".bin").mkdir(parents=True)
+
+    builder = EnvProfileBuilder(reasoner=ScriptedReasoningEngine(plan=None, patches=[]))
+    profile = await builder.build(tmp_path)
+
+    assert profile.ecosystems[0].interpreter_or_runner == "node_modules/.bin"
 
 
 @pytest.mark.asyncio
@@ -54,11 +90,16 @@ async def test_build_synthesises_node_with_package_lock(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_build_synthesises_with_subdir_prefix_on_paths(tmp_path: Path):
-    """Fast-path interpreter_or_runner must include the subdir (W4 origin)."""
+    """Fast-path interpreter_or_runner must include the subdir (W4 origin),
+    but only when the binary actually exists at that subdir-prefixed path."""
     sub = tmp_path / "services" / "agentd-py"
     sub.mkdir(parents=True)
     (sub / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
     (sub / "uv.lock").write_text("# locked\n")
+    bin_dir = sub / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
+    (bin_dir / "python").chmod(0o755)
 
     builder = EnvProfileBuilder(reasoner=ScriptedReasoningEngine(plan=None, patches=[]))
     profile = await builder.build(tmp_path)
@@ -89,10 +130,16 @@ async def test_build_falls_through_to_llm_when_python_has_no_lockfile(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_build_normalises_interpreter_path_from_llm(tmp_path: Path):
-    """W4: LLM returns interpreter_or_runner without subdir prefix → prepend it."""
+    """W4: LLM returns interpreter_or_runner without subdir prefix → prepend it.
+    Then verify the path exists; otherwise null it."""
     sub = tmp_path / "services" / "agentd-py"
     sub.mkdir(parents=True)
     (sub / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    # Create the venv so existence check passes
+    bin_dir = sub / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
+    (bin_dir / "python").chmod(0o755)
     # No lockfile in subdir → fast-path returns None → LLM call.
     canned = {
         "ecosystems": [{
@@ -111,6 +158,33 @@ async def test_build_normalises_interpreter_path_from_llm(tmp_path: Path):
     profile = await builder.build(tmp_path)
 
     assert profile.ecosystems[0].interpreter_or_runner == "services/agentd-py/.venv/bin/python"
+
+
+@pytest.mark.asyncio
+async def test_build_nulls_llm_interpreter_when_file_absent(tmp_path: Path):
+    """LLM may return a conventional path; if the file isn't on disk yet,
+    null it. The agent reads the diagnostic and learns to setup_env first."""
+    sub = tmp_path / "services" / "agentd-py"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text("[project]\nname=\"x\"\nversion=\"0\"\n")
+    # No venv created.
+    canned = {
+        "ecosystems": [{
+            "ecosystem": "python",
+            "subdir": "services/agentd-py",
+            "manifest_path": "services/agentd-py/pyproject.toml",
+            "package_manager": "uv", "install_command": "uv sync",
+            "interpreter_or_runner": "services/agentd-py/.venv/bin/python",
+            "test_command": "pytest",
+            "declared_dependencies_top": [], "notes": None,
+        }],
+        "conventions_notes": None,
+    }
+    engine = ScriptedReasoningEngine(plan=None, patches=[], draft_conventions_responses=[canned])
+    builder = EnvProfileBuilder(reasoner=engine)
+    profile = await builder.build(tmp_path)
+
+    assert profile.ecosystems[0].interpreter_or_runner is None
 
 
 @pytest.mark.asyncio

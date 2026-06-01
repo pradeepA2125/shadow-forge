@@ -66,7 +66,21 @@ def _node_dep_strings_from_package_json(text: str) -> tuple[list[str], str | Non
     return deps, test_cmd
 
 
-def _synthesize_entry(facts: EcosystemFacts) -> EnvEcosystemEntry | None:
+def _verify_path(workspace_root: Path, rel_path: str | None) -> str | None:
+    """Return rel_path only if <workspace_root>/<rel_path> actually exists.
+
+    interpreter_or_runner should mean 'this binary/dir is ready to use'. When
+    the convention path isn't on disk yet (e.g. .venv not created), return
+    None so the agent's VENV_ABSENT diagnostic carries the truth.
+    """
+    if rel_path is None:
+        return None
+    if (workspace_root / rel_path).exists():
+        return rel_path
+    return None
+
+
+def _synthesize_entry(facts: EcosystemFacts, workspace_root: Path) -> EnvEcosystemEntry | None:
     """Try to build an EnvEcosystemEntry from probe facts alone.
 
     Returns None when the evidence is ambiguous and the LLM is needed.
@@ -75,7 +89,9 @@ def _synthesize_entry(facts: EcosystemFacts) -> EnvEcosystemEntry | None:
       - Node:   package-lock.json → npm ci; yarn.lock → yarn; pnpm-lock.yaml → pnpm.
       - Rust:   any Cargo.toml → cargo (one ecosystem-wide PM).
       - Go:     any go.mod → go.
-    Interpreter / runner / test_command follow community defaults.
+    Interpreter / runner paths are set only when the file actually exists at
+    build time. A null value tells the agent 'setup_env first'; the matching
+    VENV_ABSENT / NODE_MODULES_ABSENT / CARGO_TARGET_ABSENT diagnostic explains why.
     """
     subdir = facts.subdir
     if facts.ecosystem == "python":
@@ -88,10 +104,11 @@ def _synthesize_entry(facts: EcosystemFacts) -> EnvEcosystemEntry | None:
             pm, install = "pip", f"pip install -r {req}"
         else:
             return None  # ambiguous — defer to LLM
+        candidate = _path_join_subdir(subdir, ".venv/bin/python")
         return EnvEcosystemEntry(
             ecosystem="python", subdir=subdir, manifest_path=facts.manifest_path,
             package_manager=pm, install_command=install,
-            interpreter_or_runner=_path_join_subdir(subdir, ".venv/bin/python"),
+            interpreter_or_runner=_verify_path(workspace_root, candidate),
             test_command="pytest",
             declared_dependencies_top=_python_dep_strings_from_pyproject(facts.manifest_text),
             notes=None,
@@ -106,10 +123,11 @@ def _synthesize_entry(facts: EcosystemFacts) -> EnvEcosystemEntry | None:
         else:
             return None  # ambiguous — defer to LLM
         deps, test_cmd = _node_dep_strings_from_package_json(facts.manifest_text)
+        candidate = _path_join_subdir(subdir, "node_modules/.bin")
         return EnvEcosystemEntry(
             ecosystem="node", subdir=subdir, manifest_path=facts.manifest_path,
             package_manager=pm, install_command=install,
-            interpreter_or_runner=_path_join_subdir(subdir, "node_modules/.bin"),
+            interpreter_or_runner=_verify_path(workspace_root, candidate),
             test_command=test_cmd,
             declared_dependencies_top=deps,
             notes=None,
@@ -133,11 +151,11 @@ def _synthesize_entry(facts: EcosystemFacts) -> EnvEcosystemEntry | None:
     return None
 
 
-def _try_synthesize_all(probe: ProbeResult) -> list[EnvEcosystemEntry] | None:
+def _try_synthesize_all(probe: ProbeResult, workspace_root: Path) -> list[EnvEcosystemEntry] | None:
     """Synthesise entries for ALL ecosystems, or return None if any is ambiguous."""
     out: list[EnvEcosystemEntry] = []
     for facts in probe.ecosystems:
-        entry = _synthesize_entry(facts)
+        entry = _synthesize_entry(facts, workspace_root)
         if entry is None:
             return None
         out.append(entry)
@@ -188,7 +206,7 @@ class EnvProfileBuilder:
         # W2 fast-path: when probe evidence is unambiguous, synthesise the
         # entries deterministically and skip the LLM (saves 30-60s per first
         # task on a workspace).
-        synthesized = _try_synthesize_all(probe)
+        synthesized = _try_synthesize_all(probe, workspace_root)
         if synthesized is not None:
             logger.info(
                 "env profile: synthesised %d ecosystem(s) deterministically; skipped LLM",
@@ -228,9 +246,16 @@ class EnvProfileBuilder:
 
         # W4 defense: normalise interpreter_or_runner to subdir-prefixed form
         # in case the LLM emitted it relative to the subdir rather than the root.
+        # Then verify the path actually exists on disk — null it out otherwise
+        # so the field's meaning ('this binary is ready to use') stays honest.
         raw_entries = decision.get("ecosystems", [])
-        normalised = [_normalise_interpreter_path(dict(e)) for e in raw_entries]
-        entries = [EnvEcosystemEntry(**e) for e in normalised]
+        entries = []
+        for raw in raw_entries:
+            normalised = _normalise_interpreter_path(dict(raw))
+            normalised["interpreter_or_runner"] = _verify_path(
+                workspace_root, normalised.get("interpreter_or_runner")
+            )
+            entries.append(EnvEcosystemEntry(**normalised))
         return EnvProfile(
             workspace_root=probe.workspace_root,
             built_at=now,
