@@ -122,6 +122,94 @@ REPO-GROUNDED CONVENTIONS:
 • For schema or storage tasks, infer fields only from files you have actually read.
 • When a tool result shows a compatible capability, cite the existing path; do not duplicate.
 
+SYMBOL CLOSURE & FLOW TRACE (the two checks that catch most cross-step bugs):
+
+These catch the failure mode where a plan looks complete in isolation but breaks at execution
+because a symbol or signal has no other end of the wire. Apply both DURING drafting of each
+step — not as a summary section at the end. A summary written after the fact only repeats what
+you decided; the value of these checks is that they force you to find the gap WHILE there is
+still time to add the missing step.
+
+1. CLOSURE — every new symbol must have BOTH a definition AND a reference, written INLINE in
+   the Change field where the symbol is introduced. Do NOT collect closure lines into a summary
+   section at the end of the plan — at the end it is too late to fix anything, and the model
+   tends to write what it remembers instead of auditing what is actually there.
+   For every new class, dataclass, enum value, payload key, method, action_type, status, route
+   handler, broadcast event type, or transition-table entry the plan introduces, the step that
+   defines it MUST contain one explicit line of the form:
+       "Closure: defines `<name>` (referenced by `<consumer1>` in this step / step N, and by
+        `<consumer2>` in step M)."
+   And the step that references a name defined elsewhere MUST contain one line of the form:
+       "Closure: references `<name>` (defined in step N: `<path>`)."
+   Rules:
+   • A name referenced but not defined → executor crashes on import or AttributeError.
+     (Example failure: `TaskRecord.clarification_request: ClarificationRequest` is added, but no
+     step defines the `ClarificationRequest` class — the field's type annotation is dangling.)
+   • A name defined but not referenced → dead code.
+     (Example: a new method `handle_foo_response` with no caller in any step.)
+   • DECOMPOSE COMPOUND CONCEPTS into their actual symbols. A new TaskStatus value is not one
+     symbol — it is at least three: the enum value itself, the transition-table edges that
+     allow it (in `domain/state_machine.py`), and the call sites that invoke `transition(...,
+     <new value>, ...)`. List each separately. Similarly, a new action_type splits into the
+     response-schema enum entry (producer side), the prompt instruction that teaches the model
+     to emit it, and the loop handler that dispatches on it. A new HTTP route splits into the
+     Pydantic request body, the route handler, and the router registration. If you only list
+     the headline symbol you will miss the enforcement-layer siblings — this is the single
+     most common closure failure in this codebase.
+
+2. FLOW TRACE — every new state, branch, or signal needs a one-line trace written INLINE in
+   the step where the state/signal originates.
+   For each new TaskStatus, action_type, broadcast event, payload-driven conditional, or
+   route-triggered transition, the originating step MUST contain one explicit line of the form:
+       "Flow: <PRODUCED by ...> → <HANDLED by / dispatched on ...> → <ADVANCED out of / consumed by ...>"
+   Rules:
+   • If any leg is missing, that leg is a planning bug. The "advanced out" leg is the one most
+     often missed — a new status with no transition-out edge, or a new event with no listener,
+     is a dead end.
+   • Do NOT hand-wave the consumer leg as "the UI receives the event" or "the user sees this."
+     Name the concrete handler: which route, which controller method, which webview message
+     handler. If the chat path is involved, name the function in `chat/agent.py` that detects
+     the state and dispatches.
+   • The trace also catches direction-of-communication mistakes: who is asking whom? A prompt
+     that tells the LLM to handle a request the user is supposed to make (or vice versa) will
+     fail the trace because one of the three legs cannot be filled.
+   Example (good): "Flow: AWAITING_CLARIFICATION is PRODUCED by orchestrator.run_task when
+   PlanningLoop returns ClarificationResult → HANDLED by state_machine.transition allowing
+   CONTEXT_READY→AWAITING_CLARIFICATION and back → ADVANCED out of when the user POSTs to
+   /v1/tasks/<id>/clarification (or sends a chat message that ChatAgent routes to that
+   endpoint when the latest task on the thread is AWAITING_CLARIFICATION), which calls
+   orchestrator.handle_clarification_response, transitions back to CONTEXT_READY, and replans
+   with the answer folded into plan_feedback."
+   Example (bad — missing concrete consumer): "Flow: clarification_event PRODUCED by loop →
+   HANDLED by broadcaster → ADVANCED by UI receiving the event." (The third leg names no
+   actual handler — "the UI" is not a symbol.)
+
+3. STEP ORDERING — no forward or circular dependencies between steps.
+   Steps execute sequentially. The shadow workspace promotes each step's edits before the next
+   step runs, so step N sees exactly the files as they exist after steps 1..N-1 — and nothing
+   from steps N+1..end. Every name step N references must already exist by then.
+   • FORWARD DEPENDENCY: step N references a symbol (class, field, method, function, attribute,
+     import path, route, file, test) that is defined in step M > N. At execution time, step N
+     will hit ImportError, AttributeError, NameError, or "file not found" because M has not
+     run yet — and the patch-attempt will burn the retry budget before failing the step.
+     (Concrete example we have hit: step 5 wrote `task.clarification_request = …` but the
+     `clarification_request` field on `TaskRecord` was only added in step 6 → step 5's edit
+     failed mypy and runtime.) Forward references are the most common ordering bug. Detect by
+     reading every "Closure: references `<X>` (defined in step N)" line in step M and checking
+     N < M; if not, REORDER (move M before N), MERGE (collapse them into one step that both
+     defines and uses X), or SPLIT (extract the interface into an earlier step and leave the
+     implementation in the later one).
+   • CIRCULAR DEPENDENCY: step N's Change requires something step M defines AND step M's Change
+     requires something step N defines. Neither can land first. Resolve by merging into a
+     single step (preferred when the cycle is small) or by separating an interface step from
+     an implementation step so the cycle becomes a chain.
+   • DERIVED CONSTRAINTS: a step's Verify command may only reference files that exist after
+     this step plus earlier steps (already stated in TEST COVERAGE HINTS — the same rule). A
+     step that creates a test file is the step that runs it.
+   The closure lines you write inline are also the audit input for this check. If you find
+   yourself wanting to write "Closure: references X (defined in step N)" where N > current,
+   that is the bug — fix it before moving on, do not paper over it with a TODO.
+
 TEST COVERAGE HINTS (the step's "Verify" field):
 • "Verify" must be a CONCRETE command with a real path, grounded in the repo layout you already
   observed — e.g. "pytest services/agentd-py/tests/test_auth.py -x", not "run the tests". The
@@ -143,6 +231,37 @@ PRE-EXPLORED CONTEXT (when present in the payload):
 If the payload contains "pre_explored_context", treat those as tool results already gathered.
 You may cite files and symbols from it as EXISTING. Do not re-read the same files.
 
+GRAPH NEIGHBOUR FILES (when present in the payload):
+The payload may include "graph_neighbor_files": workspace-relative paths of files reached from the
+goal's matched symbols by one structural hop in the symbol graph (Calls, Imports, References,
+Inherits, Implements). Use them as an initial reading list — they're files the semantic search did
+NOT surface but that are structurally connected to your goal.
+
+QUERY_GRAPH TOOL (use AFTER reading a file to follow its call edges):
+When the `query_graph` tool is registered, you can walk the symbol graph from any file or symbol:
+  query_graph(node="services/agentd-py/agentd/orchestrator/engine.py:_run_task", depth=1)
+returns the symbols `_run_task` calls (outbound Calls), the symbols that call into it (inbound
+Calls), and the same for Imports/References/Inherits/Implements. This is the same data
+`graph_neighbor_files` is built from, but lets you DRILL: after you read a file and see it calls
+`transition`, ask the graph where `transition` is defined and what implementations it has, then
+read just those files — no whole-codebase grep needed.
+
+Common patterns:
+  • "Where is X defined?" — query_graph(node="<file_you_read>:X", edge_kinds=["Calls","References"])
+    and look at the outbound edge.
+  • "Who calls X?" — same call, look at inbound (`<-`) edges of kind Calls.
+  • "Protocol dispatch" — when a Calls edge lands on a Protocol/ABC/interface method (you'll see
+    its declaration is a stub `def save(self, ...): ...` in some base file), query_graph that
+    declaration with edge_kinds=["Implements"] — the inbound edges fan out to the concrete classes.
+  • "What does this file depend on?" — query_graph(node="<file>") with no symbol, edge_kinds=["Imports"].
+
+Depth=2 reaches grandchildren in one call (e.g. caller → Protocol → implementations) and is
+usually enough; depth=3 is the hard cap. limit defaults to 20; raise to 40 or 60 when needed.
+
+Do NOT use query_graph as a substitute for read_file — it tells you WHERE symbols live, not what
+they do. Pattern: read_file to understand a function, query_graph to find the next file to read,
+read_file again.
+
 BEFORE EMITTING THE PLAN, VERIFY:
 □ Each targeted file appeared in at least one search or read result this session (or pre_explored_context).
 □ No redundant wrapper is proposed when evidence shows an existing capability.
@@ -150,6 +269,26 @@ BEFORE EMITTING THE PLAN, VERIFY:
 □ Every code-touching step has all five fields (Targets, Change, Edge cases, Verify, Why) — no
   generic placeholders; the Change field is concrete enough to patch from.
 □ Every "Verify" is a concrete command with a real path grounded in the observed repo layout.
+□ CLOSURE lines appear INLINE inside each step's Change field — not summarized at the end of the
+  plan. Every new symbol (class, dataclass, enum value, payload key, method, action_type, status,
+  route handler, transition-table edge, broadcast event type) has a "Closure: defines ..." line
+  in its defining step naming the consumers, and a "Closure: references ..." line in each
+  consuming step naming where it was defined. No referenced-but-undefined names; no
+  defined-but-unreferenced names. Compound concepts are listed as their actual symbols:
+  a new status = enum value + transition-table edges in domain/state_machine.py + each call site
+  of `transition(..., <new status>, ...)`; a new action_type = response-schema enum entry +
+  prompt instruction that teaches the model to emit it + loop handler that dispatches on it;
+  a new route = Pydantic request body + route handler + router registration.
+□ FLOW TRACE lines appear INLINE in each originating step — not in a summary. Every new state,
+  action_type, broadcast event, or branch has a "Flow: <produced by ...> → <handled by ...> →
+  <advanced out of / consumed by ...>" line with no missing leg, no hand-waved "the UI receives
+  this" leg (name the concrete handler — which route, which controller method, which chat-agent
+  function). The "advanced out of" leg is the one most often missed.
+□ STEP ORDERING: for every "Closure: references `<X>` (defined in step N)" line in step M, the
+  index N is strictly less than M (no forward references — step N runs before step M, so step
+  M never references something a later step will create). No two steps mutually reference each
+  other's new symbols (no cycles); if you find one, merge the two steps or split out a shared
+  interface step that lands first.
 
 OUTPUT — choose exactly one variant per turn:
 

@@ -225,7 +225,61 @@ class ToolRegistry:
                     },
                 )
             )
+        if self._has_graph_snapshot():
+            tools.append(
+                ToolDefinition(
+                    name="query_graph",
+                    description=(
+                        "Walk the symbol graph from a file or symbol. Returns workspace "
+                        "files/symbols connected via Calls / Imports / References / Implements / "
+                        "Inherits — both outbound and inbound. After read_file shows you a "
+                        "function, use query_graph(node=\"path:Symbol\") to find what it calls "
+                        "(outbound Calls), who calls it (inbound Calls), and — for Protocol/ABC "
+                        "method calls — the concrete implementations via Implements edges. "
+                        "depth=2 chains two hops: Calls -> declaration, Implements <- "
+                        "concrete classes."
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "node": {
+                                "type": "string",
+                                "description": (
+                                    "Workspace-relative \"path/to/file.ext\" to anchor every "
+                                    "symbol in that file, or \"path/to/file.ext:Symbol\" to anchor "
+                                    "a specific symbol."
+                                ),
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "BFS depth (default 1, max 3).",
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max neighbours (default 20, max 60).",
+                            },
+                            "edge_kinds": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Filter: subset of Calls, Imports, References, Inherits, "
+                                    "Implements. Omit for all."
+                                ),
+                            },
+                        },
+                        "required": ["node"],
+                    },
+                )
+            )
         return tools
+
+    def _has_graph_snapshot(self) -> bool:
+        override = os.environ.get("AI_EDITOR_RETRIEVAL_SNAPSHOT_PATH")
+        candidate = (
+            Path(override) if override
+            else self._real_workspace_path / ".ai-editor" / "index-snapshot.json"
+        )
+        return candidate.exists()
 
     async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
         """Dispatch a tool call. Returns ToolOutput with output text and error flag."""
@@ -351,4 +405,47 @@ class ToolRegistry:
                 semantic_index=self._semantic_index,
             )
 
+        if name == "query_graph":
+            return self._execute_query_graph(args)
+
         return ToolOutput(output=f"Error: unknown tool '{name}'", is_error=True)
+
+    def _execute_query_graph(self, args: dict[str, object]) -> ToolOutput:
+        # Lazy import: graph_walker has its own cost, and the execution-loop
+        # registry might never need it on tasks that don't touch query_graph.
+        from agentd.planning.registry import _render_query_result  # type: ignore[attr-defined]
+        from agentd.retrieval.graph_walker import GraphWalker
+
+        node = str(args.get("node", "")).strip()
+        if not node:
+            return ToolOutput(output="Error: 'node' is required", is_error=True)
+
+        override = os.environ.get("AI_EDITOR_RETRIEVAL_SNAPSHOT_PATH")
+        snapshot = (
+            Path(override) if override
+            else self._real_workspace_path / ".ai-editor" / "index-snapshot.json"
+        )
+        if not snapshot.exists():
+            return ToolOutput(
+                output="Error: symbol-graph snapshot not available (run the indexer first).",
+                is_error=True,
+            )
+
+        depth = int(args.get("depth", 1) or 1)  # type: ignore[call-overload]
+        limit = int(args.get("limit", 20) or 20)  # type: ignore[call-overload]
+        edge_kinds_raw = args.get("edge_kinds")
+        edge_kinds: list[str] | None
+        if isinstance(edge_kinds_raw, list):
+            edge_kinds = [str(k) for k in edge_kinds_raw]
+        else:
+            edge_kinds = None
+
+        walker = GraphWalker(snapshot, self._real_workspace_path)
+        try:
+            result = walker.query(node, depth=depth, limit=limit, edge_kinds=edge_kinds)
+        except FileNotFoundError:
+            return ToolOutput(
+                output="Error: symbol-graph snapshot not available (indexer hasn't run).",
+                is_error=True,
+            )
+        return ToolOutput(output=_render_query_result(node, result))
