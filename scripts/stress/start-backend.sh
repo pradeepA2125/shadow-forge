@@ -24,6 +24,19 @@ USAGE
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# Ensure Homebrew bin dirs are on PATH for subprocesses (ripgrep, etc.).
+# When start-backend.sh is launched from an IDE shell whose PATH was assembled
+# without `brew shellenv`, asyncio.create_subprocess_exec("rg", ...) errors with
+# "ripgrep not found at 'rg'" even though `rg` exists on the user's interactive
+# PATH. Prepend the canonical Homebrew bin dirs unconditionally — harmless when
+# absent, fixes the lookup when present.
+for _brew_dir in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin; do
+  if [[ -d "$_brew_dir" && ":$PATH:" != *":$_brew_dir:"* ]]; then
+    PATH="$_brew_dir:$PATH"
+  fi
+done
+export PATH
+
 # Auto-source .env — check this dir first, then the main worktree root (git common dir).
 if [[ -z "${_AI_EDITOR_ENV_LOADED:-}" ]]; then
   _env_file=""

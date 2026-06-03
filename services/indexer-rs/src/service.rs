@@ -73,7 +73,16 @@ impl IndexerService {
         if self.config.lsp_enabled {
             let files: Vec<PathBuf> = self.tracked_files.iter().cloned().collect();
             self.lsp.open_workspace_files(&files).await?;
+            // Run the LSP-backed Calls/Implements resolver after every file
+            // has been told to the LSP — otherwise pyright/tsserver wouldn't
+            // know the cross-file context yet and `textDocument/definition`
+            // would return nothing for most call sites.
+            crate::resolver::resolve_placeholders(&mut self.graph, &mut self.lsp);
             self.refresh_diagnostics().await?;
+        } else {
+            // Drop placeholders we collected during parse — LSP isn't going to
+            // help us resolve them, and keeping them around would leak memory.
+            let _ = self.graph.take_placeholders();
         }
 
         self.persist_snapshot().await?;
@@ -202,6 +211,12 @@ impl IndexerService {
 
                     match std::fs::read_to_string(&path) {
                         Ok(source) => {
+                            // Wipe stale Calls/Implements edges originating
+                            // from this file before re-parsing. The resolver
+                            // will re-emit them from the fresh placeholders.
+                            // Without this, edges that no longer match the
+                            // new source would linger as orphans.
+                            self.graph.prune_resolved_calls_from_file(&path);
                             if let Err(error) = self.parser.parse_file(&path, &source, &mut self.graph) {
                                 self.push_index_warning(
                                     &path,
@@ -211,6 +226,15 @@ impl IndexerService {
                             }
                             self.tracked_files.insert(path.clone());
                             self.lsp.upsert_file(&path, source).await?;
+                            if self.config.lsp_enabled {
+                                crate::resolver::resolve_placeholders_for_file(
+                                    &mut self.graph,
+                                    &mut self.lsp,
+                                    &path,
+                                );
+                            } else {
+                                let _ = self.graph.take_placeholders_for_file(&path);
+                            }
                             processed_any = true;
                         }
                         Err(error) => {

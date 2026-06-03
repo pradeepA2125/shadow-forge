@@ -120,3 +120,62 @@ fn graph_query_honors_edge_filters() {
     assert_eq!(result.edges.len(), 1);
     assert_eq!(result.edges[0].kind, EdgeKind::Imports);
 }
+
+#[test]
+fn graph_query_filters_to_implements_only() {
+    // The Implements variant is new; this test pins both that the variant
+    // round-trips through the graph and that the edge-kind filter accepts it
+    // alongside the existing kinds.
+    let mut graph = SymbolGraph::default();
+    graph.upsert_node(SymbolNode {
+        id: "decl:TaskStore.save".to_string(),
+        path: "src/storage/base.py".to_string(),
+        name: "TaskStore.save".to_string(),
+        kind: SymbolKind::Method,
+        line: 10,
+    });
+    graph.upsert_node(SymbolNode {
+        id: "impl:SQLiteStore.save".to_string(),
+        path: "src/storage/sqlite.py".to_string(),
+        name: "SQLiteStore.save".to_string(),
+        kind: SymbolKind::Method,
+        line: 25,
+    });
+    graph.upsert_node(SymbolNode {
+        id: "impl:InMemoryStore.save".to_string(),
+        path: "src/storage/in_memory.py".to_string(),
+        name: "InMemoryStore.save".to_string(),
+        kind: SymbolKind::Method,
+        line: 12,
+    });
+
+    graph.add_edge(SymbolEdge {
+        from: "impl:SQLiteStore.save".to_string(),
+        to: "decl:TaskStore.save".to_string(),
+        kind: EdgeKind::Implements,
+    });
+    graph.add_edge(SymbolEdge {
+        from: "impl:InMemoryStore.save".to_string(),
+        to: "decl:TaskStore.save".to_string(),
+        kind: EdgeKind::Implements,
+    });
+    // A noise edge of a different kind that must NOT pass the filter.
+    graph.add_edge(SymbolEdge {
+        from: "impl:SQLiteStore.save".to_string(),
+        to: "decl:TaskStore.save".to_string(),
+        kind: EdgeKind::References,
+    });
+
+    let result = graph.query(&GraphQueryRequest {
+        mode: GraphQueryMode::NodeId,
+        value: "decl:TaskStore.save".to_string(),
+        depth: 1,
+        limit: 20,
+        edge_kinds: Some(vec![EdgeKind::Implements]),
+    });
+
+    // The declaration plus its two implementations.
+    assert_eq!(result.nodes.len(), 3);
+    assert_eq!(result.edges.len(), 2);
+    assert!(result.edges.iter().all(|e| e.kind == EdgeKind::Implements));
+}

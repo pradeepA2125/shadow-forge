@@ -75,6 +75,7 @@ class ChatAgent:
         orchestrator: Any | None,
         broadcaster: EventBroadcaster,
         max_explore_calls: int = 5,
+        retrieval_client: Any | None = None,
     ) -> None:
         self._workspace_path = workspace_path
         self._transport = transport
@@ -83,7 +84,14 @@ class ChatAgent:
         self._orchestrator = orchestrator
         self._broadcaster = broadcaster
         self._max_explore_calls = max_explore_calls
-        self._registry = PlanningToolRegistry(real_path=Path(workspace_path))
+        # Mirror the orchestrator's planning-registry wiring so the chat explore
+        # phase has access to search_semantic when the retrieval client exposes a
+        # loaded semantic index. Without this the chat path silently falls back
+        # to "Error: semantic index not available" on every search_semantic call.
+        self._registry = PlanningToolRegistry(
+            real_path=Path(workspace_path),
+            semantic_index=getattr(retrieval_client, "_semantic_index", None),
+        )
         self._classifier = IntentClassifier(transport=transport, model=model)
 
     async def handle_message(self, thread_id: str, message: str, channel_id: str) -> None:

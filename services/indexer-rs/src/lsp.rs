@@ -55,6 +55,27 @@ enum SessionState {
     Failed,
 }
 
+/// Workspace-absolute pointer at a symbol returned from an LSP location-style
+/// query (`textDocument/definition`, `textDocument/implementation`,
+/// `textDocument/references`). Always carries the path as a `PathBuf` and the
+/// position in LSP 0-indexed semantics (line + UTF-16 character).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspLocation {
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Cached result of one LSP resolution query, indexed on `LspSession` so we
+/// don't pay the JSON-RPC roundtrip twice for the same `(file, position,
+/// method)` triple. Cleared per file when its `file_versions` entry bumps.
+#[derive(Debug, Clone)]
+enum CachedResolution {
+    Definition(Option<LspLocation>),
+    Implementations(Vec<LspLocation>),
+    References(Vec<LspLocation>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LspDiagnostic {
     pub severity: String,
@@ -111,6 +132,10 @@ struct LspSession {
     request_timeout: Duration,
     file_versions: HashMap<PathBuf, i32>,
     diagnostics_by_uri: HashMap<String, Vec<LspDiagnostic>>,
+    /// Resolution-query cache. Key shape: `(file_path, line, character,
+    /// method)`. Invalidated for a given `file_path` whenever its
+    /// `file_versions` entry bumps via `open_file` / `change_file` / `close_file`.
+    resolution_cache: HashMap<(PathBuf, u32, u32, &'static str), CachedResolution>,
 }
 
 impl Drop for LspSession {
@@ -164,6 +189,7 @@ impl LspSession {
             request_timeout,
             file_versions: HashMap::new(),
             diagnostics_by_uri: HashMap::new(),
+            resolution_cache: HashMap::new(),
         };
 
         session.initialize()?;
@@ -178,7 +204,7 @@ impl LspSession {
             .map(|part| part.to_string_lossy().to_string())
             .unwrap_or_else(|| "workspace".to_string());
 
-        let params = json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": workspace_uri,
             "capabilities": {},
@@ -187,6 +213,27 @@ impl LspSession {
                 "name": name
             }]
         });
+
+        // Per-language initializationOptions. Today only rust-analyzer needs
+        // them — without `linkedProjects`, it can't find Cargo.toml in a
+        // monorepo whose root has no top-level Cargo manifest, so it answers
+        // every `definition`/`implementation` with `null` and our resolver
+        // sees a flood of "None" returns for every Rust call site.
+        if self.language == LspLanguage::Rust {
+            let cargo_manifests = discover_cargo_manifests(&self.workspace_root);
+            if !cargo_manifests.is_empty() {
+                let manifests: Vec<String> = cargo_manifests
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                params["initializationOptions"] = json!({
+                    "linkedProjects": manifests,
+                    "checkOnSave": false,   // skip cargo check on bootstrap — saves ~30s
+                    "cargo": { "buildScripts": { "enable": false } },
+                    "procMacro": { "enable": false },
+                });
+            }
+        }
 
         let _ = self.request_with_timeout("initialize", params, self.startup_timeout)?;
         self.notify("initialized", json!({}))?;
@@ -220,6 +267,7 @@ impl LspSession {
     fn open_file(&mut self, file_path: &Path, content: &str) -> Result<()> {
         let version = 1;
         self.file_versions.insert(file_path.to_path_buf(), version);
+        self.invalidate_cache_for_file(file_path);
 
         self.notify(
             "textDocument/didOpen",
@@ -238,6 +286,7 @@ impl LspSession {
     fn change_file(&mut self, file_path: &Path, content: &str) -> Result<()> {
         let next_version = self.file_versions.get(file_path).copied().unwrap_or(0) + 1;
         self.file_versions.insert(file_path.to_path_buf(), next_version);
+        self.invalidate_cache_for_file(file_path);
 
         self.notify(
             "textDocument/didChange",
@@ -258,6 +307,7 @@ impl LspSession {
         let uri = path_to_file_uri(file_path);
         self.file_versions.remove(file_path);
         self.diagnostics_by_uri.remove(&uri);
+        self.invalidate_cache_for_file(file_path);
 
         self.notify(
             "textDocument/didClose",
@@ -417,6 +467,218 @@ impl LspSession {
         self.writer.flush()?;
         Ok(())
     }
+
+    fn invalidate_cache_for_file(&mut self, file_path: &Path) {
+        // Cache keys are `(file_path, line, character, method)`; drop every
+        // entry whose first component matches the file we just bumped.
+        self.resolution_cache.retain(|(p, _, _, _), _| p != file_path);
+    }
+
+    /// Ensure the file is open in the LSP session before issuing a position-
+    /// based query. Resolves the "we never told the server about this file"
+    /// edge case where pyright / tsserver would otherwise reply with an empty
+    /// result. Reads the current on-disk content; relies on `upsert_file` to
+    /// no-op when the file is already open at a matching version.
+    fn ensure_file_open(&mut self, file_path: &Path) -> Result<()> {
+        if self.file_versions.contains_key(file_path) {
+            return Ok(());
+        }
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(text) => text,
+            Err(_) => return Ok(()),
+        };
+        self.open_file(file_path, &content)
+    }
+
+    fn request_definition(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<LspLocation>> {
+        let key = (
+            file_path.to_path_buf(),
+            line,
+            character,
+            "textDocument/definition",
+        );
+        if let Some(CachedResolution::Definition(cached)) = self.resolution_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        self.ensure_file_open(file_path)?;
+        let params = json!({
+            "textDocument": { "uri": path_to_file_uri(file_path) },
+            "position": { "line": line, "character": character }
+        });
+        let request_timeout = self.request_timeout;
+        let value =
+            match self.request_with_timeout("textDocument/definition", params, request_timeout) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::debug!(
+                        path = %file_path.display(),
+                        line = line,
+                        character = character,
+                        error = %err,
+                        "definition request failed"
+                    );
+                    return Ok(None);
+                }
+            };
+
+        let locations = parse_lsp_locations(&value);
+        let resolved = locations.into_iter().next();
+        self.resolution_cache
+            .insert(key, CachedResolution::Definition(resolved.clone()));
+        Ok(resolved)
+    }
+
+    fn request_implementations(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>> {
+        let key = (
+            file_path.to_path_buf(),
+            line,
+            character,
+            "textDocument/implementation",
+        );
+        if let Some(CachedResolution::Implementations(cached)) = self.resolution_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        self.ensure_file_open(file_path)?;
+        let params = json!({
+            "textDocument": { "uri": path_to_file_uri(file_path) },
+            "position": { "line": line, "character": character }
+        });
+        let request_timeout = self.request_timeout;
+        let value = match self.request_with_timeout(
+            "textDocument/implementation",
+            params,
+            request_timeout,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!(
+                    path = %file_path.display(),
+                    line = line,
+                    character = character,
+                    error = %err,
+                    "implementation request failed"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        let locations = parse_lsp_locations(&value);
+        self.resolution_cache
+            .insert(key, CachedResolution::Implementations(locations.clone()));
+        Ok(locations)
+    }
+
+    fn request_references(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Result<Vec<LspLocation>> {
+        let key = (
+            file_path.to_path_buf(),
+            line,
+            character,
+            "textDocument/references",
+        );
+        if let Some(CachedResolution::References(cached)) = self.resolution_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        self.ensure_file_open(file_path)?;
+        let params = json!({
+            "textDocument": { "uri": path_to_file_uri(file_path) },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": include_declaration }
+        });
+        let request_timeout = self.request_timeout;
+        let value =
+            match self.request_with_timeout("textDocument/references", params, request_timeout) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::debug!(
+                        path = %file_path.display(),
+                        line = line,
+                        character = character,
+                        error = %err,
+                        "references request failed"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+        let locations = parse_lsp_locations(&value);
+        self.resolution_cache
+            .insert(key, CachedResolution::References(locations.clone()));
+        Ok(locations)
+    }
+}
+
+/// Decode an LSP location response into a flat list of `LspLocation`. Handles
+/// the three shapes the spec allows for `definition` / `implementation` /
+/// `references` responses: a single `Location`, an array of `Location`, an
+/// array of `LocationLink`, or `null`. Unknown shapes return an empty vec so
+/// the caller treats it as an unresolved call site.
+fn parse_lsp_locations(value: &Value) -> Vec<LspLocation> {
+    if value.is_null() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<LspLocation> = Vec::new();
+
+    let mut consider = |item: &Value| {
+        // `Location` shape: {uri, range: {start: {line, character}, ...}}
+        if let (Some(uri), Some(range)) = (
+            item.get("uri").and_then(Value::as_str),
+            item.get("range").and_then(|r| r.get("start")),
+        ) {
+            if let Some(loc) = location_from(uri, range) {
+                out.push(loc);
+                return;
+            }
+        }
+        // `LocationLink` shape: {targetUri, targetRange: {start: ...}, targetSelectionRange: {...}}
+        if let (Some(target_uri), Some(range)) = (
+            item.get("targetUri").and_then(Value::as_str),
+            item.get("targetSelectionRange")
+                .or_else(|| item.get("targetRange"))
+                .and_then(|r| r.get("start")),
+        ) {
+            if let Some(loc) = location_from(target_uri, range) {
+                out.push(loc);
+            }
+        }
+    };
+
+    if let Some(arr) = value.as_array() {
+        for item in arr {
+            consider(item);
+        }
+    } else {
+        consider(value);
+    }
+
+    out
+}
+
+fn location_from(uri: &str, start: &Value) -> Option<LspLocation> {
+    let line = start.get("line").and_then(Value::as_u64)? as u32;
+    let character = start.get("character").and_then(Value::as_u64)? as u32;
+    Some(LspLocation {
+        path: PathBuf::from(file_uri_to_path(uri)),
+        line,
+        character,
+    })
 }
 
 pub struct LspAdapter {
@@ -495,6 +757,80 @@ impl LspAdapter {
                 path: file_path.to_path_buf(),
             },
         )
+    }
+
+    /// Resolve a call site's static declaration via LSP. Returns `None` when:
+    /// the file is in an unsupported language, the LSP is disabled, the
+    /// session can't be started, or the LSP itself returned no usable
+    /// location. Never errors on the failure path — callers treat the empty
+    /// result as "leave the placeholder's `external:call:<name>` fallback
+    /// edge in place."
+    pub fn resolve_definition(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Option<LspLocation> {
+        let session = self.session_for(file_path)?;
+        session
+            .request_definition(file_path, line, character)
+            .ok()
+            .flatten()
+    }
+
+    /// Resolve every workspace symbol that implements/overrides the symbol at
+    /// `(file_path, line, character)`. Used to emit `Implements` edges for
+    /// Protocol/ABC/interface dispatch. Returns the empty vec on any failure
+    /// or when the target is a concrete leaf with no overrides.
+    pub fn resolve_implementations(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Vec<LspLocation> {
+        let Some(session) = self.session_for(file_path) else {
+            return Vec::new();
+        };
+        session
+            .request_implementations(file_path, line, character)
+            .unwrap_or_default()
+    }
+
+    /// Resolve the call sites that reference the symbol at the given
+    /// position. Reserved for a future "find callers" surface — declared
+    /// alongside definition/implementation so the cache primitive covers it.
+    pub fn resolve_references(
+        &mut self,
+        file_path: &Path,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) -> Vec<LspLocation> {
+        let Some(session) = self.session_for(file_path) else {
+            return Vec::new();
+        };
+        session
+            .request_references(file_path, line, character, include_declaration)
+            .unwrap_or_default()
+    }
+
+    /// Borrow the LSP session for the language matching `file_path`. Returns
+    /// `None` when the adapter is disabled, the language is unsupported, the
+    /// session can't be started, or a prior failure marked the session as
+    /// disabled. The resolution wrappers above are all built on top of this.
+    fn session_for(&mut self, file_path: &Path) -> Option<&mut LspSession> {
+        if !self.enabled {
+            return None;
+        }
+        let language = LspLanguage::language_for_path(file_path)?;
+        if self.ensure_session(language).is_err() {
+            return None;
+        }
+        let slot = self.sessions.get_mut(&language)?;
+        if slot.disabled_reason.is_some() {
+            return None;
+        }
+        slot.session.as_mut()
     }
 
     pub async fn collect_diagnostics(&mut self, _workspace_root: &Path) -> Result<Vec<LspDiagnostic>> {
@@ -783,19 +1119,124 @@ fn parse_command(command: &str) -> Result<(String, Vec<String>)> {
     Ok((program, args))
 }
 
+/// Discover every `Cargo.toml` reachable from `workspace_root` so we can
+/// pass them to rust-analyzer's `initializationOptions.linkedProjects`. The
+/// LSP otherwise gives up on monorepo layouts whose root holds no manifest.
+/// Skip the same dirs the rest of the indexer skips so we don't descend into
+/// `target/`, `.venv/`, `node_modules/`, etc.
+fn discover_cargo_manifests(workspace_root: &Path) -> Vec<PathBuf> {
+    const IGNORED: &[&str] = &[
+        "node_modules", ".venv", "venv", ".git", "target",
+        "__pycache__", "dist", "build", ".next",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".agentd", ".ai-editor", ".tmp", ".worktrees",
+    ];
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![workspace_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() {
+            found.push(manifest);
+            // Don't descend further inside a Cargo project: workspace members
+            // are wired via the root's [workspace] table and rust-analyzer
+            // discovers them itself.
+            continue;
+        }
+
+        let read = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || IGNORED.contains(&name) {
+                    continue;
+                }
+            }
+            stack.push(path);
+        }
+    }
+    found
+}
+
 fn path_to_file_uri(path: &Path) -> String {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.starts_with('/') {
-        format!("file://{normalized}")
+    // Percent-encode the bare minimum: space, plus a couple of reserved chars
+    // that show up in real workspace paths. Without this, pyright sees a URI
+    // it can't parse for any workspace whose path contains a space (and our
+    // workspace is literally "/AI editor/...").
+    let encoded = encode_uri_path(&normalized);
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{normalized}")
+        format!("file:///{encoded}")
     }
 }
 
 fn file_uri_to_path(uri: &str) -> String {
-    uri.strip_prefix("file://")
-        .unwrap_or(uri)
-        .to_string()
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    decode_uri_percent(raw)
+}
+
+/// Encode characters in a path that need escaping when round-tripped through
+/// a `file://` URI. Whitelist alphanumerics, `/`, and common safe punctuation;
+/// everything else becomes `%XX`. Deliberately conservative — paths in this
+/// codebase contain spaces (workspace name "AI editor"), unicode is rare.
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'.'
+            | b'_'
+            | b'-'
+            | b'~'
+            | b':' => out.push(byte as char),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+/// Reverse of `encode_uri_path`. Handles `%XX` sequences; passes other bytes
+/// through. Lossy decoding via UTF-8 is fine for paths (servers we talk to
+/// emit valid UTF-8 URIs).
+fn decode_uri_percent(uri: &str) -> String {
+    let bytes = uri.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_digit(bytes[i + 1]);
+            let lo = hex_digit(bytes[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn response_id(payload: &Value) -> Option<u64> {

@@ -110,6 +110,7 @@ fn parse_edge_kinds(raw: &str) -> Result<Vec<EdgeKind>> {
             "imports" => EdgeKind::Imports,
             "inherits" => EdgeKind::Inherits,
             "references" => EdgeKind::References,
+            "implements" => EdgeKind::Implements,
             _ => return Err(anyhow!("invalid edge kind '{part}'")),
         };
         kinds.push(kind);

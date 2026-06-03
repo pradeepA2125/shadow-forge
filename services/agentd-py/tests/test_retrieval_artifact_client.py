@@ -252,3 +252,87 @@ def test_load_context_ranks_by_goal_terms_without_repo_specific_bias(tmp_path: P
     assert warnings == []
     assert context.related_files
     assert context.related_files[0] == "src/auth/session_auth.py"
+
+
+def test_graph_neighbor_files_includes_imports_reached_via_semantic_seed(
+    tmp_path: Path,
+) -> None:
+    """When a file lands in semantic top-K but isn't keyword-matched, its
+    file-level Imports edges should still expand graph_neighbor_files to the
+    imported workspace files. This was the failure mode behind the planner
+    missing state_machine.py / models.py — the seed was symbol-only, so the
+    file→file import edges never participated in neighbour expansion."""
+    workspace = tmp_path / "repo"
+    workspace.mkdir(parents=True)
+    snapshot_path = workspace / ".ai-editor/index-snapshot.json"
+    abs_engine = str(workspace / "src/engine.py")
+    abs_state_machine = str(workspace / "src/state_machine.py")
+    abs_unrelated = str(workspace / "src/unrelated.py")
+
+    payload = _snapshot_payload(int(time.time() * 1000))
+    payload["workspace_root"] = str(workspace)
+    payload["graph"] = {
+        "nodes": [
+            {"id": "file:engine", "path": abs_engine, "name": "engine.py", "kind": "File"},
+            {"id": "file:sm", "path": abs_state_machine, "name": "state_machine.py", "kind": "File"},
+            {"id": "file:unrelated", "path": abs_unrelated, "name": "unrelated.py", "kind": "File"},
+        ],
+        "edges": [
+            # The key file→file import that prior seed logic could not follow.
+            {"from": "file:engine", "to": "file:sm", "kind": "Imports"},
+        ],
+    }
+    payload["diagnostics"] = []
+    _write_snapshot(snapshot_path, payload)
+
+    # Stub semantic index: returns engine.py as the top semantic hit. The keyword
+    # match in the goal ("orchestrate") does not touch engine.py at all — the
+    # only path to seed engine.py is via the semantic union we just added.
+    from agentd.retrieval.chunker import CodeChunk, ScoredChunk
+
+    class _StubSemanticIndex:
+        def is_ready(self) -> bool:
+            return True
+
+        def query(self, goal: str, *, top_k: int, exclude_tests: bool):
+            chunk = CodeChunk(
+                chunk_id="src/engine.py::L1",
+                path="src/engine.py",
+                language="python",
+                line_start=1,
+                line_end=10,
+                line_count=10,
+                name="orchestrate",
+                kind="Function",
+                signature="def orchestrate():",
+                parent_name=None,
+                parent_kind=None,
+                module_path="engine",
+                is_top_level=True,
+                imports=[],
+                calls=[],
+                called_by=[],
+                docstring=None,
+                text="def orchestrate(): pass",
+                text_with_lines="  1: def orchestrate(): pass",
+                context_before="",
+                context_after="",
+                is_test=False,
+                has_docstring=False,
+                file_mtime=0.0,
+                indexed_at_ms=0,
+            )
+            return [ScoredChunk(chunk=chunk, score=0.9)]
+
+    client = RetrievalArtifactClient(semantic_index=_StubSemanticIndex())
+    context, _ = client.load_context(str(workspace), "orchestrate something")
+
+    # engine.py is the seed (via semantic). The edge engine.py → state_machine.py
+    # should surface state_machine.py in graph_neighbor_files.
+    assert "src/state_machine.py" in context.graph_neighbor_files, (
+        f"expected state_machine.py in graph_neighbor_files; got: {context.graph_neighbor_files}"
+    )
+    # And the unrelated file (no edges) must NOT appear.
+    assert "src/unrelated.py" not in context.graph_neighbor_files
+    # Seed file itself must NOT be in its own neighbour list.
+    assert "src/engine.py" not in context.graph_neighbor_files

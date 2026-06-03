@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use rustpython_parser::{ast, Parse};
+use rustpython_parser::{ast, ast::Ranged, Parse};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
-use crate::graph::{EdgeKind, SymbolEdge, SymbolGraph, SymbolKind, SymbolNode};
+use crate::graph::{EdgeKind, PlaceholderEdge, SymbolEdge, SymbolGraph, SymbolKind, SymbolNode};
 
 pub trait LanguageParser: Send + Sync {
     fn language_name(&self) -> &'static str;
@@ -12,11 +12,22 @@ pub trait LanguageParser: Send + Sync {
 
 pub struct TreeSitterParser {
     pub workspace_root: PathBuf,
+    /// Directories that act as Python sys.path entries: not packages themselves
+    /// (no __init__.py) but containing at least one immediate package child.
+    /// Resolves `from agentd.X import Y` in a monorepo where `agentd/` sits at
+    /// `services/agentd-py/agentd/` rather than at the workspace root.
+    /// Computed once at construction so the cost (one directory walk) is paid
+    /// per indexing run, not per file.
+    python_source_roots: Vec<PathBuf>,
 }
 
 impl TreeSitterParser {
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+        let python_source_roots = discover_python_source_roots(&workspace_root);
+        Self {
+            workspace_root,
+            python_source_roots,
+        }
     }
 }
 
@@ -80,7 +91,14 @@ impl LanguageParser for TreeSitterParser {
         let file_id = upsert_file_node(graph, file_path);
 
         if file_path.extension().and_then(|e| e.to_str()) == Some("py") {
-            return extract_python_ruff(file_path, source, graph, &file_id, &self.workspace_root);
+            return extract_python_ruff(
+                file_path,
+                source,
+                graph,
+                &file_id,
+                &self.workspace_root,
+                &self.python_source_roots,
+            );
         }
 
         let Some(language) = ParserLanguage::from_path(file_path) else {
@@ -282,10 +300,25 @@ fn extract_typescript(
                 );
                 let from = current_class.clone().unwrap_or_else(|| file_id.to_string());
                 graph.add_edge(SymbolEdge {
-                    from,
-                    to: target_id,
+                    from: from.clone(),
+                    to: target_id.clone(),
                     kind: EdgeKind::Calls,
                 });
+                // PlaceholderEdge so the resolver can rewrite this to a
+                // workspace symbol once tsserver answers. Position points at
+                // the callable identifier — for `obj.method()` that's the
+                // property's start, not the receiver's, so tsserver resolves
+                // the method itself rather than the receiver variable.
+                if let Some(point) = typescript_callable_position(node) {
+                    graph.push_placeholder(PlaceholderEdge {
+                        from_id: from,
+                        external_to_id: target_id,
+                        file_path: file_path.to_path_buf(),
+                        line: point.row as u32,
+                        character: point.column as u32,
+                        edge_kind: EdgeKind::Calls,
+                    });
+                }
             }
         }
         _ => {}
@@ -321,10 +354,24 @@ fn extract_python_ruff(
     graph: &mut SymbolGraph,
     file_id: &str,
     workspace_root: &Path,
+    python_source_roots: &[PathBuf],
 ) -> Result<()> {
     let stmts = ast::Suite::parse(source, file_path.to_str().unwrap_or("<file>"))
         .map_err(|e| anyhow!("Python parse error in {}: {e}", file_path.display()))?;
-    walk_python_body(file_path, source, graph, file_id, workspace_root, &stmts, None);
+    // current_enclosing at module scope is the file node itself — any Calls
+    // emitted from top-level statements (rare but real: module-level setup
+    // code) are attributed to the file.
+    walk_python_body(
+        file_path,
+        source,
+        graph,
+        file_id,
+        workspace_root,
+        python_source_roots,
+        &stmts,
+        None,
+        file_id,
+    );
     Ok(())
 }
 
@@ -334,20 +381,48 @@ fn walk_python_body(
     graph: &mut SymbolGraph,
     file_id: &str,
     workspace_root: &Path,
+    python_source_roots: &[PathBuf],
     stmts: &[ast::Stmt],
     current_class: Option<&str>,
+    current_enclosing: &str,
 ) {
     for stmt in stmts {
         match stmt {
             ast::Stmt::FunctionDef(f) => {
                 let name = f.name.as_str();
                 let line = py_offset_to_line(source, usize::from(f.range.start()));
-                emit_python_fn(file_path, graph, file_id, name, line, current_class);
+                let fn_id =
+                    emit_python_fn(file_path, graph, file_id, name, line, current_class);
+                // Recurse into the body so nested defs are captured AND so
+                // each Call inside attributes to this function/method.
+                walk_python_body(
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    &f.body,
+                    None,
+                    fn_id.as_str(),
+                );
             }
             ast::Stmt::AsyncFunctionDef(f) => {
                 let name = f.name.as_str();
                 let line = py_offset_to_line(source, usize::from(f.range.start()));
-                emit_python_fn(file_path, graph, file_id, name, line, current_class);
+                let fn_id =
+                    emit_python_fn(file_path, graph, file_id, name, line, current_class);
+                walk_python_body(
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    &f.body,
+                    None,
+                    fn_id.as_str(),
+                );
             }
             ast::Stmt::ClassDef(c) => {
                 let name = c.name.as_str();
@@ -372,15 +447,34 @@ fn walk_python_body(
                         });
                     }
                 }
+                // Inside the class body, methods are defined; their bodies'
+                // call sites attribute to the method id, not the class id.
+                // current_enclosing for the class scope itself is left as the
+                // outer enclosing (file or outer function) so module-level
+                // calls — class-level assignments using calls (e.g. `field =
+                // Field(...)` inside a Pydantic class) — attribute correctly.
                 walk_python_body(
-                    file_path, source, graph, file_id, workspace_root,
-                    &c.body, Some(class_id.as_str()),
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    &c.body,
+                    Some(class_id.as_str()),
+                    current_enclosing,
                 );
             }
             ast::Stmt::Import(i) => {
                 for alias in &i.names {
                     let module_name = alias.name.as_str();
-                    if let Some(target) = resolve_python_module_to_file(module_name, 0, file_path, workspace_root) {
+                    if let Some(target) = resolve_python_module_to_file(
+                        module_name,
+                        0,
+                        file_path,
+                        workspace_root,
+                        python_source_roots,
+                    ) {
                         let target_id = format!("file:{}", target.display());
                         graph.upsert_node(SymbolNode {
                             id: target_id.clone(),
@@ -411,7 +505,13 @@ fn walk_python_body(
                 let level: u32 = i.level.as_ref().map(|n| n.to_u32()).unwrap_or(0);
                 if let Some(module_id_val) = &i.module {
                     let module_name = module_id_val.as_str();
-                    if let Some(target) = resolve_python_module_to_file(module_name, level, file_path, workspace_root) {
+                    if let Some(target) = resolve_python_module_to_file(
+                        module_name,
+                        level,
+                        file_path,
+                        workspace_root,
+                        python_source_roots,
+                    ) {
                         let target_id = format!("file:{}", target.display());
                         graph.upsert_node(SymbolNode {
                             id: target_id.clone(),
@@ -437,8 +537,550 @@ fn walk_python_body(
                     }
                 }
             }
-            _ => {}
+            other => {
+                scan_python_stmt_for_calls(
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    other,
+                    current_class,
+                    current_enclosing,
+                );
+            }
         }
+    }
+}
+
+/// Find every `Expr::Call` reachable from a non-def statement and emit a
+/// placeholder `Calls` edge for each. Recurses through nested control-flow
+/// bodies via `walk_python_body` so the enclosing-scope attribution stays
+/// correct. The list of statement variants is exhaustive for what shows up
+/// in our codebases; anything missed falls through silently (no panic) and is
+/// recovered by grep on the model side, same as today.
+#[allow(clippy::too_many_arguments)]
+fn scan_python_stmt_for_calls(
+    file_path: &Path,
+    source: &str,
+    graph: &mut SymbolGraph,
+    file_id: &str,
+    workspace_root: &Path,
+    python_source_roots: &[PathBuf],
+    stmt: &ast::Stmt,
+    current_class: Option<&str>,
+    current_enclosing: &str,
+) {
+    // Inline closure to scan a single expression for nested calls.
+    let scan = |expr: &ast::Expr, g: &mut SymbolGraph| {
+        scan_python_expr_for_calls(file_path, source, g, expr, current_enclosing);
+    };
+
+    match stmt {
+        ast::Stmt::Expr(s) => scan(&s.value, graph),
+        ast::Stmt::Assign(s) => {
+            scan(&s.value, graph);
+            for target in &s.targets {
+                scan(target, graph);
+            }
+        }
+        ast::Stmt::AnnAssign(s) => {
+            if let Some(value) = &s.value {
+                scan(value, graph);
+            }
+            scan(&s.target, graph);
+            scan(&s.annotation, graph);
+        }
+        ast::Stmt::AugAssign(s) => {
+            scan(&s.target, graph);
+            scan(&s.value, graph);
+        }
+        ast::Stmt::Return(s) => {
+            if let Some(value) = &s.value {
+                scan(value, graph);
+            }
+        }
+        ast::Stmt::If(s) => {
+            scan(&s.test, graph);
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::While(s) => {
+            scan(&s.test, graph);
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::For(s) => {
+            scan(&s.iter, graph);
+            scan(&s.target, graph);
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::AsyncFor(s) => {
+            scan(&s.iter, graph);
+            scan(&s.target, graph);
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::With(s) => {
+            for item in &s.items {
+                scan(&item.context_expr, graph);
+                if let Some(vars) = &item.optional_vars {
+                    scan(vars, graph);
+                }
+            }
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::AsyncWith(s) => {
+            for item in &s.items {
+                scan(&item.context_expr, graph);
+                if let Some(vars) = &item.optional_vars {
+                    scan(vars, graph);
+                }
+            }
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::Try(s) => {
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(eh) = handler;
+                if let Some(typ) = &eh.type_ {
+                    scan(typ, graph);
+                }
+                recurse_body(
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    &eh.body,
+                    current_class,
+                    current_enclosing,
+                );
+            }
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.finalbody,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::TryStar(s) => {
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.body,
+                current_class,
+                current_enclosing,
+            );
+            for handler in &s.handlers {
+                let ast::ExceptHandler::ExceptHandler(eh) = handler;
+                if let Some(typ) = &eh.type_ {
+                    scan(typ, graph);
+                }
+                recurse_body(
+                    file_path,
+                    source,
+                    graph,
+                    file_id,
+                    workspace_root,
+                    python_source_roots,
+                    &eh.body,
+                    current_class,
+                    current_enclosing,
+                );
+            }
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.orelse,
+                current_class,
+                current_enclosing,
+            );
+            recurse_body(
+                file_path,
+                source,
+                graph,
+                file_id,
+                workspace_root,
+                python_source_roots,
+                &s.finalbody,
+                current_class,
+                current_enclosing,
+            );
+        }
+        ast::Stmt::Raise(s) => {
+            if let Some(exc) = &s.exc {
+                scan(exc, graph);
+            }
+            if let Some(cause) = &s.cause {
+                scan(cause, graph);
+            }
+        }
+        ast::Stmt::Assert(s) => {
+            scan(&s.test, graph);
+            if let Some(msg) = &s.msg {
+                scan(msg, graph);
+            }
+        }
+        ast::Stmt::Delete(s) => {
+            for target in &s.targets {
+                scan(target, graph);
+            }
+        }
+        // Match would require iterating cases/patterns; very rare in our code,
+        // skip for now. Pass/Break/Continue/Global/Nonlocal carry no exprs.
+        _ => {}
+    }
+}
+
+/// Local convenience for recursing into a nested body, preserving the
+/// enclosing-scope attribution that the parent statement was operating under.
+#[allow(clippy::too_many_arguments)]
+fn recurse_body(
+    file_path: &Path,
+    source: &str,
+    graph: &mut SymbolGraph,
+    file_id: &str,
+    workspace_root: &Path,
+    python_source_roots: &[PathBuf],
+    stmts: &[ast::Stmt],
+    current_class: Option<&str>,
+    current_enclosing: &str,
+) {
+    walk_python_body(
+        file_path,
+        source,
+        graph,
+        file_id,
+        workspace_root,
+        python_source_roots,
+        stmts,
+        current_class,
+        current_enclosing,
+    );
+}
+
+/// Walk an expression subtree, emitting a `Calls` placeholder for every
+/// `Expr::Call` encountered. Recurses through compound expressions so calls
+/// nested in lambdas, comprehensions, ternaries, etc. are captured.
+fn scan_python_expr_for_calls(
+    file_path: &Path,
+    source: &str,
+    graph: &mut SymbolGraph,
+    expr: &ast::Expr,
+    current_enclosing: &str,
+) {
+    match expr {
+        ast::Expr::Call(c) => {
+            if let Some(name) = py_expr_base_name(&c.func) {
+                // For Attribute callees (`receiver.method(...)`) pyright needs
+                // the position INSIDE the attribute name, not at the start of
+                // the receiver — querying at the receiver resolves the
+                // variable instead, and pyright returns None for the method.
+                // For Name callees the start of the name is correct.
+                let offset = python_callable_offset(source, &c.func);
+                let line_1 = py_offset_to_line(source, offset);
+                let (lsp_line, lsp_char) = py_offset_to_lsp_position(source, offset);
+                let external_id = upsert_external_symbol(
+                    graph,
+                    file_path,
+                    "call",
+                    &name,
+                    SymbolKind::Function,
+                    line_1,
+                );
+                graph.add_edge(SymbolEdge {
+                    from: current_enclosing.to_string(),
+                    to: external_id.clone(),
+                    kind: EdgeKind::Calls,
+                });
+                graph.push_placeholder(PlaceholderEdge {
+                    from_id: current_enclosing.to_string(),
+                    external_to_id: external_id,
+                    file_path: file_path.to_path_buf(),
+                    line: lsp_line,
+                    character: lsp_char,
+                    edge_kind: EdgeKind::Calls,
+                });
+            }
+            scan_python_expr_for_calls(file_path, source, graph, &c.func, current_enclosing);
+            for arg in &c.args {
+                scan_python_expr_for_calls(file_path, source, graph, arg, current_enclosing);
+            }
+            for kw in &c.keywords {
+                scan_python_expr_for_calls(file_path, source, graph, &kw.value, current_enclosing);
+            }
+        }
+        ast::Expr::Attribute(a) => {
+            scan_python_expr_for_calls(file_path, source, graph, &a.value, current_enclosing);
+        }
+        ast::Expr::Subscript(s) => {
+            scan_python_expr_for_calls(file_path, source, graph, &s.value, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &s.slice, current_enclosing);
+        }
+        ast::Expr::Slice(s) => {
+            if let Some(l) = &s.lower {
+                scan_python_expr_for_calls(file_path, source, graph, l, current_enclosing);
+            }
+            if let Some(u) = &s.upper {
+                scan_python_expr_for_calls(file_path, source, graph, u, current_enclosing);
+            }
+            if let Some(st) = &s.step {
+                scan_python_expr_for_calls(file_path, source, graph, st, current_enclosing);
+            }
+        }
+        ast::Expr::BoolOp(o) => {
+            for v in &o.values {
+                scan_python_expr_for_calls(file_path, source, graph, v, current_enclosing);
+            }
+        }
+        ast::Expr::BinOp(o) => {
+            scan_python_expr_for_calls(file_path, source, graph, &o.left, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &o.right, current_enclosing);
+        }
+        ast::Expr::UnaryOp(o) => {
+            scan_python_expr_for_calls(file_path, source, graph, &o.operand, current_enclosing);
+        }
+        ast::Expr::Compare(c) => {
+            scan_python_expr_for_calls(file_path, source, graph, &c.left, current_enclosing);
+            for v in &c.comparators {
+                scan_python_expr_for_calls(file_path, source, graph, v, current_enclosing);
+            }
+        }
+        ast::Expr::IfExp(e) => {
+            scan_python_expr_for_calls(file_path, source, graph, &e.test, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &e.body, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &e.orelse, current_enclosing);
+        }
+        ast::Expr::Lambda(l) => {
+            scan_python_expr_for_calls(file_path, source, graph, &l.body, current_enclosing);
+        }
+        ast::Expr::NamedExpr(n) => {
+            scan_python_expr_for_calls(file_path, source, graph, &n.value, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &n.target, current_enclosing);
+        }
+        ast::Expr::Await(a) => {
+            scan_python_expr_for_calls(file_path, source, graph, &a.value, current_enclosing);
+        }
+        ast::Expr::Yield(y) => {
+            if let Some(v) = &y.value {
+                scan_python_expr_for_calls(file_path, source, graph, v, current_enclosing);
+            }
+        }
+        ast::Expr::YieldFrom(y) => {
+            scan_python_expr_for_calls(file_path, source, graph, &y.value, current_enclosing);
+        }
+        ast::Expr::FormattedValue(f) => {
+            scan_python_expr_for_calls(file_path, source, graph, &f.value, current_enclosing);
+        }
+        ast::Expr::JoinedStr(j) => {
+            for part in &j.values {
+                scan_python_expr_for_calls(file_path, source, graph, part, current_enclosing);
+            }
+        }
+        ast::Expr::List(l) => {
+            for e in &l.elts {
+                scan_python_expr_for_calls(file_path, source, graph, e, current_enclosing);
+            }
+        }
+        ast::Expr::Tuple(t) => {
+            for e in &t.elts {
+                scan_python_expr_for_calls(file_path, source, graph, e, current_enclosing);
+            }
+        }
+        ast::Expr::Set(s) => {
+            for e in &s.elts {
+                scan_python_expr_for_calls(file_path, source, graph, e, current_enclosing);
+            }
+        }
+        ast::Expr::Dict(d) => {
+            for k in d.keys.iter().flatten() {
+                scan_python_expr_for_calls(file_path, source, graph, k, current_enclosing);
+            }
+            for v in &d.values {
+                scan_python_expr_for_calls(file_path, source, graph, v, current_enclosing);
+            }
+        }
+        ast::Expr::ListComp(c) => {
+            scan_python_expr_for_calls(file_path, source, graph, &c.elt, current_enclosing);
+            for gen in &c.generators {
+                scan_python_expr_for_calls(file_path, source, graph, &gen.iter, current_enclosing);
+                for cond in &gen.ifs {
+                    scan_python_expr_for_calls(file_path, source, graph, cond, current_enclosing);
+                }
+            }
+        }
+        ast::Expr::SetComp(c) => {
+            scan_python_expr_for_calls(file_path, source, graph, &c.elt, current_enclosing);
+            for gen in &c.generators {
+                scan_python_expr_for_calls(file_path, source, graph, &gen.iter, current_enclosing);
+                for cond in &gen.ifs {
+                    scan_python_expr_for_calls(file_path, source, graph, cond, current_enclosing);
+                }
+            }
+        }
+        ast::Expr::DictComp(c) => {
+            scan_python_expr_for_calls(file_path, source, graph, &c.key, current_enclosing);
+            scan_python_expr_for_calls(file_path, source, graph, &c.value, current_enclosing);
+            for gen in &c.generators {
+                scan_python_expr_for_calls(file_path, source, graph, &gen.iter, current_enclosing);
+                for cond in &gen.ifs {
+                    scan_python_expr_for_calls(file_path, source, graph, cond, current_enclosing);
+                }
+            }
+        }
+        ast::Expr::GeneratorExp(c) => {
+            scan_python_expr_for_calls(file_path, source, graph, &c.elt, current_enclosing);
+            for gen in &c.generators {
+                scan_python_expr_for_calls(file_path, source, graph, &gen.iter, current_enclosing);
+                for cond in &gen.ifs {
+                    scan_python_expr_for_calls(file_path, source, graph, cond, current_enclosing);
+                }
+            }
+        }
+        ast::Expr::Starred(s) => {
+            scan_python_expr_for_calls(file_path, source, graph, &s.value, current_enclosing);
+        }
+        // Leaf nodes (Name, Constant) and rarely-call-bearing expressions
+        // (Subscript handled above; Subscript itself only contains value+slice).
+        _ => {}
     }
 }
 
@@ -449,25 +1091,27 @@ fn emit_python_fn(
     name: &str,
     line: u32,
     current_class: Option<&str>,
-) {
+) -> String {
     if let Some(class_id) = current_class {
         let method_id = upsert_member_symbol(
             graph, file_path, file_id, "method", class_id, name, SymbolKind::Method, line,
         );
         graph.add_edge(SymbolEdge {
             from: class_id.to_string(),
-            to: method_id,
+            to: method_id.clone(),
             kind: EdgeKind::References,
         });
+        method_id
     } else {
         let function_id = upsert_scoped_symbol(
             graph, file_path, file_id, "function", name, SymbolKind::Function, line,
         );
         graph.add_edge(SymbolEdge {
             from: file_id.to_string(),
-            to: function_id,
+            to: function_id.clone(),
             kind: EdgeKind::References,
         });
+        function_id
     }
 }
 
@@ -484,35 +1128,153 @@ fn resolve_python_module_to_file(
     level: u32,
     file_path: &Path,
     workspace_root: &Path,
+    python_source_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     let rel_path = module.replace('.', "/");
 
-    let base = if level > 0 {
-        // Relative import: ascend `level` package directories from the file's directory.
-        // level=1 means current package (parent dir of file), level=2 means grandparent, etc.
+    // Relative imports (`from . import x`, `from ..a.b import x`) are anchored to the
+    // importing file's package directory; source roots don't apply.
+    if level > 0 {
         let mut dir = file_path.parent().unwrap_or(workspace_root);
         for _ in 1..level {
             dir = dir.parent().unwrap_or(workspace_root);
         }
-        dir.to_path_buf()
-    } else {
-        workspace_root.to_path_buf()
-    };
-
-    let module_file = base.join(format!("{rel_path}.py"));
-    if module_file.exists() {
-        return Some(module_file);
+        let module_file = dir.join(format!("{rel_path}.py"));
+        if module_file.exists() {
+            return Some(module_file);
+        }
+        let pkg_init = dir.join(&rel_path).join("__init__.py");
+        if pkg_init.exists() {
+            return Some(pkg_init);
+        }
+        return None;
     }
-    let pkg_init = base.join(&rel_path).join("__init__.py");
-    if pkg_init.exists() {
-        return Some(pkg_init);
+
+    // Absolute imports: try each discovered Python source root in turn. Falling back
+    // to workspace_root preserves the legacy single-root behaviour for flat layouts
+    // (the test fixture uses ws_root directly, with no nested source root).
+    let candidates = python_source_roots
+        .iter()
+        .map(|p| p.as_path())
+        .chain(std::iter::once(workspace_root));
+    for root in candidates {
+        let module_file = root.join(format!("{rel_path}.py"));
+        if module_file.exists() {
+            return Some(module_file);
+        }
+        let pkg_init = root.join(&rel_path).join("__init__.py");
+        if pkg_init.exists() {
+            return Some(pkg_init);
+        }
     }
     None
+}
+
+/// Discover directories that act as Python sys.path entries: a directory D is a
+/// source root iff it is NOT itself a package (no D/__init__.py) but at least
+/// one immediate child directory IS a package (child/__init__.py exists). Walk
+/// the workspace, descending only through non-packages so we find every nested
+/// source root in a monorepo while avoiding redundant inner-package hits.
+///
+/// Example: in this repo, `services/agentd-py/` qualifies because `agentd/` has
+/// `__init__.py` and `services/agentd-py/` itself does not. So `from agentd.X
+/// import Y` resolves to `services/agentd-py/agentd/X.py` once this root is
+/// known — the prior code only tried the workspace root and silently fell back
+/// to an `external:module:agentd.X` edge.
+fn discover_python_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    const IGNORED_DIR_NAMES: &[&str] = &[
+        "node_modules", ".venv", "venv", ".git", "target",
+        "__pycache__", "dist", "build", ".next",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".agentd", ".ai-editor", ".tmp", ".worktrees",
+    ];
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![workspace_root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+
+        let mut has_package_child = false;
+        let mut nonpackage_subdirs: Vec<PathBuf> = Vec::new();
+
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || IGNORED_DIR_NAMES.contains(&name) {
+                    continue;
+                }
+            }
+            let is_package = path.join("__init__.py").exists();
+            if is_package {
+                has_package_child = true;
+            } else {
+                nonpackage_subdirs.push(path);
+            }
+        }
+
+        let dir_is_package = dir.join("__init__.py").exists();
+        if has_package_child && !dir_is_package {
+            roots.push(dir.clone());
+        }
+
+        // Continue only through non-package subdirs; package interiors are
+        // owned by `dir` (or a deeper non-package ancestor we've already seen).
+        stack.extend(nonpackage_subdirs);
+    }
+
+    roots
 }
 
 fn py_offset_to_line(source: &str, offset: usize) -> u32 {
     let safe = offset.min(source.len());
     1 + source[..safe].bytes().filter(|&b| b == b'\n').count() as u32
+}
+
+/// Compute the byte offset of the callable identifier for an LSP position
+/// query. Bare callees (`foo()`) want the start of the name; member-access
+/// callees (`obj.method()`) want the start of `method`, not the receiver —
+/// pyright resolves at the receiver's position to the receiver variable, not
+/// the method. rustpython-parser doesn't expose the attr's range directly, so
+/// we walk forward from the value's end through the `.` and any whitespace.
+fn python_callable_offset(source: &str, func: &ast::Expr) -> usize {
+    if let ast::Expr::Attribute(a) = func {
+        let bytes = source.as_bytes();
+        let mut offset = usize::from(a.value.range().end());
+        // Skip the dot and any whitespace before the attribute identifier.
+        while offset < bytes.len() {
+            let b = bytes[offset];
+            if b == b'.' || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                offset += 1;
+            } else {
+                break;
+            }
+        }
+        return offset;
+    }
+    usize::from(func.range().start())
+}
+
+/// Convert a Python source byte offset into LSP's 0-indexed `(line, character)`
+/// pair. LSP technically specifies UTF-16 code-unit offsets for `character`,
+/// but our source is overwhelmingly ASCII — the gap from byte to UTF-16 is
+/// negligible in practice. Falls within the same "known limits" bucket as
+/// dynamic dispatch: noted, accepted, not blocking.
+fn py_offset_to_lsp_position(source: &str, offset: usize) -> (u32, u32) {
+    let safe = offset.min(source.len());
+    let preceding = &source[..safe];
+    let line = preceding.bytes().filter(|&b| b == b'\n').count() as u32;
+    let character = match preceding.rfind('\n') {
+        Some(idx) => safe.saturating_sub(idx + 1),
+        None => safe,
+    };
+    (line, character as u32)
 }
 
 fn extract_rust(
@@ -692,10 +1454,25 @@ fn extract_rust(
                     .map(|value| value.owner_id.clone())
                     .unwrap_or_else(|| file_id.to_string());
                 graph.add_edge(SymbolEdge {
-                    from,
-                    to: target_id,
+                    from: from.clone(),
+                    to: target_id.clone(),
                     kind: EdgeKind::Calls,
                 });
+                // Same shape as the TS handler: park a placeholder so the
+                // resolver can rewrite to a workspace symbol once
+                // rust-analyzer answers. `typescript_callable_position` works
+                // for Rust call_expression too — tree-sitter-rust uses the
+                // same `function` field for the callable.
+                if let Some(point) = typescript_callable_position(node) {
+                    graph.push_placeholder(PlaceholderEdge {
+                        from_id: from,
+                        external_to_id: target_id,
+                        file_path: file_path.to_path_buf(),
+                        line: point.row as u32,
+                        character: point.column as u32,
+                        edge_kind: EdgeKind::Calls,
+                    });
+                }
             }
         }
         _ => {}
@@ -866,6 +1643,23 @@ fn extract_call_target(node: Node<'_>, source: &str) -> Option<String> {
         .or_else(|| node.child(0))?;
     let text = node_text(function_node, source)?;
     last_identifier(&text)
+}
+
+/// Return the 0-indexed `(row, column)` of the callable identifier inside a
+/// `call_expression` / `new_expression` node. For a member-access callable
+/// (`obj.method(...)`) the position points at the property's start so
+/// tsserver / pyright / rust-analyzer resolve the method itself; for a bare
+/// identifier (`fn(...)`) it points at the identifier's start. Returns `None`
+/// when neither shape applies (e.g., a computed-call surface we don't model).
+fn typescript_callable_position(call_node: Node<'_>) -> Option<tree_sitter::Point> {
+    let function_node = call_node
+        .child_by_field_name("function")
+        .or_else(|| call_node.child_by_field_name("constructor"))
+        .or_else(|| call_node.child(0))?;
+    if let Some(property) = function_node.child_by_field_name("property") {
+        return Some(property.start_position());
+    }
+    Some(function_node.start_position())
 }
 
 fn extract_variable_declarators(node: Node<'_>, source: &str) -> Vec<String> {
