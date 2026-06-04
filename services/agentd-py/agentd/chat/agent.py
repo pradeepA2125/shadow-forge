@@ -19,7 +19,8 @@ _EXPLORE_SCHEMA: dict[str, object] = {
         "thought": {"type": "string", "description": "Reasoning before this action (1-2 sentences)"},
         "action": {"type": "string", "enum": ["tool_call", "done"]},
         "tool": {"type": "string",
-                 "enum": ["search_code", "list_directory", "read_file", "search_semantic"]},
+                 "enum": ["search_code", "list_directory", "read_file", "search_semantic",
+                          "query_graph"]},
         "args": {"type": "object"},
     },
     "required": ["thought", "action"],
@@ -33,11 +34,12 @@ Only use tools to find information that is not already covered by history or pri
 Strategy:
 1. Use search_code or list_directory to locate the relevant files.
 2. Once you find the file most likely to be changed, READ IT with read_file so the content is available for the change.
-3. Emit action=done when you have read the key file(s).
+3. Use query_graph to map structure cheaply: query_graph(node="<file>") lists the files it connects to (depends-on vs used-by); query_graph(node="<file>:<Symbol>") lists what a symbol calls and who calls it (with line numbers). Use it to find the next file to read instead of grepping the whole repo.
+4. Emit action=done when you have read the key file(s).
 
 If the request involves modifying a specific file (e.g. adding an endpoint, changing a function), you MUST call read_file on that file before emitting done.
 
-Tools: search_code (ripgrep), list_directory, read_file, search_semantic.
+Tools: search_code (ripgrep), list_directory, read_file, search_semantic, query_graph (symbol-graph navigation).
 Cap: you will be stopped after a fixed number of calls regardless.
 Never modify files.
 

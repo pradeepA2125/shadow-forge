@@ -83,24 +83,24 @@ _TRANSITIONS: dict[tuple[_S, _E], _S] = {
 
 _ALLOWED_TOOLS: dict[_S, frozenset[str]] = {
     _S.EXPLORE:                frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile", "emit_patch"}),
+                                           "search_semantic", "read_env_profile", "query_graph", "emit_patch"}),
     _S.PATCH_FAILED_MUST_READ: frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile"}),
+                                           "search_semantic", "read_env_profile", "query_graph"}),
     _S.PATCH_FAILED_CAN_RETRY: frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile", "emit_patch"}),
+                                           "search_semantic", "read_env_profile", "query_graph", "emit_patch"}),
     _S.POSTPATCH_BLOCKING:     frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile", "emit_patch",
+                                           "search_semantic", "read_env_profile", "query_graph", "emit_patch",
                                            "find_binary", "setup_env", "init_workspace"}),
     _S.POSTPATCH_CLEAN:        frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile",
+                                           "search_semantic", "read_env_profile", "query_graph",
                                            "run_command", "verify_done",
                                            "find_binary", "setup_env", "init_workspace"}),
     _S.TEST_FAILED:            frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile", "emit_patch",
+                                           "search_semantic", "read_env_profile", "query_graph", "emit_patch",
                                            "run_command",
                                            "find_binary", "setup_env", "init_workspace"}),
     _S.TEST_PASSED:            frozenset({"read_file", "search_code", "list_directory",
-                                           "search_semantic", "read_env_profile", "verify_done"}),
+                                           "search_semantic", "read_env_profile", "query_graph", "verify_done"}),
 }
 
 _FAILED_PATCH_STATES = frozenset({_S.PATCH_FAILED_MUST_READ, _S.PATCH_FAILED_CAN_RETRY})

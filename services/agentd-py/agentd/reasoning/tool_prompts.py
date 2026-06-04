@@ -104,6 +104,18 @@ READ/SEARCH BEHAVIOR:
   or lines using search_code first, and then call read_file with start_line and
   end_line parameters to read around those lines. Keep reading and searching
   recursively until you have complete and correct context of the file.
+- GRAPH NAVIGATION (query_graph): when changing a symbol, use query_graph to find who depends
+  on it before/after patching — cheaper and more precise than grep.
+    • query_graph(node="<file>:<Symbol>") → outbound (what it calls, `->`) and inbound
+      (who calls it, `<-`) edges with line numbers. Use "Who calls X?" before changing a
+      signature; "Where is X defined?" to jump to a callee.
+    • query_graph(node="<file>") → distinct files this file connects to, grouped into
+      "depends on / connects out" and "used by / connected in". Use to scope a change's blast
+      radius across files.
+    • edge_kinds filters to any of Calls, Imports, References, Inherits, Implements. "Who
+      subclasses/implements X?" → query the base with edge_kinds=["Inherits"] and read inbound
+      edges (nominal subclassing only — structural Protocol conformers aren't tracked).
+    query_graph tells you WHERE symbols connect, not what they do — pair it with read_file.
 
 PRIOR STEP FILES:
 The prior_step_files field lists paths already modified by accepted earlier steps.
