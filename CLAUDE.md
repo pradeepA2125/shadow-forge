@@ -8,7 +8,7 @@ Polyglot monorepo — four packages, three runtimes:
 - `apps/editor-client` (TypeScript): Zod-validated contracts + HTTP client for the backend
 - `apps/vscode-extension` (TypeScript): VS Code extension — UI, polling, review panel
 - `services/agentd-py` (Python): orchestration backend — task lifecycle, planning, patch, provider integrations
-- `services/indexer-rs` (Rust): incremental indexing and symbol graph (tree-sitter + LSP diagnostics)
+- `services/indexer-rs` (Rust): incremental indexing and symbol graph (tree-sitter parse + LSP-resolved Calls/Implements/Inherits edges + LSP diagnostics)
 
 `apps/editor-client` is an npm workspace package consumed by the VS Code extension. Type changes there flow upstream to the extension via `BackendTaskClient` interface and Zod schemas.
 
@@ -107,10 +107,11 @@ Concurrency guards: `_in_flight_feedback` and `_in_flight_resume` are closure-sc
 - `orchestrator/scripted_engine.py` — deterministic engine for testing (replays fixed responses for all three reasoning methods)
 - `planning/agent.py` — `PlanningAgent`: thin coordinator; `generate_plan()` and `revise()` both delegate to `PlanningLoop`
 - `planning/loop.py` — `PlanningLoop`: explore-then-commit ReAct loop; calls `create_planning_step()` per iteration; returns `PlanningResult` or `PlanRevisionResult`
-- `planning/registry.py` — `PlanningToolRegistry`: read-only tools for the planning loop (`search_code`, `read_file`, `list_directory`)
+- `planning/registry.py` — `PlanningToolRegistry`: read-only tools for the planning loop (`search_code`, `read_file`, `list_directory`, `search_semantic`, `query_graph`); also exposes `_render_query_result` used by both registries
+- `retrieval/graph_walker.py` — `GraphWalker`: in-process BFS over `index-snapshot.json` backing the `query_graph` tool. File seed (`path`) → distinct neighbour files grouped by direction; symbol seed (`path:Symbol`) → symbol-level Calls/Imports/References/Inherits/Implements with line numbers. mtime-cached, thread-safe; `GraphWalkerSnapshotError` for unreadable snapshots
 - `planning/prompts.py` — system prompt, user payload builder, and `PLANNING_STEP_RESPONSE_SCHEMA` (discriminated union: `tool_call | emit_plan | emit_revision`)
 - `tools/loop.py` — `ToolLoop`: ReAct execution loop per plan step; calls `create_tool_step()` per iteration; returns `PatchResult` or `PlanHandoff`; `broadcast_key` param routes SSE events to a custom channel (used by inline change path to send to chat channel instead of task channel); `skip_verify=True` skips verify phase (used by inline changes)
-- `tools/registry.py` — `ToolRegistry`: tools for the execution loop (`search_code`, `read_file`, `run_command`, `search_semantic`); enforces path traversal protection and shell allowlist
+- `tools/registry.py` — `ToolRegistry`: tools for the execution loop (`search_code`, `read_file`, `run_command`, `search_semantic`, `query_graph`); enforces path traversal protection and shell allowlist
 - `tools/search.py` — `search_code` (ripgrep) and `search_semantic` (vector index query)
 - `tools/files.py` — `read_file` with line range support and path traversal rejection
 - `tools/shell.py` — `run_command` with configurable allowlist and timeout
@@ -179,8 +180,19 @@ SSE event types from the chat message endpoint:
 - `indexer-rs` writes `index-snapshot.json` with `nodes`/`edges`/`diagnostics`/`stats`
 - `agentd-py` reads the snapshot per task via `retrieval/` module; if missing, auto-triggers one index run
 - Retrieval context flows into `PlanningAgent.generate_plan()` as `initial_context` and into step execution via `patch_request_context`
+- `graph_neighbor_files` (in the planner payload via `RetrievalContext.as_prompt_payload()`): files reached from the goal's matched/semantic seeds by one structural hop, surfaced as an initial reading list
 - Stale/missing snapshots emit warning diagnostics but never block orchestration
 - Both `PlanningToolRegistry` and `ToolRegistry` also give the agent live access to the workspace during their loops (not just the snapshot)
+
+#### Symbol-graph edge resolution (LSP)
+- The Rust parser emits `Calls`/`Inherits` edges to `external:<kind>:<name>` placeholders, then a resolver stage (`indexer-rs/src/resolver.rs`) queries the LSP (`textDocument/definition` + `implementation`) and rewrites them to workspace symbol nodes. `Implements` edges fan out from concrete impls to a Protocol/ABC/interface declaration. Python call bodies are walked for call sites; Python class bases and TS `extends`/`implements` are resolved to workspace classes via `definition`.
+- **LSP must be ON for resolution.** `start-backend.sh` launches the self-updating watcher with `AI_EDITOR_LSP_ENABLED=true` (+ `AI_EDITOR_LSP_{PY,TS,RS}_CMD`, `AI_EDITOR_LSP_STARTUP_TIMEOUT_MS`, `AI_EDITOR_LSP_REQUEST_TIMEOUT_MS`). The watcher pays a one-time rust-analyzer warmup per launch, then resolves incrementally per changed file. The synchronous auto-index fallback (`retrieval/artifact_client._render_index_command`) forces LSP **off** (fast, tree-sitter-only) to avoid stalling a task; the watcher re-resolves and overwrites within ~a minute.
+- **Resolution caveats:** pyright (open-source) does NOT implement `textDocument/implementation` (that's Pylance), so Python `Implements` fan-out is empty — use `Inherits` for nominal Python subclass discovery instead. Only NOMINAL subclassing is tracked; a class that conforms to a Protocol structurally without declaring it as a base is not in the graph.
+
+#### `query_graph` tool (symbol-graph navigation)
+- Registered in `PlanningToolRegistry` and `ToolRegistry` **only when an `index-snapshot.json` exists**; backed by `retrieval/graph_walker.py`. Reachable in all three context-gathering loops: planning, execution (must be in `verify_phase_sm._ALLOWED_TOOLS` for the current state — it is, for every state), and chat explore (must be in `chat/agent.py::_EXPLORE_SCHEMA` tool enum — it is).
+- Two modes: file seed `node="<path>"` → distinct neighbour files grouped "depends on / connects out" vs "used by / connected in"; symbol seed `node="<path>:Symbol"` → symbol-level edges with line numbers. `edge_kinds` filters Calls/Imports/References/Inherits/Implements; `depth` (max 3), `limit` (max 60).
+- Teaching blocks: `planning/prompts.py` (planning loop), `reasoning/tool_prompts.py` (execution loop), `chat/agent.py::_EXPLORE_PROMPT` (chat). The `tool` field in both response schemas is a free string — tool availability is the `registry.definitions() ∩ sm.allowed_tools()` intersection (execution) or the schema enum (chat), NOT a schema tool-enum.
 
 ### Testing patterns
 - Python tests in `services/agentd-py/tests/` use `ScriptedPlanningEngine` / stub `Reasoner` classes + `InMemoryTaskStore` + `ShadowWorkspaceManager(tmp_path)`
