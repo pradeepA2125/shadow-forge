@@ -122,22 +122,30 @@ def _is_nearby_file(out_of_scope: str, allowed: list[str]) -> bool:
     return False
 
 
-def _format_feedback_turn(feedback: str) -> dict[str, object]:
+def _format_feedback_turn(feedback: str, *, current_plan: str | None = None) -> dict[str, object]:
     """Wrap user plan-feedback as the final turn of the planning conversation.
 
     Appended after the replayed history so the model reads it as the latest message
-    without disturbing the cacheable prefix that precedes it.
+    without disturbing the cacheable prefix that precedes it. The current plan is
+    embedded so the model can copy exact search snippets for emit_plan_patch and so
+    later rounds see the post-patch version (append-only — never mutates an earlier
+    history entry, keeping the KV prefix intact).
     """
-    return {
-        "role": "user",
-        "content": (
-            "The user reviewed your plan and gave this feedback:\n\n"
-            f"{feedback}\n\n"
-            "Revise the plan to address it. Explore further only if the feedback raises "
-            "something you have not already examined; otherwise emit_plan with the "
-            "revised plan."
-        ),
-    }
+    body = (
+        "The user reviewed your plan and gave this feedback:\n\n"
+        f"{feedback}\n\n"
+    )
+    if current_plan:
+        body += (
+            "Current plan (edit it with emit_plan_patch search_replace ops, copying exact "
+            "unique snippets from below; or emit_plan for a large rewrite):\n\n"
+            f"{current_plan}\n\n"
+        )
+    body += (
+        "Revise the plan to address the feedback. Explore further only if the feedback "
+        "raises something you have not already examined."
+    )
+    return {"role": "user", "content": body}
 
 
 def _merge_validation_results(a: "ValidationResult", b: "ValidationResult") -> "ValidationResult":
@@ -428,8 +436,9 @@ class AgentOrchestrator:
                 pinned_initial_context = task.planning_initial_context or plan_context_payload
                 seed_history = [
                     *(task.planning_conversation_history or []),
-                    _format_feedback_turn(feedback),
+                    _format_feedback_turn(feedback, current_plan=task.plan_markdown),
                 ]
+                _plan_patch_scratch = str(Path(task.shadow_workspace_path or ".") / ".plan-patch")
                 planning_result = await planning_agent.generate_plan(
                     task=task,
                     initial_context=pinned_initial_context,
@@ -437,6 +446,9 @@ class AgentOrchestrator:
                     pre_explored_context=task.initial_explore_context or None,
                     chat_channel_id=task.chat_channel_id,
                     seed_history=seed_history,
+                    current_plan_markdown=task.plan_markdown,
+                    plan_patch_scratch_dir=_plan_patch_scratch,
+                    allow_plan_patch=True,
                 )
                 self._write_debug_artifact(
                     task.task_id,
@@ -448,6 +460,10 @@ class AgentOrchestrator:
                 # this round's turns too (append-only across rounds).
                 task.planning_conversation_history = planning_result.conversation_history
                 task.plan_markdown = planning_result.plan_markdown
+                self.broadcaster.broadcast(task.chat_channel_id or task_id, {
+                    "type": "plan_diff",
+                    "payload": {"task_id": task_id, "plan_markdown": task.plan_markdown},
+                })
                 confidence_diagnostics_fb: list[Diagnostic] = [Diagnostic(
                     source="planning_agent",
                     message="Planning confidence: low. Review plan carefully.",

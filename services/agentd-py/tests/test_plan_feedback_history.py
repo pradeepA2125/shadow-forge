@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agentd.domain.models import Diagnostic, TaskRecord, ValidationResult
+from agentd.domain.models import Diagnostic, TaskRecord, TaskStatus, ValidationResult
 from agentd.orchestrator.engine import AgentOrchestrator
 from agentd.patch.engine import PatchEngine
 from agentd.retrieval.artifact_client import RetrievalContext
@@ -82,7 +82,7 @@ def _history_has(history: list[dict[str, object]], text: str) -> bool:
     return any(text in str(m.get("content", "")) for m in history)
 
 
-async def _make_orchestrator(tmp_path: Path) -> tuple[AgentOrchestrator, _RecordingPlanningEngine, TaskRecord]:
+async def _make_orchestrator(tmp_path: Path, reasoner: object | None = None) -> tuple[AgentOrchestrator, object, TaskRecord]:
     real = tmp_path / "real"
     real.mkdir(parents=True)
     (real / "README.md").write_text("hello\n", encoding="utf-8")
@@ -91,7 +91,7 @@ async def _make_orchestrator(tmp_path: Path) -> tuple[AgentOrchestrator, _Record
     task = TaskRecord(task_id="task-fb-hist", goal="Add pause", workspace_path=str(real))
     await store.create(task)
 
-    reasoner = _RecordingPlanningEngine()
+    reasoner = reasoner or _RecordingPlanningEngine()
     orchestrator = AgentOrchestrator(
         store=store,
         reasoning_engine=reasoner,
@@ -213,3 +213,50 @@ def test_build_payload_does_not_place_feedback_before_history() -> None:
     # budget_status stays last; only instruction/budget_status follow the history.
     assert keys[-1] == "budget_status"
     assert keys.index("conversation_history") < keys.index("budget_status")
+
+
+# --- emit_plan_patch feedback integration (Task 4) ---
+class _PatchEmittingEngine:
+    """emit_plan on round 1; emit_plan_patch (search_replace) on feedback rounds."""
+
+    def __init__(self) -> None:
+        self.saw_plan_patch = False
+
+    async def create_planning_step(
+        self,
+        plan_context: dict[str, object],
+        history: list[dict[str, object]],
+        tool_definitions: list[dict[str, object]],
+        on_thinking: object = None,
+        state_description: str = "",
+        allowed_action_types: frozenset[str] | None = None,
+    ) -> dict[str, object]:
+        _ = (tool_definitions, on_thinking, state_description, allowed_action_types)
+        is_feedback = any("gave this feedback" in str(m.get("content", "")) for m in history)
+        if is_feedback and plan_context.get("allow_plan_patch"):
+            self.saw_plan_patch = True
+            return {
+                "type": "emit_plan_patch",
+                "thought": "small edit",
+                "ops": [{"op": "search_replace", "search": "- Create helper",
+                         "replace": "- Create helper PATCHED", "reason": "feedback"}],
+            }
+        return {
+            "type": "emit_plan", "thought": "stub",
+            "plan_markdown": "# Plan\n\n- Create helper",
+            "files_examined": [], "confidence": "high",
+        }
+
+
+@pytest.mark.asyncio
+async def test_feedback_round_applies_plan_patch(tmp_path: Path) -> None:
+    engine = _PatchEmittingEngine()
+    orchestrator, _reasoner, task = await _make_orchestrator(tmp_path, reasoner=engine)
+
+    await orchestrator.run_task(task.task_id)
+    await orchestrator.continue_task(task.task_id, feedback="tweak the helper")
+
+    refreshed = await orchestrator._store.get(task.task_id)
+    assert engine.saw_plan_patch
+    assert refreshed.status == TaskStatus.AWAITING_PLAN_APPROVAL
+    assert "- Create helper PATCHED" in (refreshed.plan_markdown or "")
