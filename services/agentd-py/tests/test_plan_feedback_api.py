@@ -27,7 +27,9 @@ def _extract_feedback_from_history(history: list[dict[str, object]]) -> str | No
             continue
         content = str(msg.get("content", ""))
         if marker in content:
-            return content.split(marker, 1)[1].split("\n\nRevise", 1)[0].strip()
+            # Feedback runs from the marker to the next blank line; the current-plan
+            # block (when embedded) follows that, so stop at the first "\n\n".
+            return content.split(marker, 1)[1].split("\n\n", 1)[0].strip()
     return None
 
 

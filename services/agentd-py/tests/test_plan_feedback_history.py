@@ -221,6 +221,7 @@ class _PatchEmittingEngine:
 
     def __init__(self) -> None:
         self.saw_plan_patch = False
+        self.histories: list[list[dict[str, object]]] = []
 
     async def create_planning_step(
         self,
@@ -232,6 +233,7 @@ class _PatchEmittingEngine:
         allowed_action_types: frozenset[str] | None = None,
     ) -> dict[str, object]:
         _ = (tool_definitions, on_thinking, state_description, allowed_action_types)
+        self.histories.append([dict(m) for m in history])
         is_feedback = any("gave this feedback" in str(m.get("content", "")) for m in history)
         if is_feedback and plan_context.get("allow_plan_patch"):
             self.saw_plan_patch = True
@@ -260,3 +262,20 @@ async def test_feedback_round_applies_plan_patch(tmp_path: Path) -> None:
     assert engine.saw_plan_patch
     assert refreshed.status == TaskStatus.AWAITING_PLAN_APPROVAL
     assert "- Create helper PATCHED" in (refreshed.plan_markdown or "")
+
+
+@pytest.mark.asyncio
+async def test_plan_patch_feedback_rounds_are_append_only(tmp_path: Path) -> None:
+    """Two plan-patch feedback rounds: round-2 history must be a verbatim prefix of
+    round-3 history (the current-plan embed in the feedback turn never mutates an
+    earlier entry — KV prefix invariant)."""
+    engine = _PatchEmittingEngine()
+    orchestrator, _r, task = await _make_orchestrator(tmp_path, reasoner=engine)
+
+    await orchestrator.run_task(task.task_id)
+    await orchestrator.continue_task(task.task_id, feedback="one")
+    h1 = [dict(m) for m in engine.histories[1]]
+    await orchestrator.continue_task(task.task_id, feedback="two")
+    h2 = engine.histories[2]
+
+    assert h2[: len(h1)] == h1
