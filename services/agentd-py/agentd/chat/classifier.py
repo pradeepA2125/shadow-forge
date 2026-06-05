@@ -32,10 +32,19 @@ Intent values:
 You receive:
   conversation_history — recent messages; use to resolve "fix that", "also update tests", etc.
   explore_context      — files already read and search results gathered from the workspace
+  graph_blast_radius   — workspace files structurally connected (imports/calls/references) to the
+                         files in explore_context. These are files a change to the explored files
+                         would likely RIPPLE INTO, even though they weren't read. A wide blast
+                         radius spanning multiple modules is a strong large_change signal.
   recent_task          — if present: {task_id, status, goal, messages_since} for the most recent failed task in this thread
 
 Rules:
-- Count distinct files in explore_context to judge scope. Be conservative — prefer large_change when scope is unclear.
+- Judge scope from BOTH explore_context AND graph_blast_radius. The explore phase may only read
+  1-2 files, but if graph_blast_radius shows the change ripples into many files across different
+  modules (e.g. domain/, api/, orchestrator/ as well as the files explored), it is large_change.
+  A change is small_change ONLY when both the explored files AND their blast radius are localised
+  (1-2 files, one module, no interface/schema change). Be conservative — prefer large_change when
+  scope is unclear or the blast radius is wide.
 - resume: only choose if recent_task is provided AND the user clearly refers to continuing that specific task (e.g. "continue", "retry", "resume", "keep going") AND the conversation has not moved to a different topic. If recent_task is null, never choose resume.
 - clarify: choose when the message could mean resume OR something else and context does not resolve the ambiguity. Populate clarify_question with a short, specific question.
 - If intent is "qa": populate "answer" with a complete, concise response. Name files and functions explicitly.
@@ -55,6 +64,7 @@ class IntentClassifier:
         context: list[dict[str, Any]],
         history: list[dict[str, str]],
         recent_task: dict[str, Any] | None = None,
+        graph_blast_radius: list[str] | None = None,
     ) -> IntentClassification:
         if message.strip().startswith("/plan"):
             logger.info("[classify] /plan prefix — forcing large_change")
@@ -77,6 +87,7 @@ class IntentClassifier:
                     "message": message,
                     "conversation_history": history[-10:],
                     "explore_context": context,
+                    "graph_blast_radius": graph_blast_radius or [],
                     "recent_task": recent_task,
                 },
             )

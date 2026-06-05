@@ -96,6 +96,28 @@ class ChatAgent:
         )
         self._classifier = IntentClassifier(transport=transport, model=model)
 
+    def _compute_blast_radius(self, files_examined: list[str]) -> list[str]:
+        """Workspace-relative files structurally connected to the files the
+        explore phase read — the cross-file ripple of a change to them. Fed to
+        the intent classifier so it doesn't under-scope multi-file changes.
+        Best-effort: returns [] when no snapshot or on any error."""
+        ws_root = Path(self._workspace_path).resolve()
+        rel_paths: list[str] = []
+        for raw in files_examined:
+            try:
+                rel = str(Path(raw).resolve().relative_to(ws_root))
+            except (ValueError, OSError):
+                continue
+            if rel not in rel_paths:
+                rel_paths.append(rel)
+        if not rel_paths:
+            return []
+        try:
+            return self._registry.blast_radius(rel_paths)
+        except Exception:  # noqa: BLE001 — never block classification
+            logger.debug("[chat] blast_radius computation failed", exc_info=True)
+            return []
+
     async def handle_message(self, thread_id: str, message: str, channel_id: str) -> None:
         """Process a chat message and broadcast all events to channel_id.
 
@@ -200,8 +222,23 @@ class ChatAgent:
 
         _broadcast_thinking("Classifying intent…")
         recent_task = await self._find_recent_task(thread.messages)
+        # Compute the symbol-graph blast radius of the files the explore phase
+        # read, and feed it to the classifier. Without this the classifier
+        # judges scope purely from the handful of files explored and routinely
+        # UNDER-scopes multi-file changes (e.g. a planner change that ripples
+        # into domain/state_machine.py, api/routes.py, orchestrator/engine.py)
+        # to small_change — sending them down the inline-edit path instead of
+        # the planning loop. The blast radius surfaces that cross-file ripple.
+        graph_blast_radius = self._compute_blast_radius(files_examined)
+        logger.info(
+            "[chat] graph blast radius: %d files connected to %d explored (%s%s)",
+            len(graph_blast_radius), len(files_examined),
+            ", ".join(p.split("/")[-1] for p in graph_blast_radius[:6]),
+            "…" if len(graph_blast_radius) > 6 else "",
+        )
         classification = await self._classifier.classify(
-            message, context=context, history=history, recent_task=recent_task
+            message, context=context, history=history, recent_task=recent_task,
+            graph_blast_radius=graph_blast_radius,
         )
         logger.info("[chat] intent=%s targets=%s rationale=%s",
                     classification.intent, classification.likely_targets,
