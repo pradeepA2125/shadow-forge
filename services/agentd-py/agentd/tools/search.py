@@ -23,7 +23,14 @@ async def search_code(
     ripgrep_cmd: str = "rg",
 ) -> ToolOutput:
     if not pattern:
-        return ToolOutput(output="Error: pattern is required", is_error=True)
+        return ToolOutput(
+            output=(
+                "Error: the 'pattern' argument is required (the regex/text to search for). "
+                'Example: search_code(pattern="def build_router"). '
+                "Optional: path_filter (a glob like '*.py'), context_lines, fixed_strings."
+            ),
+            is_error=True,
+        )
 
     rg = shutil.which(ripgrep_cmd) or ripgrep_cmd
     cmd = [rg, "--json", "-C", str(max(0, context_lines))]

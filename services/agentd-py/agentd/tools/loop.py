@@ -39,6 +39,18 @@ _POST_PATCH_ANALYZER = AnalyzerBuilder.default()
 _MAX_OUTPUT_INJECT_CHARS = int(os.environ.get("AI_EDITOR_TOOL_RESULT_MAX_CHARS", "100000"))
 
 
+def _assistant_turn(response: dict[str, object]) -> dict[str, object]:
+    """Assistant history entry for a model turn WITHOUT its 'thought'.
+
+    Persisting the verbatim 'thought' lets a weak model copy-continue its own prior
+    reasoning, which compounds into a repetition attractor. Keep the actionable fields
+    (type/tool/args/patch_ops); drop the free-text reasoning. Append-only → KV-cache
+    prefix unaffected. Mirrors planning/loop.py::_assistant_turn.
+    """
+    persisted = {k: v for k, v in response.items() if k != "thought"}
+    return {"role": "assistant", "content": json.dumps(persisted, default=str)}
+
+
 def _extract_line_hint(error_msg: str, last_compiler_error: str) -> str:
     """Extract a line number reference from the compiler error or patch failure message,
     and construct a guided line-reading hint for the model.
@@ -415,7 +427,7 @@ class ToolLoop:
                     action_type, sm.state.value, step.id,
                     extra={"task_id": self._task_id},
                 )
-                history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                history.append({"role": "assistant", "content": "{}"})  # prong 1: don't echo rejected output (attractor prevention)
                 history.append({
                     "role": "tool_result", "tool": "_action_gate",
                     "content": (
@@ -443,10 +455,8 @@ class ToolLoop:
                         "verify_done called from invalid state %s (step %s)",
                         sm.state.value, step.id, extra={"task_id": self._task_id},
                     )
-                    history.append({
-                        "role": "assistant",
-                        "content": json.dumps(response, default=str),
-                    })
+                    # prong 1: don't echo rejected output (attractor prevention)
+                    history.append({"role": "assistant", "content": "{}"})
                     history.append({
                         "role": "tool_result", "tool": "_verify_guard",
                         "content": (
@@ -500,7 +510,8 @@ class ToolLoop:
                         "[loop] emit_patch dedup blocked: task=%s step=%s state=%s",
                         self._task_id, step.id, sm.state.value,
                     )
-                    history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                    # prong 1: don't echo the rejected duplicate patch (attractor prevention)
+                    history.append({"role": "assistant", "content": "{}"})
                     history.append({
                         "role": "tool_result", "tool": "_patch_apply",
                         "content": (
@@ -514,7 +525,7 @@ class ToolLoop:
                 sm.record_patch_attempt(patch_key)
 
                 patch_document = self._wrap_as_patch_document(patch_ops)
-                history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                history.append(_assistant_turn(response))
 
                 # Apply inline if patch_engine is available
                 if self._patch_engine is not None and self._shadow_path is not None:
@@ -799,7 +810,7 @@ class ToolLoop:
                     tool_name, sm.state.value, step.id,
                     extra={"task_id": self._task_id},
                 )
-                history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                history.append({"role": "assistant", "content": "{}"})  # prong 1: don't echo rejected output (attractor prevention)
                 history.append({
                     "role": "tool_result", "tool": "_tool_gate",
                     "content": (
@@ -819,7 +830,8 @@ class ToolLoop:
                     "[loop] repeat tool_call blocked: task=%s step=%s tool=%s first_seen_iter=%d",
                     self._task_id, step.id, tool_name, _seen_tool_calls[_call_key],
                 )
-                history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+                # prong 1: don't echo the rejected duplicate call (attractor prevention)
+                history.append({"role": "assistant", "content": "{}"})
                 history.append({
                     "role": "tool_result", "tool": tool_name,
                     "content": (
@@ -1009,7 +1021,7 @@ class ToolLoop:
                 is_error=tool_output.is_error,
             ))
 
-            history.append({"role": "assistant", "content": json.dumps(response, default=str)})
+            history.append(_assistant_turn(response))
             history.append({
                 "role": "tool_result", "tool": tool_name,
                 "content": tool_output.output[:_MAX_OUTPUT_INJECT_CHARS],

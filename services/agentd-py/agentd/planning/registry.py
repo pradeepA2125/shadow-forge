@@ -147,6 +147,8 @@ class PlanningToolRegistry:
         return tools
 
     async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
+        from agentd.tools.arg_aliases import normalize_tool_args
+        args = normalize_tool_args(name, args)
         if name == "search_code":
             from agentd.tools.search import search_code
             return await search_code(
@@ -259,6 +261,43 @@ class PlanningToolRegistry:
                 is_error=True,
             )
         return ToolOutput(output=_render_query_result(node, result))
+
+    def blast_radius(
+        self,
+        rel_paths: list[str],
+        per_file_limit: int = 25,
+        total_limit: int = 30,
+    ) -> list[str]:
+        """Distinct workspace files structurally connected (Calls/Imports/
+        References/Inherits/Implements) to `rel_paths`. Used by the chat
+        intent classifier to judge a change's true cross-file scope: the
+        explore phase may only read a couple of files, but a change to them
+        ripples into everything that imports/calls them. Returns workspace-
+        relative paths, seed files excluded, capped at `total_limit`. Empty
+        when no snapshot is available."""
+        walker = self._ensure_walker()
+        if walker is None:
+            return []
+        seed_set = set(rel_paths)
+        out: list[str] = []
+        seen: set[str] = set()
+        for rel in rel_paths:
+            try:
+                result = walker.query(rel, depth=1, limit=per_file_limit)
+            except Exception:  # noqa: BLE001 — best-effort signal, never block classify
+                continue
+            # File seeds populate file_neighbors; symbol seeds populate
+            # neighbors. Cover both so the method is robust to either input.
+            neighbour_files = [fn.file for fn in result.file_neighbors]
+            neighbour_files += [n.node.file for n in result.neighbors]
+            for f in neighbour_files:
+                if f in seed_set or f in seen:
+                    continue
+                seen.add(f)
+                out.append(f)
+                if len(out) >= total_limit:
+                    return out
+        return out
 
     def _ensure_walker(self) -> GraphWalker | None:
         snapshot = self._snapshot_path()

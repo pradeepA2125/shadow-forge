@@ -190,6 +190,20 @@ class DefaultReasoningEngine(ReasoningEngine):
             tool_definitions, max_calls=max_calls, revision_mode=revision_mode
         )
         user_payload = build_planning_step_payload(plan_context, history, tool_definitions)
+        # Per-turn payload capture: dump the EXACT system + user strings sent to the model
+        # before the call fires, so a stuck or context-overflowing loop can be inspected
+        # byte-for-byte from artifacts even when the call itself 400s. Skipped (via the
+        # type guards) on code paths where task_id/workspace_path aren't in plan_context.
+        _dbg_task_id = plan_context.get("task_id")
+        _dbg_workspace = plan_context.get("workspace_path")
+        if isinstance(_dbg_task_id, str) and isinstance(_dbg_workspace, str):
+            _turn = len(history) // 2 + 1
+            _debug_dump(
+                _dbg_task_id,
+                f"plan-turn-{_turn:02d}",
+                {"system_instructions": system_instructions, "user_payload": user_payload},
+                workspace_path=_dbg_workspace,
+            )
         result = await self._transport.generate_json(
             model=self._model,
             schema_name="planning_step_response",

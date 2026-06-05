@@ -20,7 +20,11 @@ from agentd.domain.models import (
 )
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster
 from agentd.planning.agent import PlanningAgent
-from agentd.planning.loop import PlanningLoop, _validate_no_duplicate_file_targets
+from agentd.planning.loop import (
+    PlanningBudgetExceededError,
+    PlanningLoop,
+    _validate_no_duplicate_file_targets,
+)
 from agentd.planning.registry import PlanningToolRegistry
 
 
@@ -133,6 +137,47 @@ async def test_planning_loop_tool_call_then_emit_plan(tmp_path: Path):
     result = await loop.run({"goal": "test", "workspace_path": str(tmp_path)}, TaskBudget())
     assert isinstance(result, PlanningResult)
     assert result.confidence == "medium"
+
+
+@pytest.mark.asyncio
+async def test_planning_loop_recovers_from_malformed_response(tmp_path: Path):
+    """An empty/typeless response (weak-model failure mode) is corrected and retried,
+    not fatal — a subsequent emit_plan still succeeds."""
+    engine = ScriptedPlanningEngine([
+        {},  # empty object: type == "" → malformed
+        {"thought": "still confused"},  # missing type → malformed
+        {
+            "type": "emit_plan",
+            "thought": "Recovered",
+            "plan_markdown": "# Plan\n- step 1",
+            "files_examined": [],
+            "confidence": "medium",
+        },
+    ])
+    loop = PlanningLoop(
+        reasoning_engine=engine,
+        registry=_make_registry(tmp_path),
+        broadcaster=_make_broadcaster(),
+        task_id="t1",
+    )
+    result = await loop.run({"goal": "test", "workspace_path": str(tmp_path)}, TaskBudget())
+    assert isinstance(result, PlanningResult)
+    assert result.plan_markdown == "# Plan\n- step 1"
+
+
+@pytest.mark.asyncio
+async def test_planning_loop_bails_after_consecutive_malformed(tmp_path: Path):
+    """A model that only ever returns empty responses fails gracefully after the cap
+    rather than spinning to the full tool-call budget."""
+    engine = ScriptedPlanningEngine([{}])  # always empty
+    loop = PlanningLoop(
+        reasoning_engine=engine,
+        registry=_make_registry(tmp_path),
+        broadcaster=_make_broadcaster(),
+        task_id="t1",
+    )
+    with pytest.raises(PlanningBudgetExceededError, match="consecutive malformed"):
+        await loop.run({"goal": "test", "workspace_path": str(tmp_path)}, TaskBudget())
 
 
 @pytest.mark.asyncio

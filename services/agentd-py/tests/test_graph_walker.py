@@ -139,6 +139,29 @@ def test_file_seed_truncates_on_distinct_files_not_edges(tmp_path: Path) -> None
     assert result.truncated is True
 
 
+def test_registry_blast_radius_unions_neighbour_files_excluding_seeds(tmp_path: Path) -> None:
+    """PlanningToolRegistry.blast_radius — the cross-file ripple of a set of
+    seed files, used by the chat classifier to judge true scope. Seed files
+    are excluded; neighbours from all seeds are unioned."""
+    from agentd.planning.registry import PlanningToolRegistry
+
+    snapshot = _fixture(tmp_path)  # engine.py -> state_machine.py + storage/base.py
+    # Override the env so the registry reads our fixture snapshot.
+    import os
+    os.environ["AI_EDITOR_RETRIEVAL_SNAPSHOT_PATH"] = str(snapshot)
+    try:
+        reg = PlanningToolRegistry(real_path=tmp_path)
+        br = reg.blast_radius(["src/engine.py"])
+    finally:
+        del os.environ["AI_EDITOR_RETRIEVAL_SNAPSHOT_PATH"]
+
+    # engine.py calls into state_machine.py and storage/base.py → both ripple.
+    assert "src/state_machine.py" in br
+    assert "src/storage/base.py" in br
+    # The seed file itself is excluded.
+    assert "src/engine.py" not in br
+
+
 def test_symbol_seed_still_returns_symbol_level_neighbors(tmp_path: Path) -> None:
     """The aggregation is file-seed only; symbol seeds keep symbol detail."""
     snapshot = _fixture(tmp_path)

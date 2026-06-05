@@ -283,6 +283,8 @@ class ToolRegistry:
 
     async def execute(self, name: str, args: dict[str, object]) -> ToolOutput:
         """Dispatch a tool call. Returns ToolOutput with output text and error flag."""
+        from agentd.tools.arg_aliases import normalize_tool_args
+        args = normalize_tool_args(name, args)
         if name == "search_code":
             from agentd.tools.search import search_code
             return await search_code(
