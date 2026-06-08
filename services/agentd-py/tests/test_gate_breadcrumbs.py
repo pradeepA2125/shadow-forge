@@ -139,6 +139,30 @@ async def test_validation_gate_breadcrumb(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plan_approval_breadcrumb(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"; ws.mkdir()
+    orch, chat_store, thread_id = _make(tmp_path)
+    task = TaskRecord(
+        task_id="t1", goal="g", workspace_path=str(ws),
+        chat_channel_id=f"chat:{thread_id}", plan_markdown="# Plan\n- do it",
+    )
+    for status, reason in [
+        (TaskStatus.CONTEXT_READY, "ctx"),
+        (TaskStatus.AWAITING_PLAN_APPROVAL, "approval"),
+    ]:
+        task = transition(task, status, reason)
+    await orch._store.create(task)
+    # The breadcrumb fires at the PLANNED transition, before JSON-plan generation
+    # (which the noop reasoner can't satisfy) — so tolerate the later failure.
+    try:
+        await orch.continue_task("t1", feedback=None)
+    except Exception:
+        pass
+    crumbs = _breadcrumbs(chat_store, thread_id)
+    assert any("plan approved" in c.lower() for c in crumbs)
+
+
+@pytest.mark.asyncio
 async def test_step_gate_breadcrumb(tmp_path: Path) -> None:
     ws = tmp_path / "ws"; ws.mkdir()
     shadow = tmp_path / "shadow"; shadow.mkdir()

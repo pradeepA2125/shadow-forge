@@ -488,12 +488,14 @@ class AgentOrchestrator:
                         },
                     })
                 self._write_chat_plan_card(task)
+                self._write_chat_breadcrumb(task, "↻ Plan feedback submitted — regenerating the plan.")
                 return task
 
             # Approved! Generate JSON plan from Markdown
             print("\n[PLAN] Plan Approved. Generating executable JSON plan...")
             task = transition(task, TaskStatus.PLANNED, "plan approved; starting execution")
             await self._store.save(task)
+            self._write_chat_breadcrumb(task, "✓ Plan approved — starting execution.")
             self.broadcaster.broadcast(task_id, {
                 "type": "task_status_changed",
                 "payload": {"task_id": task_id, "status": "PLANNED", "message": "Generating execution plan…"},
