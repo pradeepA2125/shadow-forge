@@ -950,6 +950,41 @@ def build_router(
                 raise HTTPException(status_code=404, detail="Thread not found")
             return thread.model_dump()
 
+        @router.get("/chat/threads/{thread_id}/live")
+        async def get_thread_live(thread_id: str) -> dict:
+            """The thread's current actionable state (status + one active gate + plan).
+
+            The UI polls this and renders entirely from it, so reloads and resume
+            task-id churn self-heal. The resolver is a pure sync function; the task
+            store is async, so we pre-fetch the active task and wrap it in a getter.
+
+            NOTE: there is no fallback to the latest chat_channel_id task for legacy
+            threads created before active_task_id tracking — the store has no
+            list-tasks API. Such a thread resolves to nulls until its next task is
+            created, which repoints active_task_id.
+            """
+            from agentd.chat.live_state import resolve_live_state
+
+            thread = _chat_agent._store.get_thread(thread_id)
+            if thread is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+
+            active_id = thread.active_task_id
+            task: TaskRecord | None = None
+            if active_id:
+                try:
+                    task = await store.get(active_id)
+                except KeyError:
+                    task = None  # task was pruned; resolve to nulls
+
+            def _get(_task_id: str) -> TaskRecord:
+                if task is None:
+                    raise KeyError(_task_id)
+                return task
+
+            live = resolve_live_state(active_id if task is not None else None, _get)
+            return live.model_dump()
+
         @router.post("/chat/threads/{thread_id}/message")
         async def post_chat_message(thread_id: str, request: dict) -> StreamingResponse:
             import asyncio as _asyncio_chat
