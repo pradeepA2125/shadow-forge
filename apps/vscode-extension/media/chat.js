@@ -415,6 +415,148 @@
     threadEl.scrollTop = threadEl.scrollHeight;
   }
 
+  // ---- Live, state-driven cards (Class A) -------------------------------------
+  // Rendered into a pinned slot from the /live poll (and SSE pokes). One card per
+  // kind, replaced in place, so they survive reloads and resume task-id churn.
+  var liveSlotEl = document.getElementById('live-slot');
+
+  function liveResolved(card, label) {
+    var a = card.querySelector('.live-actions');
+    if (a) { a.innerHTML = '<span class="inline-resolved">' + escHtml(label) + '</span>'; }
+  }
+
+  function clearLiveGate() {
+    var g = liveSlotEl.querySelector('.live-gate');
+    if (g) { g.remove(); }
+  }
+
+  function clearLivePlan() {
+    var p = liveSlotEl.querySelector('.live-plan');
+    if (p) { p.remove(); }
+  }
+
+  function renderLiveGate(gate) {
+    clearLiveGate();
+    if (!gate || !gate.kind) { return; }
+    var tid = gate.taskId;
+    var p = gate.payload || {};
+    var card = document.createElement('div');
+    card.className = 'live-gate live-gate-' + gate.kind;
+
+    if (gate.kind === 'command') {
+      var cmd = (p.command || '') + (Array.isArray(p.args) && p.args.length ? ' ' + p.args.join(' ') : '');
+      card.innerHTML =
+        '<div class="live-head">⚙ Command approval</div>' +
+        '<pre class="live-cmd">' + escHtml(cmd) + '</pre>' +
+        '<div class="live-actions">' +
+        '<button class="btn-primary" data-act="approve">Approve</button>' +
+        '<button class="btn-secondary" data-act="remember">Always allow</button>' +
+        '<button class="btn-secondary" data-act="reject">Reject</button>' +
+        '</div>';
+      card.querySelectorAll('button[data-act]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var a = b.getAttribute('data-act');
+          if (a === 'reject') {
+            liveResolved(card, 'Rejected');
+            vscode.postMessage({ type: 'commandDecision', taskId: tid, approve: false });
+          } else {
+            liveResolved(card, a === 'remember' ? 'Always allowed' : 'Approved');
+            vscode.postMessage({ type: 'commandDecision', taskId: tid, approve: true, remember: a === 'remember', scope: 'exact' });
+          }
+        });
+      });
+    } else if (gate.kind === 'validation') {
+      card.innerHTML =
+        '<div class="live-head">✓ Validation review</div>' +
+        '<div class="live-body">' + escHtml(p.summary || 'Validation failed') + '</div>' +
+        '<div class="live-actions">' +
+        '<button class="btn-primary" data-act="accept">Accept</button>' +
+        '<button class="btn-secondary" data-act="reject">Reject</button>' +
+        '</div>';
+      card.querySelectorAll('button[data-act]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var a = b.getAttribute('data-act');
+          liveResolved(card, a === 'accept' ? 'Accepted' : 'Rejected');
+          vscode.postMessage({ type: 'validationDecision', taskId: tid, decision: a });
+        });
+      });
+    } else if (gate.kind === 'scope') {
+      var files = Array.isArray(p.files) ? p.files : [];
+      var fileList = files.map(function (f) { return '<li>' + escHtml(f) + '</li>'; }).join('');
+      card.innerHTML =
+        '<div class="live-head">📁 Scope extension</div>' +
+        '<div class="live-body">' + escHtml(p.reason || '') + '<ul>' + fileList + '</ul></div>' +
+        '<div class="live-actions">' +
+        '<button class="btn-primary" data-act="approve">Approve</button>' +
+        '<button class="btn-secondary" data-act="remember">Approve &amp; remember</button>' +
+        '<button class="btn-secondary" data-act="reject">Reject</button>' +
+        '</div>';
+      card.querySelectorAll('button[data-act]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var a = b.getAttribute('data-act');
+          liveResolved(card, a === 'reject' ? 'Rejected' : 'Approved');
+          vscode.postMessage({
+            type: 'scopeDecision', taskId: tid, files: files,
+            decision: a === 'reject' ? 'reject' : 'approve', remember: a === 'remember',
+          });
+        });
+      });
+    } else if (gate.kind === 'step') {
+      card.innerHTML =
+        '<div class="live-head">📝 Step review</div>' +
+        '<div class="live-body">' + escHtml(p.step_title || 'Review the step changes') + '</div>' +
+        '<div class="live-actions">' +
+        '<button class="btn-primary" data-act="accept">Accept</button>' +
+        '<button class="btn-secondary" data-act="discard">Discard</button>' +
+        '</div>';
+      card.querySelectorAll('button[data-act]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          var a = b.getAttribute('data-act');
+          liveResolved(card, a === 'accept' ? 'Accepted' : 'Discarded');
+          vscode.postMessage({ type: 'stepDecision', taskId: tid, decision: a });
+        });
+      });
+    } else {
+      return;
+    }
+    liveSlotEl.appendChild(card);
+  }
+
+  function renderLivePlan(plan) {
+    clearLivePlan();
+    if (!plan) { return; }
+    var tid = plan.taskId;
+    var mdHtml = (typeof marked !== 'undefined' && plan.planMarkdown)
+      ? marked.parse(plan.planMarkdown)
+      : '<pre>' + escHtml(plan.planMarkdown || '') + '</pre>';
+    var div = document.createElement('div');
+    div.className = 'live-plan';
+    div.innerHTML =
+      '<div class="live-head">📋 Plan — awaiting approval</div>' +
+      '<div class="plan-md">' + mdHtml + '</div>' +
+      '<div class="live-actions">' +
+      '<button class="btn-primary" data-act="implement">Implement Plan</button>' +
+      '<textarea id="live-fb-' + escHtml(tid) + '" placeholder="Give feedback…" rows="2"></textarea>' +
+      '<button class="btn-secondary" data-act="feedback">Send Feedback</button>' +
+      '</div>';
+    div.querySelectorAll('button[data-act]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var a = b.getAttribute('data-act');
+        if (a === 'implement') {
+          liveResolved(div, 'Implementing…');
+          vscode.postMessage({ type: 'implementPlan', taskId: tid });
+        } else {
+          var fbEl = document.getElementById('live-fb-' + tid);
+          var fb = fbEl ? fbEl.value.trim() : '';
+          if (!fb) { return; }
+          liveResolved(div, 'Feedback submitted — regenerating…');
+          vscode.postMessage({ type: 'planFeedback', taskId: tid, feedback: fb });
+        }
+      });
+    });
+    liveSlotEl.appendChild(div);
+  }
+
   window.addEventListener('message', function (e) {
     var msg = e.data;
     if (msg.type === 'appendMessage') { hideThinking(); appendMessage(msg.message); }
@@ -433,6 +575,14 @@
       hideThinking();
       threadEl.innerHTML = '';
       currentAgentBubble = null;
+    } else if (msg.type === 'renderLiveGate') {
+      renderLiveGate(msg.gate);
+    } else if (msg.type === 'clearLiveGate') {
+      clearLiveGate();
+    } else if (msg.type === 'renderLivePlan') {
+      renderLivePlan(msg.plan);
+    } else if (msg.type === 'clearLivePlan') {
+      clearLivePlan();
     } else if (msg.type === 'thread_title_updated') {
       var tab = threadEl.closest('body')
         ? document.querySelector('.thread-tab[data-thread-id="' + msg.payload.thread_id + '"]')

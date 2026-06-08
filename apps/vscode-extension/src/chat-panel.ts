@@ -15,6 +15,7 @@ export type SwitchThreadHandler = (threadId: string) => Promise<void>;
 export type ScopeDecisionHandler = (taskId: string, files: string[], decision: "approve" | "reject", remember: boolean) => Promise<void>;
 export type ValidationDecisionHandler = (taskId: string, decision: "accept" | "reject") => Promise<void>;
 export type CommandDecisionHandler = (taskId: string, decision: CommandDecision) => Promise<void>;
+export type StepDecisionHandler = (taskId: string, decision: "accept" | "discard") => Promise<void>;
 
 export class ChatPanel {
   private panel: vscode.WebviewPanel | null = null;
@@ -31,6 +32,7 @@ export class ChatPanel {
     private readonly onScopeDecision: ScopeDecisionHandler,
     private readonly onValidationDecision: ValidationDecisionHandler,
     private readonly onCommandDecision: CommandDecisionHandler,
+    private readonly onStepDecision: StepDecisionHandler,
     private readonly onReady: () => Promise<void> = async () => {}
   ) {}
 
@@ -98,6 +100,9 @@ export class ChatPanel {
           ruleValue: typeof m["ruleValue"] === "string" ? (m["ruleValue"] as string) : undefined,
         };
         p = this.onCommandDecision(m["taskId"] as string, decision);
+      } else if (m["type"] === "stepDecision") {
+        const decision = m["decision"] === "accept" ? "accept" : "discard";
+        p = this.onStepDecision(m["taskId"] as string, decision);
       } else {
         return;
       }
@@ -259,6 +264,25 @@ export class ChatPanel {
   .thinking-log summary { cursor: pointer; user-select: none; opacity: 0.7; }
   .thinking-log summary:hover { opacity: 1; }
   .thinking-log ul { margin: 4px 0 0 0; padding-left: 16px; line-height: 1.6; }
+  /* Live, state-driven cards (Class A) — pinned above the input so a pending gate is
+     always in view and survives reloads (re-derived from /live). */
+  #live-slot { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; flex-shrink: 0; }
+  #live-slot:empty { padding: 0; }
+  .live-gate, .live-plan { border: 1px solid var(--vscode-focusBorder); border-radius: 6px;
+               padding: 10px 12px; background: var(--vscode-editor-inactiveSelectionBackground); }
+  .live-head { font-weight: 600; font-size: 0.9em; margin-bottom: 6px; }
+  .live-body { font-size: 0.85em; line-height: 1.5; margin-bottom: 8px; }
+  .live-body ul { margin: 4px 0; padding-left: 18px; }
+  .live-cmd { background: var(--vscode-textCodeBlock-background); padding: 6px 8px; border-radius: 4px;
+              font-family: var(--vscode-editor-font-family, monospace); font-size: 0.85em;
+              overflow-x: auto; margin: 0 0 8px; }
+  .live-plan .plan-md { margin: 6px 0; font-size: 0.88em; line-height: 1.6; max-height: 40vh; overflow-y: auto; }
+  .live-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .live-actions button { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; }
+  .live-actions textarea { flex: 1; min-width: 140px; padding: 4px;
+                           background: var(--vscode-input-background);
+                           color: var(--vscode-input-foreground);
+                           border: 1px solid var(--vscode-input-border); border-radius: 4px; }
   #input-row { display: flex; gap: 8px; padding: 10px;
                border-top: 1px solid var(--vscode-panel-border); }
   #input { flex: 1; padding: 8px; border: 1px solid var(--vscode-input-border);
@@ -271,6 +295,7 @@ export class ChatPanel {
 <body>
 <div id="thread-list"><button id="new-chat-btn">+ New Chat</button></div>
 <div id="thread"></div>
+<div id="live-slot"></div>
 <div id="input-row">
   <textarea id="input" rows="2" placeholder="Ask anything or describe a change…"></textarea>
   <button id="send">Send</button>

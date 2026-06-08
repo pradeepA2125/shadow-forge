@@ -30,6 +30,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     (taskId, files, decision, remember) => controller.handleScopeDecisionFromChat(taskId, files, decision, remember),
     (taskId, decision) => controller.handleValidationDecisionFromChat(taskId, decision),
     (taskId, decision) => controller.handleCommandDecisionFromChat(taskId, decision),
+    (taskId, decision) =>
+      decision === "accept" ? controller.acceptStep(taskId) : controller.discardStep(taskId),
     () => controller.openChat()
   );
 

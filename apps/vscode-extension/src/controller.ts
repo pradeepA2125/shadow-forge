@@ -617,56 +617,28 @@ export class AiEditorController {
           const taskId = (event.payload["task_id"] as string) ?? "";
           const status = (event.payload["status"] as string) ?? "";
           const planMarkdown = event.payload["plan_markdown"] as string | undefined;
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: planMarkdown ?? `Task ${taskId}: ${status}`,
-            type: planMarkdown ? "plan_card" : "text",
-            taskId,
-            timestamp: this.now(),
-            metadata: planMarkdown ? { taskId, plan_markdown: planMarkdown } : {},
-          });
+          if (planMarkdown) {
+            // Plan is a Class-A live card — let /live render it in the pinned slot.
+            void this.pollThreadLiveState();
+          } else {
+            this.ui.appendChatMessage({
+              role: "agent",
+              content: `Task ${taskId}: ${status}`,
+              type: "text",
+              taskId,
+              timestamp: this.now(),
+              metadata: {},
+            });
+          }
         } else if (event.type === "scope_extension_requested") {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "scope_card",
-            taskId: event.payload["decision_id"] as string,
-            timestamp: this.now(),
-            metadata: {
-              taskId: currentTaskId ?? "",
-              decision_id: event.payload["decision_id"],
-              files: event.payload["files"],
-              reason: event.payload["reason"],
-              step_id: event.payload["step_id"],
-            },
-          });
+          // Class-A gate — render from /live (instant poke now, durable on reload).
+          void this.pollThreadLiveState();
           this.ui.appendChatThinkingEntry("Waiting for scope approval…");
         } else if (event.type === "validation_decision_requested") {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "validation_card",
-            taskId: event.payload.task_id,
-            timestamp: this.now(),
-            metadata: { taskId: event.payload.task_id, diagnostics: event.payload.diagnostics },
-          });
+          void this.pollThreadLiveState();
           this.ui.appendChatThinkingEntry("Waiting for validation decision…");
         } else if (event.type === "command_approval_requested") {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "command_card",
-            taskId: currentTaskId ?? "",
-            timestamp: this.now(),
-            metadata: {
-              taskId: currentTaskId ?? "",
-              decisionId: event.payload.decision_id,
-              command: event.payload.command,
-              args: event.payload.args,
-              cwd: event.payload.cwd,
-              stepId: event.payload.step_id,
-            },
-          });
+          void this.pollThreadLiveState();
           this.ui.appendChatThinkingEntry("Waiting for command approval…");
         } else if (event.type === "thread_title_updated") {
           const threadId = (event.payload["thread_id"] as string) ?? "";
@@ -756,14 +728,8 @@ export class AiEditorController {
       try {
         const task = await client.getTask(taskId);
         if (task.status === "AWAITING_PLAN_APPROVAL" && task.planMarkdown) {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: task.planMarkdown,
-            type: "plan_card",
-            taskId,
-            timestamp: this.now(),
-            metadata: { taskId, plan_markdown: task.planMarkdown },
-          });
+          // Plan is a Class-A live card — render it from /live in the pinned slot.
+          void this.pollThreadLiveState();
         } else if (task.status === "FAILED") {
           this.ui.showError("Re-planning failed — the model used its full tool budget without producing a plan. Try submitting feedback again with more specific instructions.");
         }
@@ -819,46 +785,13 @@ export class AiEditorController {
             metadata: {},
           });
         } else if (event.type === "scope_extension_requested") {
+          // Class-A gates render from /live in the pinned slot; poke for an instant update.
           this.ui.appendChatThinkingEntry("Waiting for scope approval…");
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "scope_card",
-            taskId,
-            timestamp: this.now(),
-            metadata: {
-              taskId,
-              decision_id: event.payload.decision_id,
-              files: event.payload.files,
-              reason: event.payload.reason,
-              step_id: event.payload.step_id,
-            },
-          });
+          void this.pollThreadLiveState();
         } else if (event.type === "validation_decision_requested") {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "validation_card",
-            taskId: event.payload.task_id,
-            timestamp: this.now(),
-            metadata: { taskId: event.payload.task_id, diagnostics: event.payload.diagnostics },
-          });
+          void this.pollThreadLiveState();
         } else if (event.type === "command_approval_requested") {
-          this.ui.appendChatMessage({
-            role: "agent",
-            content: "",
-            type: "command_card",
-            taskId,
-            timestamp: this.now(),
-            metadata: {
-              taskId,
-              decisionId: event.payload.decision_id,
-              command: event.payload.command,
-              args: event.payload.args,
-              cwd: event.payload.cwd,
-              stepId: event.payload.step_id,
-            },
-          });
+          void this.pollThreadLiveState();
         } else if (event.type === "done") {
           const status = (event.payload["status"] as string | undefined) ?? "";
           this.ui.hideChatThinking();
