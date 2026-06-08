@@ -77,6 +77,23 @@ def test_step_gate() -> None:
     assert ls.pending_gate.payload["step_title"] == "Add edges"
 
 
+def test_step_gate_carries_diff_entries_with_temp_path() -> None:
+    # The chat live-slot step card renders an inline diff from these fields, so the
+    # /live payload must carry per-file path + temp_path (shadow path for vscode.diff).
+    es = TaskExecutionState(
+        pending_step_review=StepReviewPayload(
+            step_id="s3",
+            step_title="Touch auth",
+            diff_entries=[{"path": "auth.py", "additions": 3, "deletions": 1, "temp_path": "/shadow/auth.py"}],
+        )
+    )
+    t = _task(TaskStatus.AWAITING_STEP_REVIEW, es=es)
+    ls = resolve_live_state("t1", _getter(t))
+    entries = ls.pending_gate.payload["diff_entries"]
+    assert entries[0]["path"] == "auth.py"
+    assert entries[0]["temp_path"] == "/shadow/auth.py"
+
+
 def test_scope_gate() -> None:
     es = TaskExecutionState(
         pending_scope_request=ScopeExtensionRequest(

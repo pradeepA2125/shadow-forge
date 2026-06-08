@@ -502,16 +502,33 @@
         });
       });
     } else if (gate.kind === 'step') {
+      var stepEntries = Array.isArray(p.diff_entries) ? p.diff_entries : [];
+      var stepFileLines = stepEntries.map(function (e) {
+        return '<span class="diff-file">' + escHtml(e.path) + '</span>' +
+          ' <span class="diff-adds">+' + (e.additions || 0) + '</span>' +
+          ' <span class="diff-dels">-' + (e.deletions || 0) + '</span>';
+      }).join('<br>');
+      var stepViewBtns = stepEntries.map(function (e) {
+        return '<button class="btn-ghost" data-act="viewdiff" data-path="' + escHtml(e.path) +
+          '" data-shadow-path="' + escHtml(e.temp_path || '') + '">⎘ ' + escHtml(String(e.path).split('/').pop()) + '</button>';
+      }).join('');
       card.innerHTML =
-        '<div class="live-head">📝 Step review</div>' +
-        '<div class="live-body">' + escHtml(p.step_title || 'Review the step changes') + '</div>' +
+        '<div class="live-head">📝 Step review — ' + escHtml(p.step_title || '') + '</div>' +
+        (stepFileLines ? '<div class="diff-files">' + stepFileLines + '</div>' : '') +
         '<div class="live-actions">' +
         '<button class="btn-primary" data-act="accept">Accept</button>' +
         '<button class="btn-secondary" data-act="discard">Discard</button>' +
+        (stepViewBtns ? '<div class="diff-view-btns">' + stepViewBtns + '</div>' : '') +
         '</div>';
       card.querySelectorAll('button[data-act]').forEach(function (b) {
         b.addEventListener('click', function () {
           var a = b.getAttribute('data-act');
+          if (a === 'viewdiff') {
+            // Native VS Code diff (real workspace file vs step shadow), same as the
+            // small_change path — openInlineDiff is generic over (path, shadowPath).
+            vscode.postMessage({ type: 'viewDiffFile', path: b.getAttribute('data-path'), shadowPath: b.getAttribute('data-shadow-path') || '' });
+            return;
+          }
           liveResolved(card, a === 'accept' ? 'Accepted' : 'Discarded');
           vscode.postMessage({ type: 'stepDecision', taskId: tid, decision: a });
         });
