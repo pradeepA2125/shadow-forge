@@ -1397,6 +1397,10 @@ class AgentOrchestrator:
                 # accepted changes. Review (if enabled above) runs BEFORE; promote is
                 # required regardless of whether review was shown.
                 await self._partial_promote(shadow_path, real_path, step_result.touched_files)
+                # Mark completed ONLY now — after the changes are in the real workspace —
+                # so a "completed" step (which resume skips) is guaranteed to be promoted.
+                self._mark_step_completed(task, step.id)
+                await self._store.save(task)
 
             task = transition(task, TaskStatus.VALIDATING, "full validation started")
             await self._store.save(task)
@@ -1475,6 +1479,11 @@ class AgentOrchestrator:
                 await self._store.save(task)
                 return task
             self._merge_step_result(task, repair_result, persistent_diagnostics)
+            if repair_result.outcome == "step_completed":
+                # Repair has no per-step promote; its changes reach the real workspace on
+                # the final PROMOTING. Marking completed here is safe because this path
+                # ends at READY_FOR_REVIEW, not a resumable FAILED state.
+                self._mark_step_completed(task, repair_result.step_id)
             await self._store.save(task)
             if repair_result.outcome != "step_completed":
                 task = transition(task, TaskStatus.FAILED, "repair budget exhausted")
@@ -1835,13 +1844,19 @@ class AgentOrchestrator:
         task.execution_trace.extend(result.trace_entries)
         task.checkpoints.extend(result.checkpoint_manifests)
         task.diagnostics = [*result.diagnostics] if result.diagnostics else [*persistent_diagnostics]
+        # NOTE: completed_step_ids is intentionally NOT advanced here. A step is marked
+        # completed only AFTER _partial_promote writes its changes to the real workspace
+        # (see _mark_step_completed). Advancing it before promotion would orphan a
+        # completed-but-unpromoted step: resume skips completed steps, so its real-
+        # workspace write would never happen.
+
+    def _mark_step_completed(self, task: TaskRecord, step_id: str) -> None:
+        """Record a plan step as completed. Call this ONLY after the step's changes
+        have been promoted to the real workspace (_partial_promote) — completed_step_ids
+        gates resume-skip, so the two MUST stay coupled."""
         plan_step_ids = {step.id for step in task.plan.steps} if task.plan else set()
-        if (
-            result.outcome == "step_completed"
-            and result.step_id in plan_step_ids
-            and result.step_id not in task.completed_step_ids
-        ):
-            task.completed_step_ids.append(result.step_id)
+        if step_id in plan_step_ids and step_id not in task.completed_step_ids:
+            task.completed_step_ids.append(step_id)
 
     def _build_planning_agent(self, task_id: str, workspace_path: str) -> PlanningAgent:
         """Construct a PlanningAgent reading from the real (unmodified) workspace."""

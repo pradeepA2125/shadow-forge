@@ -495,3 +495,54 @@ async def test_orchestrator_allows_missing_target_when_intent_is_new(tmp_path: P
 
     assert result.status == TaskStatus.READY_FOR_REVIEW
     assert "tests/test_task_events_api.py" in result.modified_files
+
+
+@pytest.mark.asyncio
+async def test_step_completion_is_coupled_to_real_workspace_promote(tmp_path: Path) -> None:
+    """A completed step's changes must be in the real workspace (promote ran)."""
+    real_workspace = tmp_path / "real"
+    real_workspace.mkdir(parents=True)
+    store = InMemoryTaskStore()
+    task = TaskRecord(task_id="task-coupled", goal="Add new API regression test file",
+                      workspace_path=str(real_workspace))
+    await store.create(task)
+    orchestrator = AgentOrchestrator(
+        store=store, reasoning_engine=NewFileIntentReasoner(), validator=PassValidator(),
+        patch_engine=PatchEngine(),
+        workspace_manager=ShadowWorkspaceManager(root_path=tmp_path / "shadows"),
+    )
+    await orchestrator.run_task(task.task_id)
+    result = await orchestrator.continue_task(task.task_id, feedback=None)
+
+    assert result.status == TaskStatus.READY_FOR_REVIEW
+    assert result.completed_step_ids  # at least one step completed
+    # Every completed step's work is in the REAL workspace, not just the shadow.
+    assert (real_workspace / "tests" / "test_task_events_api.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_step_not_marked_completed_when_promote_fails(tmp_path: Path) -> None:
+    """If _partial_promote fails, the step must NOT enter completed_step_ids — otherwise
+    resume would skip it and its real-workspace write would never happen (orphaned)."""
+    real_workspace = tmp_path / "real"
+    real_workspace.mkdir(parents=True)
+    store = InMemoryTaskStore()
+    task = TaskRecord(task_id="task-promfail", goal="Add new API regression test file",
+                      workspace_path=str(real_workspace))
+    await store.create(task)
+    orchestrator = AgentOrchestrator(
+        store=store, reasoning_engine=NewFileIntentReasoner(), validator=PassValidator(),
+        patch_engine=PatchEngine(),
+        workspace_manager=ShadowWorkspaceManager(root_path=tmp_path / "shadows"),
+    )
+
+    async def _boom(*_a, **_k) -> None:
+        raise RuntimeError("promote failed")
+
+    orchestrator._partial_promote = _boom  # type: ignore[method-assign]
+
+    await orchestrator.run_task(task.task_id)
+    result = await orchestrator.continue_task(task.task_id, feedback=None)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.completed_step_ids == []  # un-promoted step is NOT recorded completed
