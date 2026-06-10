@@ -18,7 +18,12 @@ export interface DiffEntry {
   temp_path?: string;
 }
 
-export interface Diagnostic { level: string; message: string; source?: string }
+export interface Diagnostic {
+  /* backend sends arbitrary level strings (pydantic str) — do not narrow to a literal union */
+  level: string;
+  message: string;
+  source?: string;
+}
 
 export interface ThreadSummary {
   threadId: string;

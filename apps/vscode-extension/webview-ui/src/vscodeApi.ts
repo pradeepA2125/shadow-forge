@@ -1,5 +1,7 @@
+import type { WebviewMessage } from "./types";
+
 interface VscodeApi {
-  postMessage(msg: unknown): void;
+  postMessage(msg: WebviewMessage): void;
 }
 
 declare function acquireVsCodeApi(): VscodeApi;

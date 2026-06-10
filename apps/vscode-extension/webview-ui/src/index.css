@@ -7,6 +7,7 @@
   --color-surface-2: #1f1f24;
   --color-surface-3: #26262c;
   /* borders */
+  /* border intentionally equals surface-3 today (per hi-fi mockup) but is a semantically independent role — they may diverge */
   --color-border: #26262c;
   --color-border-strong: #32323a;
   /* text ramp */
