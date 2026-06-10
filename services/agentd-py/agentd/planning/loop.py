@@ -16,7 +16,7 @@ from agentd.domain.models import (
     ToolCall,
     ToolResult,
 )
-from agentd.orchestrator.broadcaster import PatchEventBroadcaster
+from agentd.orchestrator.broadcaster import PatchEventBroadcaster, cap_event_output
 from agentd.planning.registry import PlanningToolRegistry
 from agentd.reasoning.contracts import ReasoningEngine
 
@@ -409,7 +409,7 @@ class PlanningLoop:
 
             self._broadcast({
                 "type": "planning_tool_call",
-                "payload": {"tool": tool_name, "thought": thought[:300], "iteration": iteration + 1},
+                "payload": {"tool": tool_name, "thought": thought[:300], "args": args, "iteration": iteration + 1},
             })
 
             tool_output = await self._registry.execute(tool_name, args)
@@ -423,7 +423,7 @@ class PlanningLoop:
 
             self._broadcast({
                 "type": "planning_tool_result",
-                "payload": {"tool": tool_name, "output": tool_output.output[:500], "is_error": tool_output.is_error, "iteration": iteration + 1},
+                "payload": {"tool": tool_name, "output": cap_event_output(tool_output.output), "is_error": tool_output.is_error, "iteration": iteration + 1},
             })
 
             call_id = f"plan-{uuid4().hex[:8]}"

@@ -8,7 +8,7 @@ from typing import Any
 from agentd.chat.classifier import IntentClassifier
 from agentd.chat.models import ChatMessage, IntentType
 from agentd.chat.storage import ChatThreadStore
-from agentd.orchestrator.broadcaster import EventBroadcaster
+from agentd.orchestrator.broadcaster import EventBroadcaster, cap_event_output
 from agentd.planning.registry import PlanningToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -211,9 +211,25 @@ class ChatAgent:
                     "[chat] explore tool_result: %s is_error=%s output_chars=%d",
                     tool_name, tool_output.is_error, len(tool_output.output),
                 )
+                self._broadcaster.broadcast(channel_id, {
+                    "type": "explore_tool_result",
+                    "payload": {
+                        "tool": tool_name,
+                        "output": cap_event_output(tool_output.output),
+                        "is_error": tool_output.is_error,
+                    },
+                })
             except Exception as exc:
                 logger.warning("[chat] explore tool error: %s — %s", tool_name, exc)
                 context.append({"tool": tool_name, "args": args, "result": str(exc), "is_error": True})
+                self._broadcaster.broadcast(channel_id, {
+                    "type": "explore_tool_result",
+                    "payload": {
+                        "tool": tool_name,
+                        "output": cap_event_output(str(exc)),
+                        "is_error": True,
+                    },
+                })
 
             if tool_name in ("read_file", "list_directory"):
                 path = args.get("path", "")

@@ -1296,6 +1296,20 @@ class AgentOrchestrator:
             completed_ops_by_file: dict[str, list[dict[str, object]]] = {}
 
             while (step := self._next_incomplete_step(task)) is not None:
+                plan_steps = task.plan.steps if task.plan else []
+                step_index = next(
+                    (i + 1 for i, s in enumerate(plan_steps) if s.id == step.id),
+                    1,
+                )
+                self.broadcaster.broadcast(task.task_id, {
+                    "type": "step_started",
+                    "payload": {
+                        "step_id": step.id,
+                        "step_title": step.goal[:120],
+                        "step_index": step_index,
+                        "total_steps": len(plan_steps),
+                    },
+                })
                 attempt_offset = step_attempt_offsets.get(step.id, 0)
                 step_result = await self._run_step_with_retries(
                     task,

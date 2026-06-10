@@ -12,6 +12,13 @@ from typing import Any
 _REPLAY_BUFFER_SIZE = 50
 
 
+def cap_event_output(text: str, limit: int = 2000) -> str:
+    """Bound tool output for SSE event payloads (full output still lands in artifacts)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n… truncated"
+
+
 class EventBroadcaster:
     def __init__(self) -> None:
         self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = defaultdict(set)

@@ -20,7 +20,7 @@ from agentd.domain.models import (
     ToolCall,
     ToolResult,
 )
-from agentd.orchestrator.broadcaster import PatchEventBroadcaster
+from agentd.orchestrator.broadcaster import PatchEventBroadcaster, cap_event_output
 from agentd.reasoning.contracts import ReasoningEngine
 from agentd.tools.post_patch import AnalyzerBuilder
 from agentd.tools.registry import ToolRegistry
@@ -1010,7 +1010,7 @@ class ToolLoop:
 
             self._broadcaster.broadcast(self._broadcast_key, {
                 "type": "tool_result",
-                "payload": {"tool": tool_name, "output": tool_output.output[:500], "is_error": tool_output.is_error, "iteration": iteration + 1},
+                "payload": {"tool": tool_name, "output": cap_event_output(tool_output.output), "is_error": tool_output.is_error, "iteration": iteration + 1},
             })
 
             call_id = f"{step.id}-{uuid4().hex[:8]}"
