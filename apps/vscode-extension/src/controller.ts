@@ -75,6 +75,9 @@ export interface ControllerUI {
   clearLiveGate(): void;
   renderLivePlan(plan: LivePlanView): void;
   clearLivePlan(): void;
+  appendToolEvent(event: { id: number; tool: string; args: Record<string, unknown>; thought?: string; source: "explore" | "execution" | "planning" }): void;
+  appendToolResult(id: number, output: string, isError: boolean): void;
+  updateWorkbar(info: { stepIndex?: number; totalSteps?: number; stepTitle?: string; phaseLabel?: string } | null): void;
 }
 
 export interface LiveGateView {
@@ -107,6 +110,14 @@ export class AiEditorController {
   private liveStateTimer: ReturnType<typeof setInterval> | null = null;
   private latestLiveState: ThreadLiveState | null = null;
   private lastLiveSignature: string | null = null;
+  // Structured tool event forwarding state
+  private toolEventSeq = 0;
+  private openToolEvent: Partial<Record<"explore" | "execution" | "planning", number>> = {};
+  private lastStepStarted: { stepId: string; stepTitle: string; stepIndex: number; totalSteps: number } | null = null;
+  private lastPatchError: string | null = null;
+  private runDeviations: string[] = [];
+  private deviationsTaskId: string | null = null;
+  private turnAbort: AbortController | null = null;
 
   constructor(
     private readonly createClient: BackendClientFactory,
@@ -537,9 +548,10 @@ export class AiEditorController {
     });
 
     this.ui.setChatInputEnabled(false);
+    this.turnAbort = new AbortController();
     let currentTaskId: string | undefined;
     try {
-      for await (const event of client.sendChatMessage(threadId, text)) {
+      for await (const event of client.sendChatMessage(threadId, text, this.turnAbort.signal)) {
         if (event.type === "chat_agent_thinking") {
           const message = (event.payload["message"] as string) ?? "Thinking…";
           this.ui.appendChatThinkingEntry(message);
@@ -550,24 +562,13 @@ export class AiEditorController {
           const chunk = (event.payload["chunk"] as string) ?? "";
           if (chunk) this.ui.appendChatThinkingChunk(chunk);
         } else if (event.type === "explore_tool_call") {
-          const tool = (event.payload["tool"] as string) ?? "";
-          const thought = (event.payload["thought"] as string) ?? "";
-          const args = event.payload["args"] as Record<string, unknown> | undefined;
-          const path = args?.["path"] as string | undefined;
-          const label = path ? `${tool} ${path.split("/").pop()}` : tool;
-          this.ui.appendChatThinkingEntry(thought ? `${label} — ${thought}` : label);
+          this.forwardToolCall("explore", event.payload as Record<string, unknown>);
+        } else if (event.type === "explore_tool_result") {
+          this.forwardToolResult("explore", event.payload as Record<string, unknown>);
         } else if (event.type === "tool_call") {
-          const tool = (event.payload["tool"] as string) ?? "";
-          const thought = (event.payload["thought"] as string) ?? "";
-          const args = event.payload["args"] as Record<string, unknown> | undefined;
-          const filePath = args?.["path"] as string | undefined;
-          const fileName = filePath ? filePath.split("/").pop() : undefined;
-          const action = tool === "read_file" ? `read_file ${fileName ?? ""}`
-            : tool === "search_code" ? "search_code"
-            : tool === "run_command" ? `run_command ${(args?.["command"] as string ?? "")}`
-            : tool === "search_semantic" ? "search_semantic"
-            : tool;
-          this.ui.appendChatThinkingEntry(thought ? `${action} — ${thought.substring(0, 120)}` : action);
+          this.forwardToolCall("execution", event.payload as Record<string, unknown>);
+        } else if (event.type === "tool_result") {
+          this.forwardToolResult("execution", event.payload as Record<string, unknown>);
         } else if (event.type === "patch_applied") {
           this.ui.appendChatThinkingEntry("patch applied");
         } else if (event.type === "intent_classified") {
@@ -602,14 +603,10 @@ export class AiEditorController {
           const chunk = (event.payload["chunk"] as string) ?? "";
           if (chunk) this.ui.appendChatThinkingChunk(chunk);
         } else if (event.type === "planning_tool_call") {
-          const tool = (event.payload["tool"] as string) ?? "";
-          const thought = (event.payload["thought"] as string) ?? "";
-          const action = tool === "read_file" ? "read_file"
-            : tool === "list_directory" ? "list_directory"
-            : tool === "search_code" ? "search_code"
-            : tool === "search_semantic" ? "search_semantic"
-            : tool;
-          this.ui.appendChatThinkingEntry(thought ? `planning: ${action} — ${thought}` : `planning: ${action}`);
+          this.forwardToolCall("planning", event.payload as Record<string, unknown>);
+          this.ui.updateWorkbar({ phaseLabel: `Planning: ${(event.payload["tool"] as string) ?? ""}…` });
+        } else if (event.type === "planning_tool_result") {
+          this.forwardToolResult("planning", event.payload as Record<string, unknown>);
         } else if (event.type === "planning_complete") {
           const confidence = (event.payload["confidence"] as string) ?? "";
           this.ui.appendChatThinkingEntry(`plan ready (${confidence} confidence)`);
@@ -658,6 +655,7 @@ export class AiEditorController {
           this.ui.updateThreadTitle(threadId, title);
         } else if (event.type === "env_profile_building") {
           this.ui.appendChatThinkingEntry("Preparing workspace env profile…");
+          this.ui.updateWorkbar({ phaseLabel: "Profiling workspace environment…" });
         } else if (event.type === "env_profile_built") {
           const count = (event.payload["ecosystems_count"] as number) ?? 0;
           const bootstrap = (event.payload["bootstrap_needed"] as boolean) ?? false;
@@ -666,22 +664,35 @@ export class AiEditorController {
               ? "Env profile: workspace has no manifests yet (bootstrap_needed)"
               : `Env profile ready (${count} ecosystem${count === 1 ? "" : "s"})`,
           );
+          this.ui.updateWorkbar(null);
         } else if (event.type === "env_install_running") {
           const cmd = (event.payload["command"] as string) ?? "";
           const scope = (event.payload["scope_key"] as string) ?? "";
           this.ui.appendChatThinkingEntry(`Syncing deps: ${cmd} (${scope})`);
+          this.ui.updateWorkbar({ phaseLabel: `Syncing dependencies: ${cmd}…` });
         } else if (event.type === "env_install_done") {
           const ok = (event.payload["exit_ok"] as boolean) ?? false;
           const scope = (event.payload["scope_key"] as string) ?? "";
           this.ui.appendChatThinkingEntry(
             ok ? `Deps synced for ${scope}` : `Deps sync FAILED for ${scope}`,
           );
+          this.ui.updateWorkbar(null);
         } else if (event.type === "chat_done") {
+          this.ui.updateWorkbar(null);
           this.ui.finalizeAgentMessage();
           break;
         }
       }
+    } catch (error) {
+      // Swallow AbortError — turn was stopped by the user intentionally.
+      if (error instanceof Error && error.name === "AbortError") {
+        // do nothing
+      } else {
+        throw error;
+      }
     } finally {
+      this.ui.updateWorkbar(null);
+      this.turnAbort = null;
       this.ui.hideChatThinking();
       this.ui.finalizeAgentMessage();
       this.ui.setChatInputEnabled(true);
@@ -767,17 +778,28 @@ export class AiEditorController {
           const msg = (event.payload["message"] as string | undefined) ?? (event.payload["status"] as string) ?? "";
           if (msg) this.ui.appendChatThinkingEntry(msg);
         } else if (event.type === "tool_call") {
-          const tool = (event.payload["tool"] as string) ?? "";
-          const thought = (event.payload["thought"] as string) ?? "";
-          const action = tool === "read_file" ? "Reading file"
-            : tool === "search_code" ? "Searching codebase"
-            : tool === "run_command" ? "Running command"
-            : tool === "search_semantic" ? "Semantic search"
-            : tool;
-          this.ui.appendChatThinkingEntry(thought ? `${action} — ${thought.substring(0, 120)}` : `${action}…`);
+          this.forwardToolCall("execution", event.payload as Record<string, unknown>);
+        } else if (event.type === "tool_result") {
+          this.forwardToolResult("execution", event.payload as Record<string, unknown>);
+        } else if (event.type === "planning_tool_call") {
+          this.forwardToolCall("planning", event.payload as Record<string, unknown>);
+          this.ui.updateWorkbar({ phaseLabel: `Planning: ${(event.payload["tool"] as string) ?? ""}…` });
+        } else if (event.type === "planning_tool_result") {
+          this.forwardToolResult("planning", event.payload as Record<string, unknown>);
+        } else if (event.type === "step_started") {
+          const p = event.payload;
+          this.lastStepStarted = { stepId: p.step_id, stepTitle: p.step_title, stepIndex: p.step_index, totalSteps: p.total_steps };
+          this.ui.updateWorkbar({ stepIndex: p.step_index, totalSteps: p.total_steps, stepTitle: p.step_title });
         } else if (event.type === "patch_applied") {
           const files = event.payload.touched_files?.join(", ") ?? "";
           this.ui.appendChatThinkingEntry(`patch applied${files ? ` (${files})` : ""}`);
+        } else if (event.type === "patch_failed") {
+          const err = (event.payload["error"] as string) ?? "";
+          this.lastPatchError = err;
+          this.ui.appendChatThinkingEntry(`✗ patch failed: ${err.slice(0, 200)}`);
+        } else if (event.type === "revision_needed") {
+          this.noteDeviation(taskId, "Delta replan triggered: " + ((event.payload["reason"] as string) ?? ""));
+          this.ui.appendChatThinkingEntry("revision needed — delta replanning…");
         } else if (event.type === "planning_complete") {
           this.ui.appendChatThinkingEntry(`delta replan complete (${event.payload.confidence} confidence)`);
         } else if (event.type === "operation_success") {
@@ -807,6 +829,16 @@ export class AiEditorController {
             timestamp: this.now(),
             metadata: { taskId: event.payload.task_id, breadcrumb: true },
           });
+          // Capture deviation breadcrumbs for run context
+          const breadcrumbText: string = event.payload.text ?? "";
+          if (
+            breadcrumbText.startsWith("✓ Scope extension approved") ||
+            breadcrumbText.startsWith("✓ Command approved") ||
+            breadcrumbText.startsWith("↩ Step changes discarded") ||
+            breadcrumbText.startsWith("✓ Validation accepted")
+          ) {
+            this.noteDeviation(event.payload.task_id ?? taskId, breadcrumbText);
+          }
         } else if (event.type === "plan_card") {
           // Read-only transcript record (e.g. a feedback-regenerated version picked up
           // when execution starts). Display-only; chat.js dedups by task+content.
@@ -826,9 +858,34 @@ export class AiEditorController {
           void this.pollThreadLiveState();
         } else if (event.type === "command_approval_requested") {
           void this.pollThreadLiveState();
+        } else if (event.type === "env_profile_building") {
+          this.ui.appendChatThinkingEntry("Preparing workspace env profile…");
+          this.ui.updateWorkbar({ phaseLabel: "Profiling workspace environment…" });
+        } else if (event.type === "env_profile_built") {
+          const count = (event.payload["ecosystems_count"] as number) ?? 0;
+          const bootstrap = (event.payload["bootstrap_needed"] as boolean) ?? false;
+          this.ui.appendChatThinkingEntry(
+            bootstrap
+              ? "Env profile: workspace has no manifests yet (bootstrap_needed)"
+              : `Env profile ready (${count} ecosystem${count === 1 ? "" : "s"})`,
+          );
+          this.ui.updateWorkbar(null);
+        } else if (event.type === "env_install_running") {
+          const cmd = (event.payload["command"] as string) ?? "";
+          const scope = (event.payload["scope_key"] as string) ?? "";
+          this.ui.appendChatThinkingEntry(`Syncing deps: ${cmd} (${scope})`);
+          this.ui.updateWorkbar({ phaseLabel: `Syncing dependencies: ${cmd}…` });
+        } else if (event.type === "env_install_done") {
+          const ok = (event.payload["exit_ok"] as boolean) ?? false;
+          const scope = (event.payload["scope_key"] as string) ?? "";
+          this.ui.appendChatThinkingEntry(
+            ok ? `Deps synced for ${scope}` : `Deps sync FAILED for ${scope}`,
+          );
+          this.ui.updateWorkbar(null);
         } else if (event.type === "done") {
           const status = (event.payload["status"] as string | undefined) ?? "";
           this.ui.hideChatThinking();
+          this.ui.updateWorkbar(null);
           if (status === "READY_FOR_REVIEW") {
             this.ui.appendChatMessage({
               role: "agent",
@@ -852,6 +909,7 @@ export class AiEditorController {
     } catch (error) {
       this.ui.showError(`Stream error: ${formatError(error)}`);
     } finally {
+      this.ui.updateWorkbar(null);
       this.ui.hideChatThinking();
       this.ui.setChatInputEnabled(true);
     }
@@ -902,6 +960,35 @@ export class AiEditorController {
     this.stopPolling();
     this.stopStream();
     this.stopLiveStatePolling();
+  }
+
+  stopActiveTurn(): void {
+    this.turnAbort?.abort();
+  }
+
+  private forwardToolCall(source: "explore" | "execution" | "planning", payload: Record<string, unknown>): void {
+    const id = ++this.toolEventSeq;
+    this.openToolEvent[source] = id;
+    const thought = (payload["thought"] as string) || undefined;
+    this.ui.appendToolEvent({
+      id,
+      tool: (payload["tool"] as string) ?? "",
+      args: (payload["args"] as Record<string, unknown>) ?? {},
+      ...(thought !== undefined ? { thought } : {}),
+      source,
+    });
+  }
+
+  private forwardToolResult(source: "explore" | "execution" | "planning", payload: Record<string, unknown>): void {
+    const id = this.openToolEvent[source];
+    if (id === undefined) return; // result without a call (replay edge) — drop
+    delete this.openToolEvent[source];
+    this.ui.appendToolResult(id, (payload["output"] as string) ?? "", payload["is_error"] === true);
+  }
+
+  private noteDeviation(taskId: string, text: string): void {
+    if (this.deviationsTaskId !== taskId) { this.deviationsTaskId = taskId; this.runDeviations = []; }
+    this.runDeviations.push(text);
   }
 
   private startStream(taskId: string): void {

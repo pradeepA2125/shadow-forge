@@ -162,7 +162,7 @@ function createStubBackend(state: StubBackendState): BackendTaskClient {
       state.liveCalls?.push(threadId);
       return state.liveResponse ?? NULL_LIVE_STATE;
     },
-    sendChatMessage: async function* (_threadId: string, _message: string) {
+    sendChatMessage: async function* (_threadId: string, _message: string, _signal?: AbortSignal) {
       yield { type: "chat_done" as const, payload: {} as Record<string, never> };
     },
     applyInlineChange: async (_inlineTaskId: string) => {},
@@ -203,6 +203,9 @@ function createUi(overrides?: Partial<ControllerUI>): ControllerUI {
     clearLiveGate: () => {},
     renderLivePlan: () => {},
     clearLivePlan: () => {},
+    appendToolEvent: () => {},
+    appendToolResult: () => {},
+    updateWorkbar: () => {},
     ...overrides,
   };
 }
@@ -404,7 +407,7 @@ describe("AiEditorController — chat", () => {
         messages: [],
         touchedFiles: [],
       }),
-      sendChatMessage: async function* (_threadId: string, _message: string) {
+      sendChatMessage: async function* (_threadId: string, _message: string, _signal?: AbortSignal) {
         yield { type: "chat_agent_thinking" as const, payload: { message: "Exploring…" } };
         yield { type: "intent_classified" as const, payload: { intent: "qa", rationale: "", likely_targets: [] } };
         yield { type: "chat_response" as const, payload: { chunk: "The answer is 42." } };
@@ -433,8 +436,9 @@ describe("AiEditorController — chat", () => {
     expect(chunks).toContain("The answer is 42.");
   });
 
-  test("thinking entries: chat_agent_thinking and explore_tool_call append entries, finally hides indicator", async () => {
+  test("thinking entries: chat_agent_thinking appends entry; explore_tool_call forwards structured tool event, finally hides indicator", async () => {
     const thinkingEntries: string[] = [];
+    const toolEvents: Array<{ id: number; tool: string; source: string }> = [];
     let hideCalled = false;
 
     const chatBackend: BackendTaskClient = {
@@ -453,7 +457,7 @@ describe("AiEditorController — chat", () => {
         threadId, workspacePath: "/tmp/workspace",
         title: "New Chat", messages: [], touchedFiles: [],
       }),
-      sendChatMessage: async function* (_threadId: string, _message: string) {
+      sendChatMessage: async function* (_threadId: string, _message: string, _signal?: AbortSignal) {
         yield { type: "chat_agent_thinking" as const, payload: { message: "Exploring workspace…" } };
         yield { type: "explore_tool_call" as const, payload: { tool: "search_code", args: { pattern: "auth" }, thought: "Looking for auth handling code" } };
         yield { type: "intent_classified" as const, payload: { intent: "qa", rationale: "", likely_targets: [] } };
@@ -469,6 +473,7 @@ describe("AiEditorController — chat", () => {
       createSettings(),
       createUi({
         appendChatThinkingEntry: (t) => thinkingEntries.push(t),
+        appendToolEvent: (e) => toolEvents.push({ id: e.id, tool: e.tool, source: e.source }),
         hideChatThinking: () => { hideCalled = true; },
       }),
       { openDiff: async (_entry: ReviewFileEntry) => {} },
@@ -478,8 +483,12 @@ describe("AiEditorController — chat", () => {
     await controller.sendChatMessage("What does auth do?");
     controller.dispose();
 
+    // chat_agent_thinking still appends a thinking entry
     expect(thinkingEntries[0]).toBe("Exploring workspace…");
-    expect(thinkingEntries[1]).toBe("search_code — Looking for auth handling code");
+    // explore_tool_call is now forwarded as a structured tool event, not a thinking entry
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0].tool).toBe("search_code");
+    expect(toolEvents[0].source).toBe("explore");
     expect(hideCalled).toBe(true);
   });
 });

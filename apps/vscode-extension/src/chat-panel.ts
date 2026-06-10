@@ -190,6 +190,18 @@ export class ChatPanel {
     this.panel?.webview.postMessage({ type: "clearLivePlan" });
   }
 
+  appendToolEvent(event: { id: number; tool: string; args: Record<string, unknown>; thought?: string; source: "explore" | "execution" | "planning" }): void {
+    this.panel?.webview.postMessage({ type: "appendToolEvent", event });
+  }
+
+  appendToolResult(id: number, output: string, isError: boolean): void {
+    this.panel?.webview.postMessage({ type: "appendToolResult", id, output, isError });
+  }
+
+  updateWorkbar(info: { stepIndex?: number; totalSteps?: number; stepTitle?: string; phaseLabel?: string } | null): void {
+    this.panel?.webview.postMessage({ type: "updateWorkbar", info });
+  }
+
   private buildHtml(): string {
     const scriptUri = this.panel!.webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "media", "chat.js")

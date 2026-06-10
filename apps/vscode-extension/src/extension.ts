@@ -178,6 +178,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     clearLivePlan: () => {
       chatPanel.clearLivePlan();
     },
+    appendToolEvent: (event) => {
+      chatPanel.appendToolEvent(event);
+    },
+    appendToolResult: (id, output, isError) => {
+      chatPanel.appendToolResult(id, output, isError);
+    },
+    updateWorkbar: (info) => {
+      chatPanel.updateWorkbar(info);
+    },
   };
 
   const clientFactory: BackendClientFactory = (baseUrl) => new HttpBackendClient({ baseUrl });
