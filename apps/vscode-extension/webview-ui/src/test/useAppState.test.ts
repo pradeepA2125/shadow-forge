@@ -96,6 +96,9 @@ describe("useAppState", () => {
     expect(msgs[0].role).toBe("agent");
     expect(msgs[0].content).toBe("Done");
     expect(msgs[0].type).toBe("text");
+    // The sealed message must carry the caller-supplied timestamp (non-empty ISO string).
+    expect(typeof (msgs[0] as { timestamp: string }).timestamp).toBe("string");
+    expect((msgs[0] as { timestamp: string }).timestamp).not.toBe("");
   });
 
   // 5. resolveInlineChangeCard patches metadata.resolved

@@ -1,4 +1,4 @@
-import { useReducer, useEffect } from "react";
+import { useReducer, useEffect, useCallback } from "react";
 import type { AppState, ExtensionMessage, ChatMsg, StreamingBubble } from "../types";
 import { vscode } from "../vscodeApi";
 
@@ -38,7 +38,7 @@ const INITIAL: AppState = {
 // ── Action types ─────────────────────────────────────────────────────────────
 
 type Action =
-  | { type: "EXT"; msg: ExtensionMessage }
+  | { type: "EXT"; msg: ExtensionMessage; at: string }
   | { type: "SET_VIEW"; view: "history" | "thread" };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ function ensureStreaming(state: AppState): StreamingBubble {
  * append it to messages. If the bubble is completely empty (no text, no
  * thinking entries, no tool events), just clear it without appending.
  */
-function sealStreaming(state: AppState): AppState {
+function sealStreaming(state: AppState, at: string): AppState {
   if (!state.streaming) return state;
 
   const bubble = state.streaming;
@@ -82,7 +82,7 @@ function sealStreaming(state: AppState): AppState {
     role: "agent",
     content: bubble.text,
     type: "text",
-    timestamp: new Date().toISOString(),
+    timestamp: at,
     metadata,
   };
 
@@ -102,7 +102,7 @@ function reducer(state: AppState, action: Action): AppState {
   }
 
   // EXT actions — switch on the extension message type
-  const { msg } = action;
+  const { msg, at } = action;
 
   switch (msg.type) {
     case "renderThreadList":
@@ -131,6 +131,7 @@ function reducer(state: AppState, action: Action): AppState {
       const prev = ensureStreaming(state);
       // If this is the first text and there is an open activeThinkingChunk,
       // seal it into thinkingEntries before appending text.
+      // Protocol assumption: thinking chunks always precede response text within a turn; a thinking chunk arriving AFTER text would only be sealed at finalize.
       const updatedEntries =
         prev.text === "" && prev.activeThinkingChunk
           ? [...prev.thinkingEntries, prev.activeThinkingChunk]
@@ -202,22 +203,23 @@ function reducer(state: AppState, action: Action): AppState {
     }
 
     case "finalizeAgentMessage":
-      return sealStreaming(state);
+      return sealStreaming(state, at);
 
     case "appendMessage": {
-      const next = sealStreaming(state);
+      // Any persisted message arriving mid-stream implicitly terminates the open bubble — protocol guarantee: the extension finalizes or appends in order, so sealing here is safe for ALL card types.
+      const next = sealStreaming(state, at);
       const m = msg.message;
 
       if (m.type === "plan_card") {
         const taskId = (m.metadata?.taskId as string) ?? m.taskId ?? "";
         const s = planSig(taskId, m.content);
         // Dedup: if the exact same plan version is already in the transcript, skip.
-        if (next.messages.some((existing) => (existing as ChatMsg & { _sig?: string })._sig === s)) {
+        if (next.messages.some((existing) => existing._sig === s)) {
           return next;
         }
         return {
           ...next,
-          messages: [...next.messages, { ...m, _sig: s } as ChatMsg],
+          messages: [...next.messages, { ...m, _sig: s }],
         };
       }
 
@@ -298,13 +300,16 @@ export function useAppState() {
 
   useEffect(() => {
     const handler = (event: MessageEvent<ExtensionMessage>) =>
-      dispatch({ type: "EXT", msg: event.data });
+      dispatch({ type: "EXT", msg: event.data, at: new Date().toISOString() });
     window.addEventListener("message", handler);
     vscode.postMessage({ type: "webviewReady" });
     return () => window.removeEventListener("message", handler);
   }, []);
 
-  const setView = (view: "history" | "thread") => dispatch({ type: "SET_VIEW", view });
+  const setView = useCallback(
+    (view: "history" | "thread") => dispatch({ type: "SET_VIEW", view }),
+    [],
+  );
 
   return { state, setView };
 }

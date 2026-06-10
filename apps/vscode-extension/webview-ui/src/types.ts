@@ -8,6 +8,8 @@ export interface ChatMsg {
   taskId?: string | null;
   timestamp: string;
   metadata: Record<string, unknown>;
+  /** Internal client-side annotation (NOT on the wire): plan-card version signature used for dedup. */
+  _sig?: string;
 }
 
 // Diff entries arrive snake_case (SSE + /live payloads are not case-mapped).
