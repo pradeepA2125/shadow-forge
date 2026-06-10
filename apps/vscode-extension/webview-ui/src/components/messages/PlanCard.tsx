@@ -32,6 +32,7 @@ export function PlanCard({ content, taskId, readOnly = false, version }: Props) 
   const showVersionBadge = typeof version === "number" && version > 1;
 
   function handleImplement() {
+    if (mode !== "idle") return; // one-shot guard (UX Rule 2): a rapid double-click sees stale state
     setMode("implementing");
     vscode.postMessage({ type: "implementPlan", taskId });
   }
@@ -48,6 +49,7 @@ export function PlanCard({ content, taskId, readOnly = false, version }: Props) 
   }
 
   function handleSendFeedback() {
+    if (mode !== "feedback") return; // one-shot guard (UX Rule 2)
     const trimmed = feedbackText.trim();
     if (!trimmed) return;
     vscode.postMessage({ type: "planFeedback", taskId, feedback: trimmed });
@@ -139,6 +141,7 @@ export function PlanCard({ content, taskId, readOnly = false, version }: Props) 
         {/* Fade overlay — hidden when expanded */}
         {!expanded && (
           <div
+            data-testid="plan-fade"
             className="absolute bottom-0 left-0 right-0 h-[52px] pointer-events-none"
             style={{
               background: "linear-gradient(transparent, var(--color-surface))",

@@ -24,9 +24,10 @@ function fileDotStyle(path: string): React.CSSProperties {
 
 /** Split a path into basename + directory components for display. */
 function splitPath(path: string): { base: string; dir: string } {
-  const slash = path.lastIndexOf("/");
-  if (slash === -1) return { base: path, dir: "" };
-  return { base: path.slice(slash + 1), dir: path.slice(0, slash) };
+  const clean = path.endsWith("/") ? path.slice(0, -1) : path;
+  const slash = clean.lastIndexOf("/");
+  if (slash === -1) return { base: clean, dir: "" };
+  return { base: clean.slice(slash + 1), dir: clean.slice(0, slash) };
 }
 
 /**
@@ -46,11 +47,13 @@ export function DiffCard({ taskId, diffEntries, resolved, thinkingLog }: Props) 
   const fileCount = diffEntries.length;
 
   function handleAccept() {
+    if (effectiveResolved !== null) return; // one-shot guard (UX Rule 2)
     setLocalResolved("applied");
     vscode.postMessage({ type: "applyInlineChange", taskId });
   }
 
   function handleReject() {
+    if (effectiveResolved !== null) return; // one-shot guard (UX Rule 2)
     setLocalResolved("discarded");
     vscode.postMessage({ type: "discardInlineChange", taskId });
   }

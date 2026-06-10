@@ -188,4 +188,16 @@ describe("PlanCard — version badge", () => {
     render(<PlanCard content={PLAN_CONTENT} taskId="t1" />);
     expect(screen.queryByText(/^v\d/)).toBeNull();
   });
+
+  it("expanding removes the fade overlay", () => {
+    const { container } = render(<PlanCard content={"## Step 1\nbody"} taskId="t1" />);
+    expect(container.querySelector('[data-testid="plan-fade"]')).not.toBeNull();
+    fireEvent.click(screen.getByText("Plan"));
+    expect(container.querySelector('[data-testid="plan-fade"]')).toBeNull();
+  });
+
+  it("renders no step-count subtitle when the heuristic finds nothing", () => {
+    render(<PlanCard content={"just prose, no step markers"} taskId="t1" />);
+    expect(screen.queryByText(/steps/)).toBeNull();
+  });
 });
