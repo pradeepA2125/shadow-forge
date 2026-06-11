@@ -205,6 +205,11 @@ function createUi(overrides?: Partial<ControllerUI>): ControllerUI {
     appendToolEvent: () => {},
     appendToolResult: () => {},
     updateWorkbar: () => {},
+    renderLiveReview: () => {},
+    clearLiveReview: () => {},
+    renderLiveError: () => {},
+    clearLiveError: () => {},
+    sendLiveStatus: () => {},
     ...overrides,
   };
 }
@@ -799,5 +804,187 @@ describe("AiEditorController — command-decision", () => {
     expect(planRenders.length).toBeGreaterThanOrEqual(1);
     expect(planRenders[planRenders.length - 1].taskId).toBe("task-9");
     expect(planRenders[planRenders.length - 1].planMarkdown).toContain("# Plan");
+  });
+
+  test("live review derivation: READY_FOR_REVIEW renders review card with stepsTotal and sendLiveStatus", async () => {
+    let reviewRendered: Parameters<ControllerUI["renderLiveReview"]>[0] | null = null;
+    const liveStatuses: Array<string | null> = [];
+
+    const reviewBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [], rejectCalls: [],
+        getResultCalls: [], planFeedbackCalls: [], liveCalls: [],
+      }),
+      getThreadLiveState: async () => ({
+        activeTaskId: "t9",
+        status: "READY_FOR_REVIEW",
+        pendingGate: null,
+        plan: null,
+      }),
+      getTaskResult: async (_taskId) => ({
+        taskId: "t9",
+        status: "READY_FOR_REVIEW",
+        modifiedFiles: ["a.py"],
+        diagnostics: [],
+        shadowWorkspacePath: "/shadow",
+        plan: { analysis: "a", steps: [{}, {}], expected_files: [], stop_conditions: [] },
+        patch: { patch_ops: [] },
+      } as TaskResult),
+    };
+
+    const ui = createUi({
+      renderLiveReview: (review) => { reviewRendered = review; },
+      sendLiveStatus: (status) => { liveStatuses.push(status); },
+    });
+
+    const controller = new AiEditorController(
+      () => reviewBackend, new MemorySessionStore(), createSettings(), ui,
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller.switchChatThread("chat-rev");
+    await controller.pollThreadLiveState();
+    controller.dispose();
+
+    expect(reviewRendered).not.toBeNull();
+    expect(reviewRendered!.taskId).toBe("t9");
+    expect(reviewRendered!.modifiedFiles).toEqual(["a.py"]);
+    expect(reviewRendered!.stepsTotal).toBe(2);
+    expect(liveStatuses).toContain("READY_FOR_REVIEW");
+  });
+
+  test("live error derivation: FAILED status renders error card; non-FAILED clears it", async () => {
+    let errorRendered: Parameters<ControllerUI["renderLiveError"]>[0] | null = null;
+    let errorClears = 0;
+
+    const failedBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [], rejectCalls: [],
+        getResultCalls: [], planFeedbackCalls: [], liveCalls: [],
+      }),
+      getThreadLiveState: async () => ({
+        activeTaskId: "task-fail",
+        status: "FAILED",
+        pendingGate: null,
+        plan: null,
+      }),
+    };
+
+    const ui = createUi({
+      renderLiveError: (error) => { errorRendered = error; },
+      clearLiveError: () => { errorClears += 1; },
+    });
+
+    const controller = new AiEditorController(
+      () => failedBackend, new MemorySessionStore(), createSettings(), ui,
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller.switchChatThread("chat-fail");
+    await controller.pollThreadLiveState();
+    controller.dispose();
+
+    expect(errorRendered).not.toBeNull();
+    expect(errorRendered!.taskId).toBe("task-fail");
+    expect(errorRendered!.status).toBe("FAILED");
+    // non-FAILED status clears the error
+    expect(errorClears).toBe(0); // first poll was FAILED so no clear
+
+    // Second controller with non-FAILED status: clearLiveError should fire
+    let errorClears2 = 0;
+    const okBackend: BackendTaskClient = {
+      ...failedBackend,
+      getThreadLiveState: async () => ({ activeTaskId: null, status: null, pendingGate: null, plan: null }),
+    };
+    const controller2 = new AiEditorController(
+      () => okBackend, new MemorySessionStore(), createSettings(),
+      createUi({ clearLiveError: () => { errorClears2 += 1; } }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller2.switchChatThread("chat-ok");
+    await controller2.pollThreadLiveState();
+    controller2.dispose();
+    expect(errorClears2).toBeGreaterThanOrEqual(1);
+  });
+
+  test("acceptTaskPatch: calls client.acceptPatch with taskId; 409 is swallowed silently", async () => {
+    const accepted: string[] = [];
+    const infos: string[] = [];
+
+    const happyBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [], rejectCalls: [],
+        getResultCalls: [], planFeedbackCalls: [],
+      }),
+      acceptPatch: async (taskId) => {
+        accepted.push(taskId);
+        return {
+          taskId, status: "SUCCEEDED", modifiedFiles: [], diagnostics: [], shadowWorkspacePath: null,
+        } as TaskResult;
+      },
+    };
+
+    const controller = new AiEditorController(
+      () => happyBackend, new MemorySessionStore(), createSettings(),
+      createUi({ showInfo: (m) => { infos.push(m); } }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller.acceptTaskPatch("task-accept");
+    expect(accepted).toEqual(["task-accept"]);
+    expect(infos.some((m) => m.includes("workspace"))).toBe(true);
+
+    // 409 is benign and swallowed silently
+    const errors: string[] = [];
+    const conflictBackend: BackendTaskClient = {
+      ...happyBackend,
+      acceptPatch: async () => { throw Object.assign(new Error("conflict"), { status: 409 }); },
+    };
+    const controller2 = new AiEditorController(
+      () => conflictBackend, new MemorySessionStore(), createSettings(),
+      createUi({ showError: (m) => { errors.push(m); } }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller2.acceptTaskPatch("task-409");
+    expect(errors).toHaveLength(0); // swallowed
+    controller.dispose();
+    controller2.dispose();
+  });
+
+  test("getTaskResult failure resets signature so next poll retries", async () => {
+    let resultCallCount = 0;
+
+    const retryBackend: BackendTaskClient = {
+      ...createStubBackend({
+        submitPayloads: [], getTaskCalls: [], acceptCalls: [], rejectCalls: [],
+        getResultCalls: [], planFeedbackCalls: [], liveCalls: [],
+      }),
+      getThreadLiveState: async () => ({
+        activeTaskId: "task-retry",
+        status: "READY_FOR_REVIEW",
+        pendingGate: null,
+        plan: null,
+      }),
+      getTaskResult: async () => {
+        resultCallCount += 1;
+        throw new Error("not ready");
+      },
+    };
+
+    const controller = new AiEditorController(
+      () => retryBackend, new MemorySessionStore(), createSettings(), createUi(),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-06-11T00:00:00.000Z"
+    );
+    await controller.switchChatThread("chat-retry");
+    // First poll: getTaskResult throws → signature reset
+    await controller.pollThreadLiveState();
+    // Second poll: signature was reset so getTaskResult is called again
+    await controller.pollThreadLiveState();
+    controller.dispose();
+
+    expect(resultCallCount).toBeGreaterThanOrEqual(2);
   });
 });

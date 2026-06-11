@@ -78,6 +78,11 @@ export interface ControllerUI {
   appendToolEvent(event: { id: number; tool: string; args: Record<string, unknown>; thought?: string; source: "explore" | "execution" | "planning" }): void;
   appendToolResult(id: number, output: string, isError: boolean): void;
   updateWorkbar(info: { stepIndex?: number; totalSteps?: number; stepTitle?: string; phaseLabel?: string } | null): void;
+  renderLiveReview(review: { taskId: string; modifiedFiles: string[]; shadowWorkspacePath: string | null; stepsCompleted: number | null; stepsTotal: number | null; deviations: string[] }): void;
+  clearLiveReview(): void;
+  renderLiveError(error: { taskId: string; status: "FAILED" | "ABORTED"; detail?: string }): void;
+  clearLiveError(): void;
+  sendLiveStatus(status: string | null): void;
 }
 
 export interface LiveGateView {
@@ -118,6 +123,8 @@ export class AiEditorController {
   private runDeviations: string[] = [];
   private deviationsTaskId: string | null = null;
   private turnAbort: AbortController | null = null;
+  private seenStepIds = new Set<string>();
+  private latestLiveReview: { taskId: string; shadowWorkspacePath: string | null } | null = null;
 
   constructor(
     private readonly createClient: BackendClientFactory,
@@ -391,6 +398,11 @@ export class AiEditorController {
 
   async openInlineDiff(relativePath: string, shadowPath: string): Promise<void> {
     const workspacePath = this.ui.getWorkspacePath();
+    // ReviewCard may post shadowPath "" — fall back to the latest live review's shadow path.
+    if (!shadowPath && this.latestLiveReview?.shadowWorkspacePath) {
+      const path = await import("node:path");
+      shadowPath = path.join(this.latestLiveReview.shadowWorkspacePath, relativePath);
+    }
     if (!workspacePath || !shadowPath) {
       this.ui.showWarning("Diff is unavailable — shadow path missing.");
       return;
@@ -772,6 +784,12 @@ export class AiEditorController {
         } else if (event.type === "step_started") {
           const p = event.payload;
           this.lastStepStarted = { stepId: p.step_id, stepTitle: p.step_title, stepIndex: p.step_index, totalSteps: p.total_steps };
+          // Reset seenStepIds when a different task's stream begins (reuses deviationsTaskId
+          // as the cross-stream task identity anchor — see noteDeviation).
+          if (this.deviationsTaskId !== taskId) {
+            this.seenStepIds.clear();
+          }
+          this.seenStepIds.add(p.step_id);
           this.ui.updateWorkbar({ stepIndex: p.step_index, totalSteps: p.total_steps, stepTitle: p.step_title });
         } else if (event.type === "patch_applied") {
           const files = event.payload.touched_files?.join(", ") ?? "";
@@ -923,6 +941,38 @@ export class AiEditorController {
       this.ui.resolveInlineChangeCard(inlineTaskId, "discarded");
     } catch (error) {
       this.ui.showError(`Failed to discard inline change: ${formatError(error)}`);
+    }
+  }
+
+  async acceptTaskPatch(taskId: string): Promise<void> {
+    try {
+      await this.clientForChat().acceptPatch(taskId);
+      this.ui.showInfo("Task finished — changes are in your workspace.");
+    } catch (error) {
+      if (this.isBenignConflict(error)) return;
+      this.ui.showError(`Failed to finish task: ${formatError(error)}`);
+    }
+  }
+
+  async rejectTaskPatch(taskId: string, reason: string): Promise<void> {
+    try {
+      await this.clientForChat().rejectPatch(taskId, reason.trim() || "closed from chat");
+      this.ui.showInfo("Task closed — applied changes were kept.");
+    } catch (error) {
+      if (this.isBenignConflict(error)) return;
+      this.ui.showError(`Failed to close task: ${formatError(error)}`);
+    }
+  }
+
+  async resumeTaskById(taskId: string, stage: "plan" | "execute"): Promise<void> {
+    try {
+      const response = await this.clientForChat().resumeTask(taskId, { stage });
+      this.ui.showInfo(`Resumed as ${response.taskId}`);
+      // Force the next poll to re-render against the child task (signature reset).
+      this.lastLiveSignature = null;
+      void this.pollThreadLiveState();
+    } catch (error) {
+      this.ui.showError(`Failed to resume: ${formatError(error)}`);
     }
   }
 
@@ -1307,6 +1357,7 @@ export class AiEditorController {
 
     const signature = JSON.stringify({
       taskId: live.activeTaskId,
+      status: live.status,
       gate: live.pendingGate,
       plan: live.plan,
     });
@@ -1333,6 +1384,47 @@ export class AiEditorController {
     } else {
       this.ui.clearLivePlan();
     }
+
+    if (live.status === "READY_FOR_REVIEW" && live.activeTaskId) {
+      try {
+        const result = await this.clientForChat().getTaskResult(live.activeTaskId);
+        const review = {
+          taskId: live.activeTaskId,
+          modifiedFiles: result.modifiedFiles,
+          shadowWorkspacePath: result.shadowWorkspacePath ?? null,
+          stepsCompleted: this.seenStepIds.size > 0 ? this.seenStepIds.size : null,
+          stepsTotal: result.plan && Array.isArray((result.plan as { steps?: unknown[] }).steps)
+            ? ((result.plan as { steps: unknown[] }).steps.length)
+            : null,
+          deviations: this.deviationsTaskId === live.activeTaskId ? [...this.runDeviations] : [],
+        };
+        this.latestLiveReview = { taskId: review.taskId, shadowWorkspacePath: review.shadowWorkspacePath };
+        this.ui.renderLiveReview(review);
+      } catch {
+        // result not ready yet — reset signature so the next poll retries instead of deduping
+        this.lastLiveSignature = null;
+      }
+    } else {
+      this.latestLiveReview = null;
+      this.ui.clearLiveReview();
+    }
+
+    if ((live.status === "FAILED" || live.status === "ABORTED") && live.activeTaskId) {
+      const detailParts: string[] = [];
+      if (this.lastStepStarted) {
+        detailParts.push(`${this.lastStepStarted.stepTitle} (step ${this.lastStepStarted.stepIndex} of ${this.lastStepStarted.totalSteps})`);
+      }
+      if (this.lastPatchError) detailParts.push(this.lastPatchError);
+      this.ui.renderLiveError({
+        taskId: live.activeTaskId,
+        status: live.status,
+        ...(detailParts.length ? { detail: detailParts.join(" — ") } : {}),
+      });
+    } else {
+      this.ui.clearLiveError();
+    }
+
+    this.ui.sendLiveStatus(live.status ?? null);
   }
 
   private clientForSession(): BackendTaskClient {

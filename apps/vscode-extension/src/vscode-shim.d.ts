@@ -39,8 +39,15 @@ declare module "vscode" {
     function joinPath(base: Uri, ...pathSegments: string[]): Uri;
   }
 
+  export interface WebviewOptions {
+    enableScripts?: boolean;
+    retainContextWhenHidden?: boolean;
+    localResourceRoots?: readonly Uri[];
+  }
+
   export interface Webview {
     html: string;
+    options: WebviewOptions;
     readonly cspSource: string;
     onDidReceiveMessage(listener: (e: unknown) => unknown): Disposable;
     postMessage(message: unknown): Thenable<boolean>;

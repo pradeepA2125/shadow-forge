@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as vscode from "vscode";
 import type { ChatMessage, ChatThreadSummary, CommandDecision } from "@ai-editor/editor-client";
 import type { LiveGateView, LivePlanView } from "./controller.js";
@@ -16,6 +17,10 @@ export type ScopeDecisionHandler = (taskId: string, files: string[], decision: "
 export type ValidationDecisionHandler = (taskId: string, decision: "accept" | "reject") => Promise<void>;
 export type CommandDecisionHandler = (taskId: string, decision: CommandDecision) => Promise<void>;
 export type StepDecisionHandler = (taskId: string, decision: "accept" | "discard") => Promise<void>;
+export type AcceptTaskHandler = (taskId: string) => Promise<void>;
+export type RejectTaskHandler = (taskId: string, reason: string) => Promise<void>;
+export type ResumeTaskHandler = (taskId: string, stage: "plan" | "execute") => Promise<void>;
+export type StopTurnHandler = () => void;
 
 export class ChatPanel {
   private panel: vscode.WebviewPanel | null = null;
@@ -33,12 +38,25 @@ export class ChatPanel {
     private readonly onValidationDecision: ValidationDecisionHandler,
     private readonly onCommandDecision: CommandDecisionHandler,
     private readonly onStepDecision: StepDecisionHandler,
+    private readonly onAcceptTask: AcceptTaskHandler,
+    private readonly onRejectTask: RejectTaskHandler,
+    private readonly onResumeTask: ResumeTaskHandler,
+    private readonly onStopTurn: StopTurnHandler,
     private readonly onReady: () => Promise<void> = async () => {}
   ) {}
 
   /** Called by the webview serializer when VS Code restores a persisted panel. */
   reattach(restoredPanel: vscode.WebviewPanel): void {
     this.panel = restoredPanel;
+    // Restored panels keep serialized options — reset before building html so
+    // the CSP and localResourceRoots are correct for the new build path.
+    this.panel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [
+        vscode.Uri.joinPath(this.extensionUri, "media"),
+        vscode.Uri.joinPath(this.extensionUri, "webview-ui", "dist"),
+      ],
+    };
     this.panel.webview.html = this.buildHtml();
     this.registerHandlers();
   }
@@ -54,7 +72,10 @@ export class ChatPanel {
       vscode.ViewColumn.Two,
       {
         enableScripts: true,
-        localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
+        localResourceRoots: [
+          vscode.Uri.joinPath(this.extensionUri, "media"),
+          vscode.Uri.joinPath(this.extensionUri, "webview-ui", "dist"),
+        ],
       }
     );
     this.panel.webview.html = this.buildHtml();
@@ -103,6 +124,16 @@ export class ChatPanel {
       } else if (m["type"] === "stepDecision") {
         const decision = m["decision"] === "accept" ? "accept" : "discard";
         p = this.onStepDecision(m["taskId"] as string, decision);
+      } else if (m["type"] === "acceptTask") {
+        p = this.onAcceptTask(m["taskId"] as string);
+      } else if (m["type"] === "rejectTask") {
+        p = this.onRejectTask(m["taskId"] as string, (m["reason"] as string) ?? "");
+      } else if (m["type"] === "resumeTask") {
+        const stage = m["stage"] === "plan" ? "plan" : "execute";
+        p = this.onResumeTask(m["taskId"] as string, stage);
+      } else if (m["type"] === "stopTurn") {
+        this.onStopTurn();
+        return;
       } else {
         return;
       }
@@ -190,6 +221,26 @@ export class ChatPanel {
     this.panel?.webview.postMessage({ type: "clearLivePlan" });
   }
 
+  renderLiveReview(review: { taskId: string; modifiedFiles: string[]; shadowWorkspacePath: string | null; stepsCompleted: number | null; stepsTotal: number | null; deviations: string[] }): void {
+    this.panel?.webview.postMessage({ type: "renderLiveReview", review });
+  }
+
+  clearLiveReview(): void {
+    this.panel?.webview.postMessage({ type: "clearLiveReview" });
+  }
+
+  renderLiveError(error: { taskId: string; status: "FAILED" | "ABORTED"; detail?: string }): void {
+    this.panel?.webview.postMessage({ type: "renderLiveError", error });
+  }
+
+  clearLiveError(): void {
+    this.panel?.webview.postMessage({ type: "clearLiveError" });
+  }
+
+  sendLiveStatus(status: string | null): void {
+    this.panel?.webview.postMessage({ type: "liveStatus", status });
+  }
+
   appendToolEvent(event: { id: number; tool: string; args: Record<string, unknown>; thought?: string; source: "explore" | "execution" | "planning" }): void {
     this.panel?.webview.postMessage({ type: "appendToolEvent", event });
   }
@@ -203,124 +254,24 @@ export class ChatPanel {
   }
 
   private buildHtml(): string {
-    const scriptUri = this.panel!.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "chat.js")
-    );
-    const markedUri = this.panel!.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "marked.umd.js")
-    );
+    const distPath = vscode.Uri.joinPath(this.extensionUri, "webview-ui", "dist");
+    let html = fs.readFileSync(vscode.Uri.joinPath(distPath, "index.html").fsPath, "utf8");
+
     const nonce = Array.from({ length: 16 }, () =>
       Math.floor(Math.random() * 256).toString(16).padStart(2, "0")
     ).join("");
     const cspSource = this.panel!.webview.cspSource;
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}' ${cspSource};">
-<style>
-  body { font-family: var(--vscode-font-family); margin: 0; display: flex;
-         flex-direction: column; height: 100vh; background: var(--vscode-editor-background); }
-  #thread-list { border-bottom: 1px solid var(--vscode-panel-border); padding: 6px;
-                 display: flex; flex-direction: column; gap: 4px; align-items: stretch;
-                 max-height: 30vh; overflow-y: auto; flex-shrink: 0; }
-  .thread-tab { padding: 5px 10px; border-radius: 4px; cursor: pointer;
-                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                border: 1px solid transparent; font-size: 0.85em; background: none;
-                color: var(--vscode-foreground); text-align: left; }
-  .thread-tab:hover { background: var(--vscode-list-hoverBackground); }
-  .thread-tab.active { border-color: var(--vscode-focusBorder);
-                       background: var(--vscode-editor-inactiveSelectionBackground); }
-  /* Pinned at the top of the scrollable list so it stays reachable. */
-  #new-chat-btn { order: -1; position: sticky; top: 0; z-index: 1;
-                  padding: 5px 10px; border: none; border-radius: 4px;
-                  background: var(--vscode-button-secondaryBackground);
-                  color: var(--vscode-button-secondaryForeground); cursor: pointer;
-                  font-size: 0.85em; text-align: left; }
-  #thread { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-  .msg { max-width: 85%; padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
-  .user { align-self: flex-end; background: var(--vscode-button-background);
-          color: var(--vscode-button-foreground); }
-  .agent { align-self: flex-start; background: var(--vscode-editor-inactiveSelectionBackground); }
-  .thinking { align-self: flex-start; font-size: 0.8em; color: var(--vscode-descriptionForeground);
-              font-style: italic; padding: 4px 8px; display: flex; align-items: center; gap: 6px; }
-  .thinking-dot { width: 6px; height: 6px; border-radius: 50%;
-                  background: var(--vscode-descriptionForeground);
-                  animation: pulse 1.2s ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
-  .plan-card { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 12px;
-               align-self: flex-start; max-width: 85%; }
-  .plan-card .plan-md { margin: 8px 0; font-size: 0.88em; line-height: 1.6; }
-  .plan-card .plan-md p { margin: 4px 0; }
-  .plan-card .plan-md ul, .plan-card .plan-md ol { margin: 4px 0; padding-left: 20px; }
-  .plan-card .plan-md li { margin: 2px 0; }
-  .plan-card .plan-md h1, .plan-card .plan-md h2, .plan-card .plan-md h3 { margin: 8px 0 4px; font-size: 1em; }
-  .plan-card .plan-md code { background: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family, monospace); font-size: 0.9em; }
-  .plan-card .plan-md pre { background: var(--vscode-textCodeBlock-background); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 6px 0; }
-  .plan-card .plan-md pre code { background: none; padding: 0; }
-  .plan-card .plan-md strong { font-weight: 600; }
-  .plan-card .plan-md hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 8px 0; }
-  .plan-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-  .plan-actions button { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; }
-  .btn-primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-  .btn-secondary { background: var(--vscode-button-secondaryBackground);
-                   color: var(--vscode-button-secondaryForeground); }
-  .plan-actions textarea { flex: 1; min-width: 140px; padding: 4px;
-                           background: var(--vscode-input-background);
-                           color: var(--vscode-input-foreground);
-                           border: 1px solid var(--vscode-input-border); border-radius: 4px; }
-  .diff-files { margin: 8px 0; font-size: 0.85em; line-height: 1.6; }
-  .diff-file { font-family: var(--vscode-editor-font-family, monospace); }
-  .diff-adds { color: var(--vscode-gitDecoration-addedResourceForeground, #73c991); }
-  .diff-dels { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
-  .diff-view-btns { display: flex; gap: 6px; flex-wrap: wrap; width: 100%; margin-top: 4px; }
-  .btn-ghost { background: transparent; color: var(--vscode-textLink-foreground);
-               border: 1px solid var(--vscode-textLink-foreground) !important;
-               font-size: 0.82em; padding: 3px 8px !important; }
-  .inline-resolved { font-size: 0.85em; opacity: 0.7; font-style: italic; }
-  .thinking-log { margin-top: 8px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
-  .thinking-log summary { cursor: pointer; user-select: none; opacity: 0.7; }
-  .thinking-log summary:hover { opacity: 1; }
-  .thinking-log ul { margin: 4px 0 0 0; padding-left: 16px; line-height: 1.6; }
-  /* Live, state-driven cards (Class A) — pinned above the input so a pending gate is
-     always in view and survives reloads (re-derived from /live). */
-  #live-slot { display: flex; flex-direction: column; gap: 8px; padding: 0 12px; flex-shrink: 0; }
-  #live-slot:empty { padding: 0; }
-  .live-gate, .live-plan { border: 1px solid var(--vscode-focusBorder); border-radius: 6px;
-               padding: 10px 12px; background: var(--vscode-editor-inactiveSelectionBackground); }
-  .live-head { font-weight: 600; font-size: 0.9em; margin-bottom: 6px; }
-  .live-body { font-size: 0.85em; line-height: 1.5; margin-bottom: 8px; }
-  .live-body ul { margin: 4px 0; padding-left: 18px; }
-  .live-cmd { background: var(--vscode-textCodeBlock-background); padding: 6px 8px; border-radius: 4px;
-              font-family: var(--vscode-editor-font-family, monospace); font-size: 0.85em;
-              overflow-x: auto; margin: 0 0 8px; }
-  .live-plan .plan-md { margin: 6px 0; font-size: 0.88em; line-height: 1.6; max-height: 40vh; overflow-y: auto; }
-  .live-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .live-actions button { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; }
-  .live-actions textarea { flex: 1; min-width: 140px; padding: 4px;
-                           background: var(--vscode-input-background);
-                           color: var(--vscode-input-foreground);
-                           border: 1px solid var(--vscode-input-border); border-radius: 4px; }
-  #input-row { display: flex; gap: 8px; padding: 10px;
-               border-top: 1px solid var(--vscode-panel-border); }
-  #input { flex: 1; padding: 8px; border: 1px solid var(--vscode-input-border);
-           background: var(--vscode-input-background); color: var(--vscode-input-foreground);
-           border-radius: 4px; resize: none; font-family: inherit; }
-  #send { padding: 8px 16px; background: var(--vscode-button-background);
-          color: var(--vscode-button-foreground); border: none; border-radius: 4px; cursor: pointer; }
-</style>
-</head>
-<body>
-<div id="thread-list"><button id="new-chat-btn">+ New Chat</button></div>
-<div id="thread"></div>
-<div id="live-slot"></div>
-<div id="input-row">
-  <textarea id="input" rows="2" placeholder="Ask anything or describe a change…"></textarea>
-  <button id="send">Send</button>
-</div>
-<script nonce="${nonce}" src="${markedUri}"></script>
-<script nonce="${nonce}" src="${scriptUri}"></script>
-</body>
-</html>`;
+
+    // Vite emits relative refs (base "./"): src="./assets/index.js" href="./assets/index.css"
+    html = html.replace(/(src|href)="\.\/(assets\/[^"]+)"/g, (_m, attr: string, assetPath: string) => {
+      const uri = this.panel!.webview.asWebviewUri(vscode.Uri.joinPath(distPath, assetPath));
+      return `${attr}="${uri}"`;
+    });
+    html = html.replace(/<script /g, `<script nonce="${nonce}" `);
+    html = html.replace(
+      "<head>",
+      `<head>\n<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' ${cspSource}; script-src 'nonce-${nonce}' ${cspSource}; img-src ${cspSource} data:; font-src ${cspSource};">`
+    );
+    return html;
   }
 }

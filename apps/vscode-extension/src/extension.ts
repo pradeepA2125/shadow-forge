@@ -32,6 +32,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     (taskId, decision) => controller.handleCommandDecisionFromChat(taskId, decision),
     (taskId, decision) =>
       decision === "accept" ? controller.acceptStep(taskId) : controller.discardStep(taskId),
+    (taskId) => controller.acceptTaskPatch(taskId),
+    (taskId, reason) => controller.rejectTaskPatch(taskId, reason),
+    (taskId, stage) => controller.resumeTaskById(taskId, stage),
+    () => controller.stopActiveTurn(),
     () => controller.openChat()
   );
 
@@ -186,6 +190,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
     updateWorkbar: (info) => {
       chatPanel.updateWorkbar(info);
+    },
+    renderLiveReview: (review) => {
+      chatPanel.renderLiveReview(review);
+    },
+    clearLiveReview: () => {
+      chatPanel.clearLiveReview();
+    },
+    renderLiveError: (error) => {
+      chatPanel.renderLiveError(error);
+    },
+    clearLiveError: () => {
+      chatPanel.clearLiveError();
+    },
+    sendLiveStatus: (status) => {
+      chatPanel.sendLiveStatus(status);
     },
   };
 
