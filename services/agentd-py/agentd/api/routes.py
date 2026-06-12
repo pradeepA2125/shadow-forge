@@ -481,6 +481,14 @@ def build_router(
         await store.save(task)
         await workspace_manager.prune_checkpoints()
 
+        # Durable transcript record — the ReviewCard is live-slot only and vanishes
+        # once status leaves READY_FOR_REVIEW; this breadcrumb is the permanent
+        # record of the final decision (same Class-A model as the gate decisions).
+        orchestrator.write_chat_breadcrumb(
+            task,
+            f"✓ Task finished — {len(task.modified_files)} file(s) applied to the workspace.",
+        )
+
         return _to_task_result(task)
 
     @router.post("/tasks/{task_id}/reject", response_model=TaskResult)
@@ -499,6 +507,13 @@ def build_router(
         task = transition(task, TaskStatus.ABORTED, f"patch rejected: {request.reason}")
         await store.save(task)
         await workspace_manager.prune_checkpoints()
+
+        # Reject does NOT revert the workspace (partial promotes already landed);
+        # record that honestly in the transcript.
+        orchestrator.write_chat_breadcrumb(
+            task,
+            "✗ Task closed without finishing — applied changes kept; task marked aborted.",
+        )
 
         return _to_task_result(task)
 

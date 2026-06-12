@@ -173,7 +173,7 @@ async def test_breadcrumb_is_broadcast_live(tmp_path: Path) -> None:
     orch, _chat_store, thread_id = _make(tmp_path)
     task = await _seed_executing(orch, thread_id, ws)
 
-    orch._write_chat_breadcrumb(task, "✓ Step changes accepted: foo")
+    orch.write_chat_breadcrumb(task, "✓ Step changes accepted: foo")
 
     queue = orch.broadcaster.subscribe(task.task_id)
     events = []

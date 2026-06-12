@@ -21,19 +21,29 @@ from agentd.workspace.shadow import ShadowWorkspaceManager
 
 
 class DummyOrchestrator:
+    def __init__(self) -> None:
+        self.breadcrumbs: list[str] = []
+
     async def run_task(self, task_id: str) -> None:
         _ = task_id
 
     async def continue_task(self, task_id: str, feedback: str | None = None) -> None:
         _ = (task_id, feedback)
 
+    def write_chat_breadcrumb(self, task: TaskRecord, text: str) -> None:
+        _ = task
+        self.breadcrumbs.append(text)
+
 
 def _build_app(
     store: InMemoryTaskStore,
     workspace_manager: ShadowWorkspaceManager,
+    orchestrator: DummyOrchestrator | None = None,
 ) -> FastAPI:
     app = FastAPI()
-    app.include_router(build_router(store, DummyOrchestrator(), workspace_manager))
+    app.include_router(
+        build_router(store, orchestrator or DummyOrchestrator(), workspace_manager)
+    )
     return app
 
 
@@ -156,7 +166,8 @@ async def test_accept_promotes_and_returns_task_result(tmp_path: Path) -> None:
     )
     await store.create(task)
 
-    app = _build_app(store, manager)
+    orch = DummyOrchestrator()
+    app = _build_app(store, manager, orch)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/tasks/task-1/accept")
 
@@ -170,6 +181,9 @@ async def test_accept_promotes_and_returns_task_result(tmp_path: Path) -> None:
 
     assert (real_workspace / "src/main.py").read_text(encoding="utf-8") == "print('shadow')\n"
     assert task.shadow_workspace_path is None
+    # The final decision leaves a durable transcript breadcrumb (ReviewCard is
+    # live-slot only — without this the run summary vanishes from chat history).
+    assert orch.breadcrumbs == ["✓ Task finished — 1 file(s) applied to the workspace."]
 
 
 @pytest.mark.asyncio
@@ -195,7 +209,8 @@ async def test_reject_returns_task_result_and_aborts(tmp_path: Path) -> None:
     )
     await store.create(task)
 
-    app = _build_app(store, manager)
+    orch = DummyOrchestrator()
+    app = _build_app(store, manager, orch)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post("/v1/tasks/task-2/reject", json={"reason": "nope"})
 
@@ -208,6 +223,9 @@ async def test_reject_returns_task_result_and_aborts(tmp_path: Path) -> None:
     assert payload["shadow_workspace_path"] is None
 
     assert not shadow.shadow_path.exists()
+    assert orch.breadcrumbs == [
+        "✗ Task closed without finishing — applied changes kept; task marked aborted."
+    ]
 
 
 @pytest.mark.asyncio

@@ -823,7 +823,7 @@ export class AiEditorController {
           });
           // Capture deviation breadcrumbs for run context.
           // COUPLING: prefixes mirror backend breadcrumb constants in
-          // services/agentd-py/agentd/orchestrator/engine.py (_write_chat_breadcrumb call
+          // services/agentd-py/agentd/orchestrator/engine.py (write_chat_breadcrumb call
           // sites). A reword there silently drops deviation capture — keep in sync.
           const breadcrumbText: string = event.payload.text ?? "";
           if (
@@ -936,8 +936,15 @@ export class AiEditorController {
 
   async acceptTaskPatch(taskId: string): Promise<void> {
     try {
-      await this.clientForChat().acceptPatch(taskId);
+      const result = await this.clientForChat().acceptPatch(taskId);
       this.ui.showInfo("Task finished — changes are in your workspace.");
+      // Optimistic copy of the breadcrumb the backend persists on /accept: nothing
+      // is listening on the task SSE channel by Finish-time, so without this the
+      // durable record only appears after the next webview reload.
+      this.appendBreadcrumbMessage(
+        taskId,
+        `✓ Task finished — ${result.modifiedFiles.length} file(s) applied to the workspace.`,
+      );
       // poke so the review card clears sub-interval once status advances
       this.lastLiveSignature = null;
       void this.pollThreadLiveState();
@@ -951,10 +958,28 @@ export class AiEditorController {
     try {
       await this.clientForChat().rejectPatch(taskId, reason.trim() || "closed from chat");
       this.ui.showInfo("Task closed — applied changes were kept.");
+      this.appendBreadcrumbMessage(
+        taskId,
+        "✗ Task closed without finishing — applied changes kept; task marked aborted.",
+      );
     } catch (error) {
       if (this.isBenignConflict(error)) return;
       this.ui.showError(`Failed to close task: ${formatError(error)}`);
     }
+  }
+
+  /** Mirror of the backend's persisted breadcrumb, rendered immediately. The
+   *  persisted copy takes over on the next thread reload (full list replace —
+   *  no duplication). */
+  private appendBreadcrumbMessage(taskId: string, text: string): void {
+    this.ui.appendChatMessage({
+      role: "agent",
+      content: text,
+      type: "text",
+      taskId,
+      timestamp: this.now(),
+      metadata: { taskId, breadcrumb: true },
+    });
   }
 
   async resumeTaskById(taskId: string, stage: "plan" | "execute"): Promise<void> {

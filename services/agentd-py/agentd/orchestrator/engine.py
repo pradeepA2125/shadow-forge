@@ -489,7 +489,7 @@ class AgentOrchestrator:
                     })
                 # Breadcrumb BEFORE the new plan card so the transcript reads
                 # chronologically: old plan → "↻ feedback" → regenerated plan.
-                self._write_chat_breadcrumb(task, "↻ Plan feedback submitted — regenerating the plan.")
+                self.write_chat_breadcrumb(task, "↻ Plan feedback submitted — regenerating the plan.")
                 self._write_chat_plan_card(task)
                 return task
 
@@ -497,7 +497,7 @@ class AgentOrchestrator:
             print("\n[PLAN] Plan Approved. Generating executable JSON plan...")
             task = transition(task, TaskStatus.PLANNED, "plan approved; starting execution")
             await self._store.save(task)
-            self._write_chat_breadcrumb(task, "✓ Plan approved — starting execution.")
+            self.write_chat_breadcrumb(task, "✓ Plan approved — starting execution.")
             self.broadcaster.broadcast(task_id, {
                 "type": "task_status_changed",
                 "payload": {"task_id": task_id, "status": "PLANNED", "message": "Generating execution plan…"},
@@ -717,13 +717,13 @@ class AgentOrchestrator:
             await self._store.save(task)
             task = transition(task, TaskStatus.READY_FOR_REVIEW, "validation accepted; ready for review")
             await self._store.save(task)
-            self._write_chat_breadcrumb(
+            self.write_chat_breadcrumb(
                 task, f"✓ Validation accepted — {len(validation.diagnostics)} error(s) kept as pre-existing.",
             )
         else:
             task = transition(task, TaskStatus.FAILED, "validation errors rejected")
             await self._store.save(task)
-            self._write_chat_breadcrumb(task, "✗ Validation rejected — task marked failed.")
+            self.write_chat_breadcrumb(task, "✗ Validation rejected — task marked failed.")
         return task
 
     async def get_task(self, task_id: str) -> TaskRecord:
@@ -1211,7 +1211,7 @@ class AgentOrchestrator:
                           task_id=task.task_id, metadata={"task_id": task.task_id})
         self._chat_store.append_message(thread_id, msg)  # type: ignore[union-attr]
 
-    def _write_chat_breadcrumb(self, task: "TaskRecord", text: str) -> None:
+    def write_chat_breadcrumb(self, task: "TaskRecord", text: str) -> None:
         """Append a durable transcript breadcrumb recording a resolved gate/plan action.
 
         The live actionable card (command/scope/validation/step gate, plan) is
@@ -1663,9 +1663,9 @@ class AgentOrchestrator:
                 await self._store.save(task)
                 if decision.approve:
                     _files = ", ".join(decision.extended_files) or "(none)"
-                    self._write_chat_breadcrumb(task, f"✓ Scope extension approved: {_files}")
+                    self.write_chat_breadcrumb(task, f"✓ Scope extension approved: {_files}")
                 else:
-                    self._write_chat_breadcrumb(task, f"✗ Scope extension rejected: {decision.reason}")
+                    self.write_chat_breadcrumb(task, f"✗ Scope extension rejected: {decision.reason}")
 
             return decision
 
@@ -1773,9 +1773,9 @@ class AgentOrchestrator:
                     CommandRuleStore(task.workspace_path).add(rule)
                 await self._store.save(task)
                 if decision.approve:
-                    self._write_chat_breadcrumb(task, f"✓ Command approved: {command}")
+                    self.write_chat_breadcrumb(task, f"✓ Command approved: {command}")
                 else:
-                    self._write_chat_breadcrumb(task, f"✗ Command rejected: {command}")
+                    self.write_chat_breadcrumb(task, f"✗ Command rejected: {command}")
 
             return decision
 
@@ -1838,9 +1838,9 @@ class AgentOrchestrator:
                 task = transition(task, TaskStatus.EXECUTING, "step decision received")
             await self._store.save(task)
             if decision == "accept":
-                self._write_chat_breadcrumb(task, f"✓ Step changes accepted: {payload.step_title}")
+                self.write_chat_breadcrumb(task, f"✓ Step changes accepted: {payload.step_title}")
             else:
-                self._write_chat_breadcrumb(task, f"↩ Step changes discarded: {payload.step_title}")
+                self.write_chat_breadcrumb(task, f"↩ Step changes discarded: {payload.step_title}")
 
         return decision
 
