@@ -235,3 +235,27 @@ describe("DiffCard — persisted tool pills", () => {
     expect(screen.queryByText("read_file")).toBeNull();
   });
 });
+
+// ── 7. Resolved step-review record ────────────────────────────────────────────
+
+describe("DiffCard — resolved step-review record", () => {
+  it("renders a resolved step-review record inert with panes", () => {
+    render(
+      <DiffCard
+        taskId="task-123"
+        resolved="applied"
+        diffEntries={[
+          {
+            path: "a.py", additions: 1, deletions: 0, temp_path: "/tmp/a.py",
+            unified_diff: "@@ -1,1 +1,2 @@\n x = 1\n+y = 2",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText("Applied")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /accept all/i })).toBeNull();
+    // Panes render from the persisted unified_diff once expanded.
+    fireEvent.click(screen.getByText("Changes ready"));
+    expect(screen.getByText("y = 2")).toBeTruthy();
+  });
+});
