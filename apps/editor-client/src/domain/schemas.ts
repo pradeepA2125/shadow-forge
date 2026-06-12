@@ -27,7 +27,10 @@ export const PlanTargetSchema = z.preprocess(
 export const PlanStepSchema = z.object({
   id: z.string().min(1),
   goal: z.string().min(1),
-  targets: z.array(PlanTargetSchema).min(1),
+  // Empty targets = a command-only step (run build/tests, nothing to patch).
+  // A .min(1) here silently broke the ReviewCard for such plans: getTaskResult
+  // threw on parse every poll and the live slot never rendered.
+  targets: z.array(PlanTargetSchema),
   risk: RiskSchema
 });
 

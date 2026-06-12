@@ -23,11 +23,18 @@ _SYSTEM_PROMPT = """\
 You are classifying a user's chat message and, for qa intent, answering it in one step.
 
 Intent values:
-  qa           — question or discussion, no file changes needed
+  qa           — question or discussion; answering with TEXT fully satisfies the user
   small_change — 1-2 files, localised edit, no interface or schema changes
-  large_change — 3+ files, interface/schema changes, new files, or ambiguous scope
+  large_change — 3+ files, interface/schema changes, new files, ambiguous scope, OR a
+                 RUN/VERIFY request (see below)
   resume       — user wants to continue/retry a recently failed task
   clarify      — user message is ambiguous between resume and something else; ask a question
+
+The agent can EXECUTE commands (builds, test suites, linters) as a task — steps with no
+file targets run the commands and report results. A request to RUN, BUILD, TEST, or
+VERIFY the project (e.g. "run the test suite", "make sure everything builds", "verify
+all tests pass") is therefore large_change — NOT qa. qa is only for requests satisfied
+by text alone; "how do I run the tests?" is qa, "run the tests" is large_change.
 
 You receive:
   conversation_history — recent messages; use to resolve "fix that", "also update tests", etc.
