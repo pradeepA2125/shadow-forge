@@ -71,6 +71,26 @@ from agentd.workspace.shadow import ShadowWorkspace, ShadowWorkspaceManager
 
 logger = logging.getLogger(__name__)
 
+_DIFF_MAX_LINES = 400
+_DIFF_MAX_CHARS = 24_000
+_DIFF_TRUNCATION_MARKER = "\u2026 diff truncated \u2014 open in editor for the full diff"
+
+
+def _cap_unified_diff(diff_text: str) -> str:
+    """Bound per-file diff text for chat payload/persistence."""
+    lines = diff_text.splitlines()
+    truncated = False
+    if len(lines) > _DIFF_MAX_LINES:
+        lines = lines[:_DIFF_MAX_LINES]
+        truncated = True
+    text = "\n".join(lines)
+    if len(text) > _DIFF_MAX_CHARS:
+        text = text[:_DIFF_MAX_CHARS]
+        truncated = True
+    if truncated:
+        text += "\n" + _DIFF_TRUNCATION_MARKER
+    return text
+
 
 
 _NEARBY_PATTERN_NAMES: frozenset[str] = frozenset({"__init__.py", "conftest.py"})
@@ -1018,7 +1038,8 @@ class AgentOrchestrator:
         # Persist the diff card to the thread so it survives panel reloads.
         from agentd.chat.models import ChatMessage as _ChatMsg
         diff_entries_payload = [
-            {"path": e.path, "additions": e.additions, "deletions": e.deletions, "temp_path": e.temp_path}
+            {"path": e.path, "additions": e.additions, "deletions": e.deletions,
+             "temp_path": e.temp_path, "unified_diff": e.unified_diff}
             for e in diff_entries
         ]
         # Durable pills: chat-explore events (passed in) followed by this loop's
@@ -1054,6 +1075,7 @@ class AgentOrchestrator:
                         "additions": e.additions,
                         "deletions": e.deletions,
                         "temp_path": e.temp_path,
+                        "unified_diff": e.unified_diff,
                     }
                     for e in diff_entries
                 ],
@@ -1087,6 +1109,7 @@ class AgentOrchestrator:
                 additions=additions,
                 deletions=deletions,
                 temp_path=str(shadow_file),
+                unified_diff=_cap_unified_diff("\n".join(diff)),
             ))
         return entries
 

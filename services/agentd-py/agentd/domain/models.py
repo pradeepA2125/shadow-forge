@@ -851,6 +851,9 @@ class DiffEntry:
     additions: int
     deletions: int
     temp_path: str
+    # Capped unified diff text for in-card rendering (chat UI v2 Tier A; the
+    # full diff stays available via the native editor diff against temp_path).
+    unified_diff: str = ""
 
 
 @dataclass
