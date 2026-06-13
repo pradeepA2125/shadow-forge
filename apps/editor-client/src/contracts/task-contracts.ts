@@ -30,6 +30,23 @@ export const TaskSubmissionSchema = z.object({
   mode: z.enum(["inline", "file_edit", "project_edit", "autonomous"])
 });
 
+// Durable lifecycle telemetry (Tier B). camelCase mirror of backend FailureSummary/
+// RunSummary; lets the Error/Review cards render from state on reload.
+export const FailureSummarySchema = z.object({
+  stepId: z.string().nullable().optional(),
+  stepIndex: z.number().int().nullable().optional(),
+  errorClass: z.string(),
+  message: z.string()
+});
+export type FailureSummary = z.infer<typeof FailureSummarySchema>;
+
+export const RunSummarySchema = z.object({
+  stepsCompleted: z.number().int(),
+  stepsTotal: z.number().int(),
+  deviations: z.array(z.string()).default([])
+});
+export type RunSummary = z.infer<typeof RunSummarySchema>;
+
 export const TaskViewSchema = z.object({
   taskId: z.string().min(1),
   status: TaskStatusSchema,
@@ -37,7 +54,9 @@ export const TaskViewSchema = z.object({
   modifiedFiles: z.array(z.string()),
   diagnostics: DiagnosticsSchema,
   planMarkdown: z.string().optional(),
-  resumeOfTaskId: z.string().optional()
+  resumeOfTaskId: z.string().optional(),
+  failureSummary: FailureSummarySchema.nullable().optional(),
+  runSummary: RunSummarySchema.nullable().optional()
 });
 
 export const TaskResultSchema = z.object({
@@ -50,7 +69,9 @@ export const TaskResultSchema = z.object({
   diagnostics: DiagnosticsSchema,
   promotedAt: z.string().nullable().optional(),
   shadowWorkspacePath: z.string().nullable().optional(),
-  resumeOfTaskId: z.string().optional()
+  resumeOfTaskId: z.string().optional(),
+  failureSummary: FailureSummarySchema.nullable().optional(),
+  runSummary: RunSummarySchema.nullable().optional()
 });
 
 export const ResumeTaskRequestSchema = z.object({
@@ -223,6 +244,9 @@ export const ThreadLiveStateSchema = z.object({
   status: z.string().nullable(),
   pendingGate: PendingGateSchema.nullable(),
   plan: z.record(z.unknown()).nullable(),
+  // Durable lifecycle telemetry (Tier B): drives the Error/Review cards from poll state.
+  failureSummary: FailureSummarySchema.nullable().optional(),
+  runSummary: RunSummarySchema.nullable().optional(),
 });
 export type ThreadLiveState = z.infer<typeof ThreadLiveStateSchema>;
 
@@ -231,6 +255,11 @@ export interface BackendTaskClient {
   getTask(taskId: string): Promise<TaskView>;
   getTaskResult(taskId: string): Promise<TaskResult>;
   cancelTask(taskId: string): Promise<{ taskId: string; status: TaskStatus }>;
+  // Cooperative Stop for a running task: revert rolls the workspace back, otherwise keeps
+  // the changes applied so far (Tier B).
+  abortTask(taskId: string, options: { revert: boolean }): Promise<TaskView>;
+  // Live-mutable "Review each step" preference for a running task (Tier B).
+  setReviewPref(taskId: string, options: { autoAccept: boolean }): Promise<TaskView>;
   acceptPatch(taskId: string): Promise<TaskResult>;
   rejectPatch(taskId: string, reason: string): Promise<TaskResult>;
   providePlanFeedback(taskId: string, feedback: string | null): Promise<TaskView>;

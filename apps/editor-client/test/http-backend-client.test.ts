@@ -381,4 +381,82 @@ describe("HttpBackendClient", () => {
     expect(events[0].type).toBe("intent_classified");
     expect(events[1].type).toBe("chat_done");
   });
+
+  // ── Tier B lifecycle control + durable telemetry ───────────────────────────
+
+  test("abortTask posts {revert} and maps the TaskView", async () => {
+    let url = "";
+    let body = "";
+    const client = new HttpBackendClient({
+      baseUrl: "http://localhost:8000",
+      fetchFn: async (input, init) => {
+        url = String(input);
+        body = String(init?.body ?? "");
+        return new Response(
+          JSON.stringify({ task_id: "task-1", status: "ABORTED", goal: "g", modified_files: [], diagnostics: [] }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+    });
+    const view = await client.abortTask("task-1", { revert: true });
+    expect(url).toContain("/v1/tasks/task-1/abort");
+    expect(JSON.parse(body)).toEqual({ revert: true });
+    expect(view.status).toBe("ABORTED");
+  });
+
+  test("setReviewPref posts {auto_accept} (snake_case wire)", async () => {
+    let url = "";
+    let body = "";
+    const client = new HttpBackendClient({
+      baseUrl: "http://localhost:8000",
+      fetchFn: async (input, init) => {
+        url = String(input);
+        body = String(init?.body ?? "");
+        return new Response(
+          JSON.stringify({ task_id: "task-1", status: "EXECUTING", goal: "g", modified_files: [], diagnostics: [] }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+    });
+    await client.setReviewPref("task-1", { autoAccept: false });
+    expect(url).toContain("/v1/tasks/task-1/review-pref");
+    expect(JSON.parse(body)).toEqual({ auto_accept: false });
+  });
+
+  test("getThreadLiveState maps failure_summary and run_summary to camelCase", async () => {
+    const client = new HttpBackendClient({
+      baseUrl: "http://localhost:8000",
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify({
+            active_task_id: "task-1",
+            status: "FAILED",
+            pending_gate: null,
+            plan: null,
+            failure_summary: { step_id: "s3", step_index: 3, error_class: "VerifyPhaseExhausted", message: "boom" },
+            run_summary: { steps_completed: 2, steps_total: 4, deviations: ["1 delta replan(s)"] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        ),
+    });
+    const live = await client.getThreadLiveState("chat-abc123");
+    expect(live.failureSummary?.errorClass).toBe("VerifyPhaseExhausted");
+    expect(live.failureSummary?.stepIndex).toBe(3);
+    expect(live.runSummary?.stepsCompleted).toBe(2);
+    expect(live.runSummary?.deviations).toEqual(["1 delta replan(s)"]);
+  });
+
+  test("getTaskResult leaves summaries undefined when the wire omits them", async () => {
+    const client = new HttpBackendClient({
+      baseUrl: "http://localhost:8000",
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify({ task_id: "task-1", status: "SUCCEEDED", modified_files: [], diagnostics: [] }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        ),
+    });
+    const result = await client.getTaskResult("task-1");
+    expect(result.failureSummary).toBeUndefined();
+    expect(result.runSummary).toBeUndefined();
+  });
 });

@@ -81,6 +81,25 @@ export class HttpBackendClient implements BackendTaskClient {
     };
   }
 
+  async abortTask(taskId: string, options: { revert: boolean }): Promise<TaskView> {
+    const response = await this.fetchJson(`/v1/tasks/${encodeURIComponent(taskId)}/abort`, {
+      method: "POST",
+      body: JSON.stringify({ revert: options.revert })
+    });
+    return this.toTaskView(response);
+  }
+
+  async setReviewPref(taskId: string, options: { autoAccept: boolean }): Promise<TaskView> {
+    const response = await this.fetchJson(
+      `/v1/tasks/${encodeURIComponent(taskId)}/review-pref`,
+      {
+        method: "POST",
+        body: JSON.stringify({ auto_accept: options.autoAccept })
+      }
+    );
+    return this.toTaskView(response);
+  }
+
   async acceptPatch(taskId: string): Promise<TaskResult> {
     const response = await this.fetchJson(`/v1/tasks/${encodeURIComponent(taskId)}/accept`, {
       method: "POST"
@@ -337,6 +356,8 @@ export class HttpBackendClient implements BackendTaskClient {
         ? { kind: gate["kind"], payload: gate["payload"] ?? {} }
         : null,
       plan: raw["plan"] ?? null,
+      failureSummary: this.toFailureSummary(raw),
+      runSummary: this.toRunSummary(raw),
     });
   }
 
@@ -417,6 +438,31 @@ export class HttpBackendClient implements BackendTaskClient {
     return response.json();
   }
 
+  // Tier B durable telemetry: map the snake_case wire summaries to camelCase, or
+  // undefined when absent/null so the optional schema fields pass.
+  private toFailureSummary(raw: unknown): unknown | undefined {
+    const value = this.readOptionalUnknown(raw, "failureSummary", "failure_summary");
+    if (!value || typeof value !== "object") return undefined;
+    const r = value as Record<string, unknown>;
+    return {
+      stepId: r["stepId"] ?? r["step_id"] ?? null,
+      stepIndex: r["stepIndex"] ?? r["step_index"] ?? null,
+      errorClass: r["errorClass"] ?? r["error_class"],
+      message: r["message"]
+    };
+  }
+
+  private toRunSummary(raw: unknown): unknown | undefined {
+    const value = this.readOptionalUnknown(raw, "runSummary", "run_summary");
+    if (!value || typeof value !== "object") return undefined;
+    const r = value as Record<string, unknown>;
+    return {
+      stepsCompleted: r["stepsCompleted"] ?? r["steps_completed"],
+      stepsTotal: r["stepsTotal"] ?? r["steps_total"],
+      deviations: r["deviations"] ?? []
+    };
+  }
+
   private toTaskView(raw: unknown): TaskView {
     return TaskViewSchema.parse({
       taskId: this.readString(raw, "taskId", "task_id"),
@@ -425,7 +471,9 @@ export class HttpBackendClient implements BackendTaskClient {
       modifiedFiles: this.readArray(raw, "modifiedFiles", "modified_files"),
       diagnostics: this.normalizeDiagnostics(raw),
       planMarkdown: this.readOptionalString(raw, "planMarkdown", "plan_markdown"),
-      resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id")
+      resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id"),
+      failureSummary: this.toFailureSummary(raw),
+      runSummary: this.toRunSummary(raw)
     });
   }
 
@@ -444,7 +492,9 @@ export class HttpBackendClient implements BackendTaskClient {
         "shadowWorkspacePath",
         "shadow_workspace_path"
       ),
-      resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id")
+      resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id"),
+      failureSummary: this.toFailureSummary(raw),
+      runSummary: this.toRunSummary(raw)
     });
   }
 
