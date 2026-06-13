@@ -696,6 +696,7 @@ class StepRunResult(BaseModel):
     trace_entries: list[StepExecutionTrace] = Field(default_factory=list)
     checkpoint_manifests: list[CheckpointManifest] = Field(default_factory=list)
     last_failure: dict[str, Any] | None = None
+    step_summary: str | None = None     # carried from VerifyResult for the narrative event log
 
 
 class StepProgress(BaseModel):

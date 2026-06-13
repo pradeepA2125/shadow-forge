@@ -65,6 +65,13 @@ AGENT_STEP_RESPONSE_SCHEMA: dict[str, object] = {
             "type": "string",
             "description": "Full output from the last test/lint run (required for verify_done)",
         },
+        "step_summary": {
+            "type": "string",
+            "description": (
+                "One concise sentence summarizing what THIS step changed, for the task "
+                "narrative (optional, set it on verify_done)."
+            ),
+        },
         # revision_needed fields
         "reason": {
             "type": "string",

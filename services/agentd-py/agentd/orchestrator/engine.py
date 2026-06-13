@@ -2513,6 +2513,7 @@ class AgentOrchestrator:
                         trace_entries=trace_entries,
                         checkpoint_manifests=checkpoints,
                         last_failure=None,
+                        step_summary=step_outcome.step_summary or None,
                     )
                 else:
                     print("\n[PATCH] Entering Patching Node...")

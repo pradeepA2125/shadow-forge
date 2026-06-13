@@ -137,6 +137,7 @@ class VerifyResult:
     verified: bool
     test_output: str                    # empty when no test_command
     tool_trace: AgentToolTrace
+    step_summary: str = ""              # model-authored one-liner from verify_done (optional)
 
 
 @dataclass
@@ -518,6 +519,7 @@ class ToolLoop:
                     verified=verified_flag,
                     test_output=str(response.get("test_output", "")),
                     tool_trace=trace,
+                    step_summary=str(response.get("step_summary", "")),
                 )
 
             # ── revision_needed ──────────────────────────────────────────
