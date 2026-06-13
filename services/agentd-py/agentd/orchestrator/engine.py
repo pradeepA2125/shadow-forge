@@ -1813,6 +1813,9 @@ class AgentOrchestrator:
                 # pre-terminal gate, before any accept/discard. NO baseline cleanup here:
                 # the pinned checkpoint must survive for a later Discard (true revert).
                 self._finalize_run_summary(task)
+                # Narrative authored HERE (pre-accept) so the ReviewCard shows it before the
+                # Finish/Discard gate. Outcome "succeeded" = execution+validation passed.
+                await self._finalize_task_narrative(task, "succeeded")
                 await self._store.save(task)
             if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.ABORTED}:
                 # Durable telemetry: finalize run_summary on every engine terminal, and
@@ -1822,6 +1825,9 @@ class AgentOrchestrator:
                 if task.status == TaskStatus.FAILED and task.failure_summary is None:
                     last = task.diagnostics[-1].message if task.diagnostics else "Execution failed"
                     self._write_failure_summary(task, error_class="ExecutionFailed", message=last)
+                _outcome = "aborted" if task.status == TaskStatus.ABORTED else (
+                    "succeeded" if task.status == TaskStatus.SUCCEEDED else "failed")
+                await self._finalize_task_narrative(task, _outcome)
                 # Drop the pinned baseline (prune_checkpoints never scans _baselines, so it
                 # would otherwise leak). Any rollback/abort-revert that needs it has already
                 # run in the except handlers, which execute before this finally.
@@ -3702,6 +3708,25 @@ class AgentOrchestrator:
     def _append_run_event(self, task: TaskRecord, event: RunEvent) -> None:
         """Append to the append-only run-event log backing the task narrative (never pruned)."""
         task.execution_state.run_events.append(event)
+
+    async def _finalize_task_narrative(self, task: TaskRecord, outcome: str) -> None:
+        """Synthesize the run narrative from the event log (one LLM call). Best-effort: a
+        synthesis failure (or an engine that lacks summarize_run) must never fail the task."""
+        try:
+            es = task.execution_state
+            dev = task.run_summary.deviations if task.run_summary else []
+            raw = await self._reasoning_engine.summarize_run(
+                goal=task.goal, outcome=outcome,
+                run_events=[e.model_dump(mode="json") for e in es.run_events],
+                deviations=dev, modified_files=list(task.modified_files),
+            )
+            task.task_narrative = TaskNarrative(
+                outcome=outcome,
+                headline=str(raw.get("headline", ""))[:300],
+                points=[str(p) for p in (raw.get("points") or [])][:10],
+            )
+        except Exception:
+            logger.exception("Task narrative synthesis failed", extra={"task_id": task.task_id})
 
     def _finalize_run_summary(self, task: TaskRecord) -> None:
         """Accumulate the run-so-far context (Tier B durable telemetry). Called at every
