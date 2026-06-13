@@ -105,6 +105,7 @@ def _to_task_result(task: TaskRecord) -> TaskResult:
         resume_of_task_id=task.resume_of_task_id,
         failure_summary=task.failure_summary,
         run_summary=task.run_summary,
+        task_narrative=task.task_narrative,
     )
 
 
@@ -119,6 +120,7 @@ def _to_task_view(task: TaskRecord) -> TaskView:
         resume_of_task_id=task.resume_of_task_id,
         failure_summary=task.failure_summary,
         run_summary=task.run_summary,
+        task_narrative=task.task_narrative,
     )
 
 

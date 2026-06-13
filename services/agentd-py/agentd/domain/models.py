@@ -832,6 +832,7 @@ class TaskView(BaseModel):
     resume_of_task_id: str | None = None
     failure_summary: FailureSummary | None = None
     run_summary: RunSummary | None = None
+    task_narrative: TaskNarrative | None = None
 
 
 class PlanFeedbackRequest(BaseModel):
@@ -857,6 +858,7 @@ class TaskResult(BaseModel):
     resume_of_task_id: str | None = None
     failure_summary: FailureSummary | None = None
     run_summary: RunSummary | None = None
+    task_narrative: TaskNarrative | None = None
 
 
 class RejectPatchRequest(BaseModel):

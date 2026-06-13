@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from agentd.domain.models import FailureSummary, RunSummary
+from agentd.domain.models import FailureSummary, RunSummary, TaskNarrative
 
 
 class IntentType(StrEnum):
@@ -75,3 +75,4 @@ class ThreadLiveState(BaseModel):
     # run_summary whenever present. Lets the Error/Review cards render from state on reload.
     failure_summary: FailureSummary | None = None
     run_summary: RunSummary | None = None
+    task_narrative: TaskNarrative | None = None

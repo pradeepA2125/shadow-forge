@@ -113,4 +113,5 @@ def resolve_live_state(
         # surfaces whenever the engine has finalized it (terminal states).
         failure_summary=task.failure_summary if status in ("FAILED", "ABORTED") else None,
         run_summary=task.run_summary,
+        task_narrative=task.task_narrative,
     )
