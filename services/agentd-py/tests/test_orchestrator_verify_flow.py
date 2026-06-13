@@ -111,6 +111,11 @@ async def test_verify_done_true_completes_step(tmp_path: Path) -> None:
     result = await orchestrator.continue_task("task-2", feedback=None)
     assert result.status == TaskStatus.READY_FOR_REVIEW
     assert "hello.py" in result.modified_files
+    # Tier B: run_summary is finalized at READY_FOR_REVIEW so the ReviewCard renders
+    # durable "N of M" on reload (before any accept/discard).
+    assert result.run_summary is not None
+    assert result.run_summary.steps_total == 1
+    assert result.run_summary.steps_completed == 1
 
 
 @pytest.mark.asyncio

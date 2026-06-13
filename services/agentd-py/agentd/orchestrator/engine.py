@@ -1773,6 +1773,13 @@ class AgentOrchestrator:
             self.broadcaster.broadcast(task.task_id, {"type": "done", "payload": {"status": task.status.value}})
             if task.chat_channel_id and self._chat_store is not None:
                 self._write_chat_completion(task)
+            if task.status == TaskStatus.READY_FOR_REVIEW:
+                # Finalize run_summary here too (not just at terminal) so the ReviewCard can
+                # render "got through N of M" durably on reload — the card shows at this
+                # pre-terminal gate, before any accept/discard. NO baseline cleanup here:
+                # the pinned checkpoint must survive for a later Discard (true revert).
+                self._finalize_run_summary(task)
+                await self._store.save(task)
             if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.ABORTED}:
                 # Durable telemetry: finalize run_summary on every engine terminal, and
                 # guarantee a failure_summary on FAILED (the except-handler sites set a rich
