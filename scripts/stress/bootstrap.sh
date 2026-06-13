@@ -13,6 +13,11 @@ USAGE
 }
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Shared indexer-build helpers (indexer_bin_path, ensure_indexer_binary).
+# shellcheck source=scripts/stress/_indexer.sh
+source "$ROOT/scripts/stress/_indexer.sh"
+
 WORKSPACE="$ROOT"
 SNAPSHOT_PATH=""
 SKIP_NPM="0"
@@ -101,14 +106,14 @@ fi
 if [[ "$SKIP_INDEX" != "1" ]]; then
   echo "==> indexer build/index"
   mkdir -p "$(dirname "$SNAPSHOT_PATH")"
-  (
-    cd "$WORKSPACE/services/indexer-rs"
-    cargo build --release
-    ./target/release/ai-editor-indexer index \
-      --workspace "$WORKSPACE" \
-      --snapshot-path "$SNAPSHOT_PATH" \
-      --watch 0
-  )
+  # Build the indexer from the REPO source ($ROOT, not $WORKSPACE — a target
+  # workspace may not contain the Rust source) into the shared cargo target dir,
+  # then index $WORKSPACE with the resolved binary.
+  INDEXER_BIN="$(ensure_indexer_binary "$ROOT/services/indexer-rs")"
+  "$INDEXER_BIN" index \
+    --workspace "$WORKSPACE" \
+    --snapshot-path "$SNAPSHOT_PATH" \
+    --watch 0
 
   if [[ ! -f "$SNAPSHOT_PATH" ]]; then
     echo "Snapshot file not found after indexing: $SNAPSHOT_PATH" >&2

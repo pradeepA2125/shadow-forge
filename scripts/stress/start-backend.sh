@@ -24,6 +24,10 @@ USAGE
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# Shared indexer-build helpers (indexer_bin_path, ensure_indexer_binary).
+# shellcheck source=scripts/stress/_indexer.sh
+source "$ROOT/scripts/stress/_indexer.sh"
+
 # Ensure Homebrew bin dirs are on PATH for subprocesses (ripgrep, etc.).
 # When start-backend.sh is launched from an IDE shell whose PATH was assembled
 # without `brew shellenv`, asyncio.create_subprocess_exec("rg", ...) errors with
@@ -78,6 +82,7 @@ SCOPE_TRIGGER="any"
 SCOPE_REMEMBER="task"
 SCOPE_TIMEOUT_SEC=""
 TURBOQUANT_TIMEOUT_SEC="1200"
+SKIP_INDEXER_BUILD="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -132,6 +137,10 @@ while [[ $# -gt 0 ]]; do
     --turboquant-timeout-sec)
       TURBOQUANT_TIMEOUT_SEC="${2:?missing value for --turboquant-timeout-sec}"
       shift 2
+      ;;
+    --skip-indexer-build)
+      SKIP_INDEXER_BUILD="1"
+      shift
       ;;
     -h|--help)
       usage
@@ -466,8 +475,20 @@ fi
 # per-file resolution), so the memory/warmup cost is paid once, not per task. A language server
 # that fails to start is disabled gracefully and the other languages still resolve. Override the
 # LSP commands/timeouts below via env if your toolchain differs.
-_INDEXER_BIN="$AGENTD_DIR/../indexer-rs/target/release/ai-editor-indexer"
+# Resolve the watcher binary from the SHARED cargo target dir (see _indexer.sh) and
+# build it on demand. Previously this pointed at <this-repo>/services/indexer-rs/target,
+# which is empty in a fresh git worktree — so the watcher (and all LSP-resolved graph
+# edges) silently never started. Now a missing/stale binary is built once into a shared
+# cache (cargo no-ops when warm); pass --skip-indexer-build to bypass.
+_INDEXER_BIN="$(indexer_bin_path)"
 _WATCHER_PID=""
+if [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ ]]; then
+  if [[ "$SKIP_INDEXER_BUILD" == "1" ]]; then
+    echo "==> indexer build skipped (--skip-indexer-build); using $_INDEXER_BIN if present"
+  elif ! ensure_indexer_binary "$ROOT/services/indexer-rs" >/dev/null; then
+    echo "==> indexer: could not ensure binary — watcher will be skipped (graph retrieval off; vector retrieval still works)" >&2
+  fi
+fi
 if [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ && -x "$_INDEXER_BIN" ]]; then
   AI_EDITOR_BACKEND_URL="http://localhost:${PORT}" \
     AI_EDITOR_LSP_ENABLED="${AI_EDITOR_LSP_ENABLED:-true}" \
@@ -482,7 +503,7 @@ if [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ && -x "$_INDEXER_
   _WATCHER_PID=$!
   echo "==> indexer watch started (self-updating index, LSP-resolved edges): pid=$_WATCHER_PID log=$LOG_DIR/indexer-watch.log"
 elif [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ ]]; then
-  echo "==> indexer watch NOT started — binary missing: $_INDEXER_BIN (build: cargo build --release in services/indexer-rs)" >&2
+  echo "==> indexer watch NOT started — binary unavailable at $_INDEXER_BIN (build failed, or --skip-indexer-build with no prebuilt binary). Graph retrieval is disabled; vector retrieval still works." >&2
 fi
 
 # Don't orphan child processes (backend + watcher) on exit/interrupt.
