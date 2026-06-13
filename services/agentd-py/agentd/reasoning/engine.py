@@ -220,6 +220,28 @@ class DefaultReasoningEngine(ReasoningEngine):
         )
         return result if isinstance(result, dict) else {}
 
+    async def summarize_run(
+        self, *, goal: str, outcome: str, run_events: list[dict[str, object]],
+        deviations: list[str], modified_files: list[str],
+    ) -> dict[str, object]:
+        from agentd.reasoning.narrative_prompts import (
+            TASK_NARRATIVE_RESPONSE_SCHEMA,
+            build_narrative_payload,
+            format_narrative_system_prompt,
+        )
+        payload = build_narrative_payload(
+            goal=goal, outcome=outcome, run_events=run_events,
+            deviations=deviations, modified_files=modified_files,
+        )
+        result = await self._transport.generate_json(
+            model=self._model,
+            schema_name="task_narrative",
+            schema=TASK_NARRATIVE_RESPONSE_SCHEMA,
+            system_instructions=format_narrative_system_prompt(),
+            user_payload=payload,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def draft_conventions(self, *, probe: object) -> dict[str, object]:
         from agentd.reasoning.env_prompts import (
             DRAFT_CONVENTIONS_RESPONSE_SCHEMA,

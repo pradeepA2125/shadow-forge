@@ -83,3 +83,16 @@ class ReasoningEngine(Protocol):
         env_prompts.
         """
         ...
+
+    async def summarize_run(
+        self,
+        *,
+        goal: str,
+        outcome: str,
+        run_events: list[dict[str, object]],
+        deviations: list[str],
+        modified_files: list[str],
+    ) -> dict[str, object]:
+        """One structured call synthesizing the run's event log into a task narrative
+        ({"headline": str, "points": list[str]}). Called once per run outcome."""
+        ...

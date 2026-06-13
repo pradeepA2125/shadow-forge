@@ -20,6 +20,7 @@ class ScriptedReasoningEngine:
         patches: list[object],
         tool_step_responses: list[dict[str, object]] | None = None,
         draft_conventions_responses: list[dict[str, object]] | None = None,
+        run_narrative: dict[str, object] | None = None,
     ) -> None:
         self._plan = plan
         self._patches = patches
@@ -29,6 +30,13 @@ class ScriptedReasoningEngine:
         self._draft_conventions_responses: list[dict[str, object]] = list(
             draft_conventions_responses or []
         )
+        self._run_narrative = run_narrative
+
+    async def summarize_run(
+        self, *, goal, outcome, run_events, deviations, modified_files,
+    ) -> dict[str, object]:
+        _ = (run_events, deviations, modified_files)
+        return self._run_narrative or {"headline": f"{outcome}: {goal[:60]}", "points": []}
 
     async def create_plan(
         self,
