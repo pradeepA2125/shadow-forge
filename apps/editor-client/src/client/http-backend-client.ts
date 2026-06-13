@@ -358,6 +358,7 @@ export class HttpBackendClient implements BackendTaskClient {
       plan: raw["plan"] ?? null,
       failureSummary: this.toFailureSummary(raw),
       runSummary: this.toRunSummary(raw),
+      taskNarrative: this.toTaskNarrative(raw),
     });
   }
 
@@ -463,6 +464,17 @@ export class HttpBackendClient implements BackendTaskClient {
     };
   }
 
+  private toTaskNarrative(raw: unknown): unknown | undefined {
+    const value = this.readOptionalUnknown(raw, "taskNarrative", "task_narrative");
+    if (!value || typeof value !== "object") return undefined;
+    const r = value as Record<string, unknown>;
+    return {
+      outcome: r["outcome"],
+      headline: r["headline"],
+      points: r["points"] ?? []
+    };
+  }
+
   private toTaskView(raw: unknown): TaskView {
     return TaskViewSchema.parse({
       taskId: this.readString(raw, "taskId", "task_id"),
@@ -473,7 +485,8 @@ export class HttpBackendClient implements BackendTaskClient {
       planMarkdown: this.readOptionalString(raw, "planMarkdown", "plan_markdown"),
       resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id"),
       failureSummary: this.toFailureSummary(raw),
-      runSummary: this.toRunSummary(raw)
+      runSummary: this.toRunSummary(raw),
+      taskNarrative: this.toTaskNarrative(raw)
     });
   }
 
@@ -494,7 +507,8 @@ export class HttpBackendClient implements BackendTaskClient {
       ),
       resumeOfTaskId: this.readOptionalString(raw, "resumeOfTaskId", "resume_of_task_id"),
       failureSummary: this.toFailureSummary(raw),
-      runSummary: this.toRunSummary(raw)
+      runSummary: this.toRunSummary(raw),
+      taskNarrative: this.toTaskNarrative(raw)
     });
   }
 

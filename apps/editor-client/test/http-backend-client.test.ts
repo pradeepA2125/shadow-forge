@@ -446,6 +446,27 @@ describe("HttpBackendClient", () => {
     expect(live.runSummary?.deviations).toEqual(["1 delta replan(s)"]);
   });
 
+  test("getThreadLiveState maps task_narrative to camelCase", async () => {
+    const client = new HttpBackendClient({
+      baseUrl: "http://localhost:8000",
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify({
+            active_task_id: "task-1",
+            status: "READY_FOR_REVIEW",
+            pending_gate: null,
+            plan: null,
+            task_narrative: { outcome: "succeeded", headline: "Added refresh tokens", points: ["edited auth.py", "added test"] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        ),
+    });
+    const live = await client.getThreadLiveState("chat-abc123");
+    expect(live.taskNarrative?.outcome).toBe("succeeded");
+    expect(live.taskNarrative?.headline).toBe("Added refresh tokens");
+    expect(live.taskNarrative?.points).toEqual(["edited auth.py", "added test"]);
+  });
+
   test("getTaskResult leaves summaries undefined when the wire omits them", async () => {
     const client = new HttpBackendClient({
       baseUrl: "http://localhost:8000",

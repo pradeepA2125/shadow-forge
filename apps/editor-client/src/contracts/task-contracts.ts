@@ -47,6 +47,14 @@ export const RunSummarySchema = z.object({
 });
 export type RunSummary = z.infer<typeof RunSummarySchema>;
 
+// LLM-authored narrative of the run (headline + points), for the Review/Error cards.
+export const TaskNarrativeSchema = z.object({
+  outcome: z.enum(["succeeded", "failed", "aborted"]),
+  headline: z.string(),
+  points: z.array(z.string()).default([])
+});
+export type TaskNarrative = z.infer<typeof TaskNarrativeSchema>;
+
 export const TaskViewSchema = z.object({
   taskId: z.string().min(1),
   status: TaskStatusSchema,
@@ -56,7 +64,8 @@ export const TaskViewSchema = z.object({
   planMarkdown: z.string().optional(),
   resumeOfTaskId: z.string().optional(),
   failureSummary: FailureSummarySchema.nullable().optional(),
-  runSummary: RunSummarySchema.nullable().optional()
+  runSummary: RunSummarySchema.nullable().optional(),
+  taskNarrative: TaskNarrativeSchema.nullable().optional()
 });
 
 export const TaskResultSchema = z.object({
@@ -71,7 +80,8 @@ export const TaskResultSchema = z.object({
   shadowWorkspacePath: z.string().nullable().optional(),
   resumeOfTaskId: z.string().optional(),
   failureSummary: FailureSummarySchema.nullable().optional(),
-  runSummary: RunSummarySchema.nullable().optional()
+  runSummary: RunSummarySchema.nullable().optional(),
+  taskNarrative: TaskNarrativeSchema.nullable().optional()
 });
 
 export const ResumeTaskRequestSchema = z.object({
@@ -247,6 +257,7 @@ export const ThreadLiveStateSchema = z.object({
   // Durable lifecycle telemetry (Tier B): drives the Error/Review cards from poll state.
   failureSummary: FailureSummarySchema.nullable().optional(),
   runSummary: RunSummarySchema.nullable().optional(),
+  taskNarrative: TaskNarrativeSchema.nullable().optional(),
 });
 export type ThreadLiveState = z.infer<typeof ThreadLiveStateSchema>;
 
