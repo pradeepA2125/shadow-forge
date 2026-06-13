@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -103,14 +104,35 @@ def _make_executable(path: Path, content: str = "#!/bin/sh\nexit 0\n") -> Path:
 
 
 def test_detect_default_commands_finds_venv_pytest(tmp_path: Path) -> None:
-    """When pytest is in <workspace>/.venv/bin, the validator picks the absolute path."""
+    """When pytest is in <workspace>/.venv/bin, the validator runs `<venv python> -m
+    pytest` (not the bare console script) so cwd lands on sys.path — matching the agent."""
     (tmp_path / "x.py").write_text("x = 1\n")
-    pytest_bin = _make_executable(tmp_path / ".venv" / "bin" / "pytest")
+    _make_executable(tmp_path / ".venv" / "bin" / "pytest")
+    venv_python = _make_executable(tmp_path / ".venv" / "bin" / "python")
     validator = CommandValidator(configured_commands=None)
     cmds = validator._detect_default_commands(tmp_path)
     pytest_cmd = next((c for c in cmds if c.name == "pytest"), None)
     assert pytest_cmd is not None, [c.name for c in cmds]
-    assert str(pytest_bin) in pytest_cmd.command
+    assert pytest_cmd.command == f"{shlex.quote(str(venv_python))} -m pytest"
+
+
+@pytest.mark.asyncio
+async def test_default_pytest_validation_resolves_root_level_imports(tmp_path: Path) -> None:
+    """A test importing a top-level package (`from src.… import …`) must pass full
+    validation. The execution agent verifies each step with `python -m pytest` (which
+    puts cwd on sys.path[0]); if the validator runs the bare `pytest` console script
+    (which does NOT add cwd) the same test fails at collection, tripping a spurious
+    REPAIRING loop. The default pytest command must match the agent's invocation."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "__init__.py").write_text("")
+    (tmp_path / "src" / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_calc.py").write_text(
+        "from src.calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    )
+    validator = CommandValidator(configured_commands=None)
+    result = await validator.run(str(tmp_path))
+    assert result.success, [d.message for d in result.diagnostics]
 
 
 def test_detect_default_commands_finds_node_modules_vitest_without_scripts(tmp_path: Path) -> None:

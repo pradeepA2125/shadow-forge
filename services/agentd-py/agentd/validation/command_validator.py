@@ -418,11 +418,20 @@ class CommandValidator:
                 )
             pytest_bin = self._resolve_bin(workspace_path, "pytest")
             if pytest_bin:
+                # Invoke `python -m pytest`, not the bare console script: `-m` puts cwd
+                # (the shadow root) on sys.path[0], so root-level imports (`from src.…`)
+                # resolve the same way the execution agent's per-step `python -m pytest`
+                # verify does. The bare pytest entry point does NOT add cwd, so a test
+                # that passes every step verify would fail full validation at collection,
+                # tripping a spurious REPAIRING loop. Prefer the python that owns the
+                # resolved pytest (same venv → its installed deps); fall back to ours.
+                sibling_python = Path(pytest_bin).with_name("python")
+                python_exec = str(sibling_python) if sibling_python.exists() else sys.executable
                 commands.append(
                     ValidationCommand(
                         stage="test",
                         name="pytest",
-                        command=shlex.quote(pytest_bin),
+                        command=f"{shlex.quote(python_exec)} -m pytest",
                     )
                 )
 
