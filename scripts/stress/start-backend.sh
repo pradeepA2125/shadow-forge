@@ -495,6 +495,24 @@ if [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ ]]; then
   fi
 fi
 if [[ "${AI_EDITOR_SEMANTIC_RETRIEVAL:-}" =~ ^(1|true|yes|on)$ && -x "$_INDEXER_BIN" ]]; then
+  # Single-writer guard: reap any existing indexer watcher on THIS snapshot before launching ours.
+  # Two watchers racing the same snapshot file clobber each other — the loser overwrites the
+  # winner's LSP-resolved Calls/Inherits edges back to unresolved `external:` placeholders, which
+  # silently degrades graph retrieval and the query_graph tool. (Found 2026-06-14: a stale watcher
+  # from a prior launch kept overwriting the fresh LSP-resolved snapshot; incremental per-file
+  # re-resolution never rebuilds the full graph, so it stayed degraded.)
+  # NOTE: the `|| true` is load-bearing under `set -euo pipefail`. With no stale watcher
+  # (the normal clean-env case) `grep` matches nothing → exits 1 → pipefail fails the
+  # pipeline → set -e aborts the script BEFORE the watcher launches, leaving the backend
+  # orphaned and graph retrieval off. Tolerate the empty match explicitly.
+  _STALE_WATCHERS="$(pgrep -af 'ai-editor-indexer index' 2>/dev/null \
+    | grep -F -- "--snapshot-path $SNAPSHOT_PATH" | awk '{print $1}' || true)"
+  if [[ -n "$_STALE_WATCHERS" ]]; then
+    echo "==> reaping stale indexer watcher(s) on this snapshot: $(echo "$_STALE_WATCHERS" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    kill $_STALE_WATCHERS 2>/dev/null || true
+    sleep 1
+  fi
   AI_EDITOR_BACKEND_URL="http://localhost:${PORT}" \
     AI_EDITOR_LSP_ENABLED="${AI_EDITOR_LSP_ENABLED:-true}" \
     AI_EDITOR_LSP_PY_CMD="${AI_EDITOR_LSP_PY_CMD:-pyright-langserver --stdio}" \
