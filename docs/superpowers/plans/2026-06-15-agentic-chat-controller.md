@@ -10,6 +10,41 @@
 
 ---
 
+## ⏸️ RESUME / STATUS (handoff 2026-06-15) — read this first
+
+**Execution mode:** inline TDD (executing-plans skill), per task: failing test → run red → impl → run green → `ruff check --fix` → commit. Code review at the F and H2 seams (user asked).
+
+**Where I am — DONE & committed (worktree `.worktrees/feat-agentic-chat-controller`, branch `feat/agentic-chat-controller` off `main`@7be81ce; ~15 commits, all TDD-green, ruff-clean on new code):**
+- ✅ **A** ToolSource seam (`tools/sources.py`: `ToolSource`, `BuiltinToolSource`, `AggregatingToolRegistry`)
+- ✅ **B** `chat/controller_prompts.py` (flat schema + phase gating + builders), `reasoning/react_common.py`, `create_controller_step` (Protocol+impl+scripted)
+- ✅ **C** `chat/controller_phase.py` (`ControllerPhaseSM` DECIDE→EDIT)
+- ✅ **D0** `patch/diffing.py`+`patch/inline_apply.py`+`workspace/promote.py` (engine `_compute_diff_entries`/`_partial_promote` delegate; `_cap_unified_diff` re-exported) · ✅ **D1** `chat/edit_session.py` (`TurnEditSession`) — **code-reviewed clean**
+
+**NEXT:** **Phase E** (`chat/controller_loop.py` `ControllerLoop`, E1–E4, mirrors `PlanningLoop`) → **F** (F0 thread-gate `/live` plumbing + ChatController + gates/routes; **review**) → **G/H** (flag + invariants + full suite; **review at H2**) → **I** (frontend; **needs `npm install` at repo root first**) → **J** (live smoke — interactive dev-host, needs the human) → **K** (delete legacy explore→classify→route).
+
+**Run/resume commands:** `cd services/agentd-py && source .venv/bin/activate` (venv already built with `pip install -e .[dev]`). Test: `python -m pytest tests/<file> -q`. Full suite at H2.
+
+**Baseline gotchas (so you don't chase ghosts):**
+- **mypy:** ~110 PRE-EXISTING errors across 19 provider files; only guard NEW findings — your new files must be mypy-clean.
+- **ruff:** E501 (line-length 100) enforced; `engine.py`/`contracts.py` carry PRE-EXISTING E501 + an `InlineChangeResult` F401 — fix only NEW findings in your diff. Per-file-ignores: `tool_prompts.py`, `prompt_builder.py`, `tools/registry.py`, `planning/prompts.py`.
+- **Pyright "import could not be resolved"** in the IDE = IDE not pointed at the worktree venv — ignore; pytest runs fine.
+- **6 pre-existing test failures:** `test_graph_walker_reachability` (`@requires_live_snapshot`). Everything else green on `main`.
+
+**BROAD/ULTRA CONTEXT — verified anchors (traced from source this session; the expensive part — DO NOT re-derive, just trust/spot-check):**
+- **Patch apply:** there is NO `PatchEngine.apply()`. Use `patch/inline_apply.py::apply_ops(engine, base, ops, allowed_files)` → wraps `PatchDocumentV2({candidates:[{candidate_id, patch_ops}]})` → `apply_patch_candidate(base, candidate, allowed_files=)` → `.touched_files`. (`loop._apply_patch_inline` left intact — different error-return contract.)
+- **Promote:** `workspace/promote.py::promote_files(shadow, real, touched)` (shadow→real copy). **Diff:** `patch/diffing.py::compute_diff_entries(real, shadow, touched, key)` + `cap_unified_diff`.
+- **ScriptedReasoningEngine(plan, patches, *, controller_step_responses=[...])** — positional `plan, patches`.
+- **create_task_from_chat(*, thread_id, goal, workspace_path, explore_context, store, step_review_auto_accept=None)** — keyword-only.
+- **ChatThread.thread_id** (NOT `.id`); **ChatMessage.role ∈ {"user","agent"}**; `store.create_thread(workspace_path, title)`; `store.append_message(thread_id, ChatMessage)`; `update_title`.
+- **Reasoning impl:** `ReasoningEngineImpl` has `self._transport`, `self._model`; `generate_json(model, schema_name, schema, system_instructions, user_payload, on_thinking)`. Orchestrator attrs: `self._patch_engine`, `self._workspace_manager`, `self._broadcaster`/`self.broadcaster`.
+- **Mirror PlanningLoop** (`planning/loop.py`): `_assistant_turn` (strip `thought`), dedup guard (`_seen_calls` w/ canonical sorted-args key), `_consecutive_malformed` correction (cap 3), `seed_history` replay; two-builder split (`format_*_system_prompt` = prompt+tools vs `build_*_step_payload` = payload, varying fields LAST); **flat `type`-enum schema, NOT oneOf** (Gemini deadlocks) — gate per phase via deep-copy + enum-trim.
+- **Gate model (Class-A, F0/F2/F3):** `resolve_live_state` (chat/live_state.py) derives gates from the active **task** status→`execution_state.pending_*` → `PendingGate(kind∈command/step/scope/validation)`. **Controller has NO task** → add `ChatThread.pending_controller_gate` + `PendingGate.kind += mode/edit` + a `resolve_thread_live` overlay used by `get_thread_live`. `propose_mode` = Class-A (set thread gate + `chat_done`; `/mode-decision` clears + dispatches via a NEW streamed turn); per-edit gate = **hold the SSE stream open** + in-memory future (mirror `_pause_for_step_review` + `_pending_step_decisions`), set the `edit` thread-gate while awaiting.
+- **Chat route:** `post_chat_message` (routes.py ~1113), `channel_id=f"chat:{thread_id}"`, SSE held until `chat_done` (15s ping keepalive), agent task started inside the stream generator. Step-decision route pattern at routes.py:729 (`future.set_result`).
+- **Frontend:** gates render in `LiveSlot.tsx::GateDispatch` by `kind` (add `mode`/`edit` cases → `ModeGate`/`EditGate`). `LiveGateView.kind` is declared in **BOTH** `vscode-extension/src/controller.ts:85` AND `webview-ui/src/types.ts:56` — extend both. Decision posts handled in **`chat-panel.ts::registerHandlers`** (`m["type"]` if-else, `stepDecision` at :134) → add `modeDecision`/`editDecision`. **`controller.ts:1456`** `renderLiveGate` is gated on `live.activeTaskId` (null on controller turns) → relax to render on `pendingGate` with `taskId: live.activeTaskId ?? threadId`. **`Icon` has NO `"lightbulb"`** (valid: …`diff`,`bolt`,`spark`,`warn`,`check`,`x`…). `HttpBackendClient` ctor = `{ baseUrl, fetchFn? }` (options object). `StreamEvent` is a plain TS discriminated union (not Zod). `CardShell` props: `icon`(req)/`title`/`subtitle?`/`borderColor?`/`headerTint?`; `BtnPrimary` has `flex?`, `BtnGhost` does not. Webview vitest: jsdom + `src/test/setup.ts`.
+- **Spec:** `docs/superpowers/specs/2026-06-15-agentic-chat-controller-design.md` (esp. §4 schema, §6 seed+delta cache, §12 mirror/DRY/patterns). Memory: `project_agentic_chat_controller.md`, `feedback_trace_before_asserting.md`.
+
+---
+
 ## Reference reading (do this before Phase A)
 
 Read these to internalize the mirror target. Do NOT skip — the loop tasks say "mirror X" and assume you've read X:
