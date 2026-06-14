@@ -387,8 +387,12 @@ def build_controller_step_payload(
     iteration = len(history) // 2
     if history:
         payload["conversation_history"] = history
+    _phase_hint = ("You are in EDIT mode: emit type='edit' (patch_ops) to make changes, "
+                   "then type='submit_changes' when done. Do NOT propose_mode again."
+                   if phase == "EDIT" else
+                   "Explore with tools, then answer, clarify, or propose_mode.")
     payload["instruction"] = (
-        f"Phase={phase}. You have used {iteration} of {max_iters} steps. "
+        f"Phase={phase}. {_phase_hint} You have used {iteration} of {max_iters} steps. "
         "Choose ONE action per the schema."
     )
     payload["budget_status"] = f"{iteration}/{max_iters} steps used"  # LAST (varies)
@@ -1571,6 +1575,8 @@ In `ChatController`, provide the cb + route resolution:
 ```
 Wire `_run_loop` to pass `edit_decision_cb=lambda: self._edit_decision_cb(thread_id, channel_id)` when `step_review is True`. Add a `POST /chat/threads/{id}/edit-decision {decision, reason?}` route (mirror `/step-decision` 729-761) that calls `_chat_agent.resolve_edit(thread_id, request)` and returns `{ok: True}` (the held-open message stream surfaces the continuation).
 
+**Hardening (client-disconnect):** if the SSE client drops while `_edit_decision_cb` awaits, the future never resolves and the turn hangs. Wrap the await with `AI_EDITOR_CHAT_EDIT_DECISION_TIMEOUT_SEC` (default `0` = wait forever, matching `AI_EDITOR_COMMAND_DECISION_TIMEOUT_SEC`); on timeout return `{"decision": "reject", "reason": "decision timed out"}` so the loop unwinds cleanly. Add a test that a timeout rejects the edit.
+
 - [ ] **Step 4: Run test to verify it passes** — `pytest tests/test_edit_decision.py -v` → PASS.
 
 - [ ] **Step 5: Commit**
@@ -1686,6 +1692,7 @@ git commit -m "feat(chat): AI_EDITOR_CHAT_CONTROLLER flag selects controller vs 
   2. never-auto-mutate: from DECIDE the schema forbids `edit` (assert `"edit" not in controller_response_schema(phase="DECIDE")["properties"]["type"]["enum"]`).
   3. reads-hit-real: assert `ControllerLoop`/`BuiltinToolSource` never call `use_shadow_for_reads` in the chat path (grep-style: the controller code does not invoke it).
   4. no-batching: two `edit` actions each promote before the next is processed (sequence assertion via a spy edit session).
+  5. `shadow==real` across reject rounds: edit file A (reject) → edit file B (accept) → assert A unchanged on real, B promoted, and the shadow holds both A (==real) and B (==real) — pins the invariant when a rejected round touched a *different* file than the next.
 
 - [ ] **Step 2: Run to verify they fail where unimplemented**, fix any gaps inline.
 
@@ -1715,29 +1722,152 @@ git commit -m "chore(chat): lint/type clean for controller"
 
 > Mirror the existing chat SSE/card plumbing. Each task is TDD with vitest.
 
-### Task I1: Contracts — new SSE events + mode-choice card schema
+### Task I1: Contracts — add `mode_choice` to the `StreamEvent` union
+
+> **Verified:** `StreamEvent` is a **plain TS discriminated union** (not Zod) at `task-contracts.ts:161-197`. The new chat handler reuses `diff_ready` for per-edit diffs; only `mode_choice` is new. `mode-decision`/`edit-decision` are *outbound* POSTs (handled by the extension controller), not `StreamEvent` members.
 
 **Files:**
-- Modify: `apps/editor-client/src/contracts/task-contracts.ts`
-- Test: `apps/editor-client/test/...`
+- Modify: `apps/editor-client/src/contracts/task-contracts.ts` (+ `BackendTaskClient` if a typed method is added)
+- Test: `apps/editor-client/test/stream-events.test.ts`
 
-- [ ] **Step 1: Write the failing vitest** asserting the `StreamEvent` union parses a `mode_choice` event (`{type:"mode_choice", payload:{plan_sketch, recommended, reason, options}}`) and an `edit_decision`-resolved diff card.
-- [ ] **Step 2: Run** `npm run -w @ai-editor/editor-client test` → FAIL.
-- [ ] **Step 3: Add** the Zod members + types.
-- [ ] **Step 4: Run** → PASS; then `npm run -w @ai-editor/editor-client build` (extension types off its dist).
-- [ ] **Step 5: Commit** `git commit -m "feat(contracts): mode_choice + edit-decision chat events"`.
+- [ ] **Step 1: Write the failing test**
 
-### Task I2: Webview — mode-choice card + per-edit diff card + decision posts
+```typescript
+// apps/editor-client/test/stream-events.test.ts
+import { describe, it, expect } from "vitest";
+import type { StreamEvent } from "../src/contracts/task-contracts";
+
+describe("mode_choice StreamEvent", () => {
+  it("type-checks the new member", () => {
+    const ev: StreamEvent = { type: "mode_choice", payload: {
+      plan_sketch: "add a decorator", recommended: "create_task", reason: "big",
+      options: [{ mode: "create_task", label: "Plan it", description: "..." }],
+    }};
+    expect(ev.type).toBe("mode_choice");
+    if (ev.type === "mode_choice") expect(ev.payload.options[0].mode).toBe("create_task");
+  });
+});
+```
+
+- [ ] **Step 2: Run** `npm run -w @ai-editor/editor-client test stream-events` → FAIL (member not in union / tsc error).
+
+- [ ] **Step 3: Add the union member** (before the trailing `chat_breadcrumb` line at `task-contracts.ts:197`):
+
+```typescript
+  | { type: "mode_choice"; payload: { plan_sketch: string; recommended: string; reason: string; options: Array<{ mode: string; label?: string; description?: string }> } }
+```
+
+Optionally add typed client methods to `BackendTaskClient`:
+```typescript
+  postModeDecision(threadId: string, mode: string): AsyncIterable<StreamEvent>;  // streamed (edit/create_task emit live)
+  postEditDecision(threadId: string, decision: "accept" | "reject", reason?: string): Promise<void>;
+```
+and implement them in `HttpBackendClient` (snake_case body `{mode}` / `{decision, reason}`) mirroring `sendChatMessage` (SSE) and a plain POST respectively.
+
+- [ ] **Step 4: Run** `npm run -w @ai-editor/editor-client test stream-events` → PASS; then `npm run -w @ai-editor/editor-client build` (the extension types off its compiled `dist`).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add apps/editor-client/src/contracts/task-contracts.ts apps/editor-client/src/client/http-backend-client.ts apps/editor-client/test/stream-events.test.ts
+git commit -m "feat(contracts): mode_choice StreamEvent + mode/edit decision client methods"
+```
+
+### Task I2: Webview — `ModeChoiceCard` + per-edit gate + decision posts
 
 **Files:**
-- Modify: webview chat components + `vscode-extension/src/controller.ts`
-- Test: webview vitest
+- Create: `apps/vscode-extension/webview-ui/src/components/messages/gates/ModeChoiceCard.tsx`
+- Modify: the message renderer (where `step_review_requested`→`StepGate` is dispatched) to route `mode_choice`→`ModeChoiceCard`; `vscode-extension/src/controller.ts` (+ `extension.ts` message handler) to post mode/edit decisions.
+- Test: `apps/vscode-extension/webview-ui/src/test/ModeChoiceCard.test.tsx`
 
-- [ ] **Step 1: Write failing vitest** — mode-choice card renders the `plan_sketch` + recommended + options and posts `/mode-decision` on click; renders a **"Discuss / refine"** affordance (or relies on the composer) so a follow-up message resumes the turn; per-edit card posts `/edit-decision` accept/reject(+reason).
-- [ ] **Step 2: Run** webview tests → FAIL.
-- [ ] **Step 3: Implement** card components + controller methods (mirror existing StepGate/DiffCard).
-- [ ] **Step 4: Run** webview tests + `npm run build` → PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(webview): mode-choice + per-edit decision cards"`.
+- [ ] **Step 1: Write the failing test**
+
+```tsx
+// apps/vscode-extension/webview-ui/src/test/ModeChoiceCard.test.tsx
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { ModeChoiceCard } from "../components/messages/gates/ModeChoiceCard";
+import { vscode } from "../vscodeApi";
+
+vi.mock("../vscodeApi", () => ({ vscode: { postMessage: vi.fn() } }));
+beforeEach(() => vi.clearAllMocks());
+
+describe("ModeChoiceCard", () => {
+  const payload = { plan_sketch: "add a decorator and apply to 3 routes",
+    recommended: "create_task", reason: "big",
+    options: [{ mode: "create_task", label: "Plan it", description: "d1" },
+              { mode: "edit", label: "Edit inline", description: "d2" }] };
+
+  it("renders the sketch + options and posts modeDecision on click", () => {
+    render(<ModeChoiceCard threadId="th1" payload={payload} />);
+    expect(screen.getByText(/add a decorator/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Edit inline"));
+    expect(vscode.postMessage).toHaveBeenCalledWith({ type: "modeDecision", threadId: "th1", mode: "edit" });
+  });
+});
+```
+
+- [ ] **Step 2: Run** `npm run -w @ai-editor/vscode-extension test ModeChoiceCard` → FAIL (component missing).
+
+- [ ] **Step 3: Write the component** (mirrors `StepGate.tsx`):
+
+```tsx
+// apps/vscode-extension/webview-ui/src/components/messages/gates/ModeChoiceCard.tsx
+import { useState } from "react";
+import { vscode } from "../../../vscodeApi";
+import { CardShell } from "../../shared/CardShell";
+import { BtnPrimary, BtnGhost } from "../../shared/buttons";
+
+interface Option { mode: string; label?: string; description?: string }
+interface Props { threadId: string; payload: Record<string, unknown> }
+
+export function ModeChoiceCard({ threadId, payload }: Props) {
+  const sketch = String(payload.plan_sketch ?? "");
+  const recommended = String(payload.recommended ?? "");
+  const options = (Array.isArray(payload.options) ? payload.options : []) as Option[];
+  const [picked, setPicked] = useState<string | null>(null);
+
+  function pick(mode: string) {
+    if (picked !== null) return;          // one-shot
+    setPicked(mode);
+    vscode.postMessage({ type: "modeDecision", threadId, mode });
+  }
+
+  return (
+    <CardShell icon="lightbulb" title="How should I proceed?" subtitle={recommended ? `recommended: ${recommended}` : undefined}
+               borderColor="var(--accent-brd)" headerTint="linear-gradient(180deg, var(--accent-bg), transparent)">
+      {sketch && <div className="px-2.5 py-2 text-[12px] text-text-1 whitespace-pre-wrap border-t border-border">{sketch}</div>}
+      <div className="flex flex-col gap-1.5 px-2.5 py-2 border-t border-border">
+        {picked === null ? options.map((o) => {
+          const Btn = o.mode === recommended ? BtnPrimary : BtnGhost;
+          return (
+            <Btn key={o.mode} onClick={() => pick(o.mode)}>
+              <span className="font-medium">{o.label ?? o.mode}</span>
+              {o.description && <span className="ml-1 text-[11px] text-text-2">— {o.description}</span>}
+            </Btn>
+          );
+        }) : (
+          <span className="text-[11px] text-text-2">Chose: {picked} — or type a message to discuss further.</span>
+        )}
+      </div>
+    </CardShell>
+  );
+}
+```
+
+- [ ] **Step 4: Wire it up**
+  - In the message renderer, add `case "mode_choice": return <ModeChoiceCard threadId={threadId} payload={ev.payload} />` (next to the `step_review_requested`/`StepGate` case). For the per-edit gate, reuse the existing `diff_ready`/`StepGate`-style card but have its Accept/Discard post `editDecision` (`vscode.postMessage({type:"editDecision", threadId, decision, reason})`).
+  - In `vscode-extension/src/extension.ts` message handler, map `modeDecision`→`controller.postModeDecision(threadId, mode)` (consumes the streamed SSE into the thread) and `editDecision`→`controller.postEditDecision(threadId, decision, reason)`.
+  - In `controller.ts`, add `postModeDecision`/`postEditDecision` calling the `BackendTaskClient` methods from I1; `postModeDecision` streams events into the same thread-render path as `sendChatMessage`.
+  - Per the "discuss" path: no special UI needed — typing a normal message already calls `sendChatMessage`, which resumes (F1/F4). The card's post-pick hint just tells the user that.
+
+- [ ] **Step 5: Run + commit**
+
+```bash
+npm run -w @ai-editor/vscode-extension test ModeChoiceCard && npm run build
+git add apps/vscode-extension/webview-ui/src apps/vscode-extension/src/controller.ts apps/vscode-extension/src/extension.ts
+git commit -m "feat(webview): ModeChoiceCard + per-edit gate decision posts"
+```
 
 ---
 
@@ -1769,8 +1899,18 @@ git commit -m "chore(chat): lint/type clean for controller"
 
 ## Self-Review (completed by author)
 
-**Spec coverage:** §3 architecture → Phases E/F; §4 action union → B1/E1–E3; §5 phase SM + ACID edit → C1/D1/E3; §6 cache payload → B2 + H1; §7 ToolSource seam → A1/A2; §8 migration → G1/K1; §9 invariants → H1; §12 mirror/DRY/patterns → B3 (shared primitives), C1 (State), A2 (Composite), E1 (mirror loop). Deferred subsystems (#2–#6) intentionally absent.
+**Spec coverage:** §3 architecture → Phases E/F; §4 action union → B1/E1–E3; §5 phase SM + ACID edit → C1/D0/D1/E3; §6 cache payload → B2 + H1; §7 ToolSource seam → A1/A2; §8 migration → G1/K1; §9 invariants → H1; §12 mirror/DRY/patterns → B3 (shared primitives), C1 (State), A2 (Composite), D0 (extracted patch/promote/diff), E1 (mirror loop). Deferred subsystems (#2–#6) intentionally absent.
 
-**Placeholder scan:** Phases A–E + G + H1 carry full code. Phases F2–F4, I, J, K describe steps with concrete signatures/routes/assertions but compress repeated boilerplate (gate plumbing mirrors the documented step/command-gate pattern) — when executing these, copy the exact shapes from `_pending_step_decisions` / `/step-decision`. This is a deliberate "mirror the existing pattern" instruction, not an under-specification.
+**Placeholder scan:** Phases A–I now carry **full literal code** (constructor, gate plumbing, routes, components) verified against source — no "mirror the pattern" stubs remain except where a step legitimately says "copy the exact shape from `_pending_step_decisions`/`/step-decision`" for the route boilerplate (which is shown). Phases J (live smoke) and K (deletion) are checklists by nature, not code.
 
-**Type consistency:** `ToolSource`/`AggregatingToolRegistry`/`BuiltinToolSource` (A), `controller_response_schema(phase=)`/`_PHASE_TYPES` (B/C), `ControllerOutcome`/`ControllerLoop.run` (E), `TurnEditSession.apply/accept/reject/close` (D) are consistent across tasks.
+**Anchor verification (2026-06-15):** all assumed APIs traced to source and corrected — `apply_patch_candidate`/`PatchDocumentV2` (not `PatchEngine.apply`), `_partial_promote`→`promote_files` (no `promote_files` on the manager), `ChatThread.thread_id`/role `"agent"`, `ScriptedReasoningEngine(plan, patches, *_responses)`, `create_task_from_chat(*, …)` keyword-only, `post_chat_message` SSE shape. D0 extracts `apply_ops`/`compute_diff_entries`/`promote_files` as the single shared implementation.
+
+**Type consistency:** `ToolSource`/`AggregatingToolRegistry`/`BuiltinToolSource` (A); `controller_response_schema(phase=)`/`_PHASE_TYPES` (B/C); `ControllerOutcome`/`ControllerLoop.run(…, auto_accept_edits, edit_decision_cb, retrieval_delta_cb)` (E/F3/F4); `TurnEditSession.apply/accept/reject/close` (D); `ChatController._histories`/`_pending_mode`/`_pending_edit`/`resolve_mode`/`resolve_edit` (F1–F4); `mode_choice` event + `ModeChoiceCard` (I) — consistent across tasks.
+
+**Failure-path dry-run (review pass):**
+1. **Shadow seeding for new files mid-turn** — `TurnEditSession._ensure_shadow` copies a newly-touched existing file into the lightweight shadow on second+ edits (else `apply_ops` would patch a missing file). Created-from-scratch files have no real source → `CreateFileOp` handles them. ✓ (covered by D1's multi-edit + E3's two-edit tests).
+2. **`shadow==real` after reject across rounds** — reject restores touched files from real; next edit re-seeds. The invariant test (H1 #4) must include a reject-then-edit-different-file case. **Added risk note** → H1 test 4 expanded below.
+3. **propose_mode → edit dispatch loses phase** — `resolve_mode("edit")` calls `_run_loop(phase="EDIT")`, which `enter_edit_mode()`s a *fresh* SM seeded with prior history; the agent must re-emit `edit` (it can, EDIT phase allows it). If the agent instead re-emits `propose_mode` it's blocked by the EDIT enum → malformed-correction loop. **Mitigation:** the EDIT-phase instruction explicitly says "you are now in edit mode; emit edit/submit_changes." (add to `build_controller_step_payload` instruction text).
+4. **Held-stream edit gate vs client disconnect** — if the SSE client drops while `_pending_edit` awaits, the future never resolves → the turn hangs. Mirror the task gate's behavior: add an `AI_EDITOR_CHAT_EDIT_DECISION_TIMEOUT_SEC` (default 0 = wait) and on timeout default to reject. **Added to F3 as a hardening step.**
+5. **`create_task_from_chat` explore_context empty** — controller passes `explore_context=[]`; the planner re-explores from scratch (acceptable, the controller's exploration wasn't a task). Optionally pass the controller's tool-result history as `initial_explore_context`. Noted, not required for v1.
+6. **Retrieval seed staleness across a long session** — seed is frozen at session start; deltas + live tools cover freshness (spec §6). Acceptable; compaction is the future module's job.
