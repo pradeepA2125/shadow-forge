@@ -7,22 +7,37 @@ edit/submit_changes are added in E2/E3.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from agentd.reasoning.react_common import MALFORMED_CORRECTION, assistant_turn, dedup_key
+
+if TYPE_CHECKING:
+    from agentd.chat.controller_phase import ControllerPhaseSM
+    from agentd.chat.edit_session import TurnEditSession
+    from agentd.orchestrator.broadcaster import EventBroadcaster
+    from agentd.reasoning.contracts import ReasoningEngine
+    from agentd.tools.sources import AggregatingToolRegistry
 
 
 @dataclass
 class ControllerOutcome:
     kind: str  # "answer" | "clarify" | "propose_mode" | "submit_changes"
     text: str = ""
-    payload: dict | None = None
-    history: list | None = None
+    payload: dict[str, object] | None = None
+    history: list[dict[str, object]] | None = None
 
 
 class ControllerLoop:
     def __init__(
-        self, reasoning, registry, broadcaster, *, channel_id, phase_sm, edit_session=None
-    ):
+        self,
+        reasoning: ReasoningEngine,
+        registry: AggregatingToolRegistry,
+        broadcaster: EventBroadcaster,
+        *,
+        channel_id: str,
+        phase_sm: ControllerPhaseSM,
+        edit_session: TurnEditSession | None = None,
+    ) -> None:
         self._reasoning = reasoning
         self._registry = registry
         self._broadcaster = broadcaster
@@ -30,7 +45,14 @@ class ControllerLoop:
         self._sm = phase_sm
         self._edit = edit_session
 
-    async def run(self, plan_context, *, max_iters=32, seed_history=None):
+    async def run(
+        self,
+        plan_context: dict[str, object],
+        *,
+        max_iters: int = 32,
+        seed_history: list[dict[str, object]] | None = None,
+        auto_accept_edits: bool = False,
+    ) -> ControllerOutcome:
         tool_defs = [d.model_dump() for d in self._registry.definitions()]
         history = [dict(m) for m in seed_history] if seed_history else []
         seen: dict[str, int] = {}
@@ -54,7 +76,8 @@ class ControllerLoop:
                     return ControllerOutcome(
                         kind="answer", text="(step budget exhausted)", history=history)
                 tool = str(resp.get("tool", ""))
-                args = resp.get("args") or {}
+                raw_args = resp.get("args")
+                args: dict[str, object] = raw_args if isinstance(raw_args, dict) else {}
                 key = dedup_key(tool, args)
                 if key in seen:
                     history.append({"role": "assistant", "content": "{}"})
@@ -80,6 +103,30 @@ class ControllerLoop:
                     "reason": resp.get("reason", ""),
                     "options": resp.get("options", []),
                 }, history=history)
-            # edit / submit_changes handled in E3
+            if atype == "edit":
+                # EDIT phase is only reachable with an edit_session (phase SM gate).
+                assert self._edit is not None
+                raw_ops = resp.get("patch_ops")
+                ops: list[dict[str, object]] = raw_ops if isinstance(raw_ops, list) else []
+                diff = await self._edit.apply(ops)
+                self._broadcaster.broadcast(self._channel_id, {
+                    "type": "diff_ready",
+                    "payload": {"diff_entries": [d.path for d in diff]},
+                })
+                # Per-edit review gate wired in Phase F; for now always accept
+                # (auto_accept_edits selects the policy there). Instant-promote.
+                await self._edit.accept()
+                history.append(assistant_turn(resp))
+                history.append({
+                    "role": "tool_result", "tool": "edit",
+                    "content": f"applied+promoted: {[d.path for d in diff]}",
+                })
+                continue
+            if atype == "submit_changes":
+                assert self._edit is not None
+                await self._edit.close()
+                history.append(assistant_turn(resp))
+                return ControllerOutcome(
+                    kind="submit_changes", text=str(resp.get("summary", "")), history=history)
             raise NotImplementedError(atype)
         return ControllerOutcome(kind="answer", text="(loop ended)", history=history)
