@@ -68,6 +68,18 @@ class ControllerLoop:
                 history.append(assistant_turn(resp))
                 history.append({"role": "tool_result", "tool": tool, "content": out.output})
                 continue
-            # clarify / propose_mode / edit / submit_changes handled in later tasks (E2/E3)
+            if atype == "clarify":
+                history.append(assistant_turn(resp))
+                return ControllerOutcome(
+                    kind="clarify", text=str(resp.get("question", "")), history=history)
+            if atype == "propose_mode":
+                history.append(assistant_turn(resp))
+                return ControllerOutcome(kind="propose_mode", payload={
+                    "plan_sketch": resp.get("plan_sketch", ""),
+                    "recommended": resp.get("recommended"),
+                    "reason": resp.get("reason", ""),
+                    "options": resp.get("options", []),
+                }, history=history)
+            # edit / submit_changes handled in E3
             raise NotImplementedError(atype)
         return ControllerOutcome(kind="answer", text="(loop ended)", history=history)
