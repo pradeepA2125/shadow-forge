@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from agentd.chat.controller import ChatController
+from agentd.chat.models import PendingGate
 from agentd.chat.storage import ChatThreadStore
 from agentd.orchestrator.broadcaster import EventBroadcaster
 from agentd.orchestrator.scripted_engine import ScriptedReasoningEngine
@@ -49,11 +50,31 @@ async def test_mode_decision_create_task_dispatches(tmp_path: Path):
     orch = _Orch()
     ctrl = _controller(tmp_path, store, ScriptedReasoningEngine(None, []), orch)
     ctrl._histories[th.thread_id] = [{"role": "assistant", "content": "{}"}]
+    store.set_controller_gate(th.thread_id, PendingGate(kind="mode", payload={}))
     await ctrl.resolve_mode(
         th.thread_id, "create_task", channel_id=f"chat:{th.thread_id}", goal="g")
     assert orch.created is not None and orch.created["goal"] == "g"
     # The mode gate is cleared on resolution (Class-A: gates clear in place).
     assert store.get_thread(th.thread_id).pending_controller_gate is None
+
+
+@pytest.mark.asyncio
+async def test_mode_decision_double_dispatch_guarded(tmp_path: Path):
+    """A second /mode-decision after the gate is resolved must NOT re-dispatch
+    (no double task creation)."""
+    store = ChatThreadStore(tmp_path / "c.sqlite3")
+    th = store.create_thread(str(tmp_path), title="t")
+    orch = _Orch()
+    ctrl = _controller(tmp_path, store, ScriptedReasoningEngine(None, []), orch)
+    store.set_controller_gate(th.thread_id, PendingGate(kind="mode", payload={}))
+    await ctrl.resolve_mode(
+        th.thread_id, "create_task", channel_id=f"chat:{th.thread_id}", goal="g")
+    first = orch.created
+    orch.created = None
+    # Second resolve with the gate already cleared → no-op.
+    await ctrl.resolve_mode(
+        th.thread_id, "create_task", channel_id=f"chat:{th.thread_id}", goal="g")
+    assert first is not None and orch.created is None
 
 
 @pytest.mark.asyncio
@@ -64,6 +85,7 @@ async def test_mode_decision_explain_reenters_loop_with_answer(tmp_path: Path):
         {"type": "answer", "thought": "t", "answer": "here is what would happen"}])
     ctrl = _controller(tmp_path, store, eng, _Orch())
     ctrl._histories[th.thread_id] = [{"role": "assistant", "content": "{}"}]
+    store.set_controller_gate(th.thread_id, PendingGate(kind="mode", payload={}))
     await ctrl.resolve_mode(
         th.thread_id, "explain", channel_id=f"chat:{th.thread_id}", goal="g")
     msgs = store.get_thread(th.thread_id).messages

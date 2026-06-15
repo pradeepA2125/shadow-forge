@@ -55,6 +55,8 @@ class ChatController:
         self._retrieval = retrieval_client
         # Per-thread controller conversation history — the cache prefix replayed as
         # seed_history on the next turn (clarify/discuss resume, spec §12).
+        # TODO(controller): unbounded per-thread growth; eviction/compaction is owned
+        # by the future agent-memory module (spec §6 defers it). Fine for v1.
         self._histories: dict[str, list[dict[str, object]]] = {}
         # Per-thread retrieval seed — computed once, never rewritten (spec §6 cache
         # discipline: a frozen pointer-set placed before history).
@@ -227,12 +229,24 @@ class ChatController:
         """Resolve the mode gate (POST /mode-decision). Clears the gate in place
         (Class-A), writes a breadcrumb, then dispatches: edit/explain re-enter the
         loop (a new streamed turn), create_task/resume hand off to the orchestrator."""
+        # Precondition + idempotency guard: only a pending `mode` gate may resolve.
+        # The read→clear pair has no `await` between it (sqlite is sync), so two
+        # concurrent /mode-decision posts can't both dispatch (which would double-
+        # create a task). The second finds the gate already cleared and no-ops.
+        thread = self._store.get_thread(thread_id)
+        gate = thread.pending_controller_gate if thread is not None else None
+        if gate is None or gate.kind != "mode":
+            logger.info("[controller] resolve_mode no-op: no pending mode gate (thread=%s)",
+                        thread_id)
+            return
         self._store.set_controller_gate(thread_id, None)
         self._broadcaster.broadcast(channel_id, {
             "type": "chat_breadcrumb",
             "payload": {"text": f"▸ Proceeding: {mode}", "task_id": ""}})
 
         if mode in ("edit", "explain"):
+            if mode == "edit" and self._orchestrator is None:
+                raise RuntimeError("edit mode requires an orchestrator")
             phase = "EDIT" if mode == "edit" else None
             outcome = await self._run_loop(
                 thread_id, channel_id, goal,

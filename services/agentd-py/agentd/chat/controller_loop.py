@@ -77,6 +77,34 @@ class ControllerLoop:
         _MAX_MALFORMED = 3
         consecutive_malformed = 0
         plan_context = {**plan_context, "max_iters": max_iters}
+        try:
+            return await self._iterate(
+                plan_context, history, tool_defs, seen, max_iters,
+                _MAX_MALFORMED, consecutive_malformed,
+                auto_accept_edits=auto_accept_edits,
+                edit_decision_cb=edit_decision_cb,
+                retrieval_delta_cb=retrieval_delta_cb,
+            )
+        finally:
+            # The per-turn shadow is discarded at turn end on ANY exit (submit, budget
+            # exhaustion, exhaustion-raise, or a patch crash) — no shadow leak.
+            if self._edit is not None:
+                await self._edit.close()
+
+    async def _iterate(
+        self,
+        plan_context: dict[str, object],
+        history: list[dict[str, object]],
+        tool_defs: list[dict[str, object]],
+        seen: dict[str, int],
+        max_iters: int,
+        _MAX_MALFORMED: int,
+        consecutive_malformed: int,
+        *,
+        auto_accept_edits: bool,
+        edit_decision_cb: EditDecisionCb | None,
+        retrieval_delta_cb: RetrievalDeltaCb | None,
+    ) -> ControllerOutcome:
         for iteration in range(max_iters + 1):
             resp = await self._reasoning.create_controller_step(
                 plan_context=plan_context, history=history,
@@ -134,7 +162,19 @@ class ControllerLoop:
                 assert self._edit is not None
                 raw_ops = resp.get("patch_ops")
                 ops: list[dict[str, object]] = raw_ops if isinstance(raw_ops, list) else []
-                diff = await self._edit.apply(ops)
+                try:
+                    diff = await self._edit.apply(ops)
+                except Exception as exc:
+                    # A bad search string / policy violation / ambiguous selector raises
+                    # (PatchEngine.apply_patch_candidate). Feed it back so the agent can
+                    # read the file and re-emit — mirrors ToolLoop._apply_patch_inline —
+                    # instead of crashing the whole turn.
+                    history.append(assistant_turn(resp))
+                    history.append({
+                        "role": "tool_result", "tool": "edit",
+                        "content": f"PATCH FAILED: {exc}. Read the file and re-emit a "
+                                   "corrected patch (check the exact search text)."})
+                    continue
                 self._broadcaster.broadcast(self._channel_id, {
                     "type": "diff_ready",
                     "payload": {"diff_entries": [
@@ -177,8 +217,7 @@ class ControllerLoop:
                         "content": f"REJECTED by user: {reason}. Revise and re-emit."})
                 continue
             if atype == "submit_changes":
-                assert self._edit is not None
-                await self._edit.close()
+                # The shadow is closed by run()'s finally on return (no double-close).
                 history.append(assistant_turn(resp))
                 return ControllerOutcome(
                     kind="submit_changes", text=str(resp.get("summary", "")), history=history)
