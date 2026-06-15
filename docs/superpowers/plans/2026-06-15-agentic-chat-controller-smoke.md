@@ -120,8 +120,27 @@ Secondary (best-effort): J2, J6, J8, J10.
 6. **plan_sketch echoed input / no exploration** → prompt nudge: explore existing code first; make sketch concrete (path+signature+integration).
 8. **Mode-choice breadcrumb not persisted** — `resolve_mode` broadcast-only → lost on reload. → persist+broadcast `"▸ You chose: <label>"` (mirror `write_chat_breadcrumb`).
 
-**🔴 OPEN (next chunk — decided: DiffCard becomes canonical edit-review card, drop EditGate):**
-9. **`resolve_mode` hardcodes `step_review=False`** → "Review each step" ignored for edits (always auto-accept). The controller **edit path persists nothing durable** (no diff record, no completion) — the whole edit turn vanishes on reload except the user msg. `diff_ready` DiffCard shows Accept/Reject even on auto-accept. Plan: persist a durable `diff_card` per controller edit (mirror inline-change/step diff records); wire `step_review` through `/mode-decision`→`resolve_mode`; route the DiffCard Accept/Reject to `/edit-decision` (resolve the edit future); remove the `/live` EditGate path + `EditGate.tsx` + LiveSlot `edit` case.
+**🔴 OPEN:**
 7. **ModeGate "really ugly"** — needs a visual pass to match the other cards.
 
-**Not yet driven:** J2 (clarify), J5 (auto-accept edit, partially seen), J6 (edit reject), J7 (create_task handoff end-to-end), J8 (discuss/refine), J10 (multi-turn context).
+**Not yet driven:** J2 (clarify), J7 (create_task handoff end-to-end — step_review now wired, untested), J8 (discuss/refine), J10 (multi-turn context).
+
+### 2026-06-16 — Phase J session 2 (durable-edit parity + live-render fixes; controller :8001 tqp/qwen3.6, worktree ext)
+
+**Decision revised:** keep EditGate (live, interactive) + a durable INERT `diff_card` record (Class-A, mirrors StepGate) — did NOT drop EditGate. Chosen over "DiffCard canonical" to avoid forking DiffCard's button routing.
+
+**🐞 Finding #9 — FIXED.** Root-caused into persistence (server-side) vs live-render (FE/broadcast):
+- **Durable per-edit record**: `ControllerLoop.edit_record_cb` → `ChatController._edit_record_cb` persists an inert `diff_card` (resolved=applied/discarded, temp_path dropped) for every resolved edit; `submit_changes` persists summary+pills; `_present_mode_choice` now persists pills+thinking via shared `_turn_metadata`. Verified: DB + reload reconstruct the full edit turn (diff card "Changes ready/Applied" + breadcrumbs + summary).
+- **`step_review` threaded** through `/mode-decision`→`resolve_mode` (per-thread stash) → edits honor "Review each step" (EditGate appears) ✓. Also wired into the `create_task` handoff.
+- **Live-render gap (the "wasn't persisted" report)**: persistence was fine; live was dropping it. (a) `streamTurn` had no `chat_breadcrumb` branch → mode-choice/edit breadcrumbs only on reload → **added live render**; (b) review-mode wasn't broadcasting the inert card live → **now broadcasts in both modes** (fills the hole the cleared EditGate leaves).
+- **Live streaming**: `ControllerLoop` now passes `on_thinking` (streams `tool_thinking_chunk`) + accumulates `thinking_log`.
+- **Observability**: `ControllerLoop` now logs `[controller] iter/action`, tool_call/result, edit ops (had none — turns were invisible in logs).
+
+**VERIFIED live (session 2):**
+- **J1** QA ✓ (grounded, live pills/thinking). **J3** ModeGate ✓.
+- **J4** review edit ✓: step_review gated → EditGate → Accept → **instant-promote to real disk** (`src/discount.py`, `src/taxutil.py`). Breadcrumbs + inert card render **live** AND on reload; DB single-copy (no dup).
+- **J6** reject ✓: EditGate Reject → file unchanged on disk (shadow restored) → `✗ Edit rejected` breadcrumb live → agent revised + re-emitted → re-accept applied.
+- **Multi-edit / multiple review screens** ✓: a 4-file docstring task with explicit "separate edit per file" → 5 EditGates (sq/discount/taxutil✗/taxutil✓/mathutil), traced in `[controller]` logs (`action=edit` per file + `submit_changes`). Batched task (no instruction) → 1 multi-file gate (model choice).
+- Malformed `files=[None]` edit ops (qwen3.6) → caught by `except → PATCH FAILED → retry`, persisted nothing (DB diff_card count correct).
+
+**Still open:** ModeGate visual pass (#7); `explore_context=[]` not forwarded to create_task (planner re-explores; v1 limitation); J7 end-to-end, J2/J8/J10 not driven.

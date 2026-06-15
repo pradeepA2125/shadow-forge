@@ -25,9 +25,17 @@ if TYPE_CHECKING:
     from agentd.tools.sources import AggregatingToolRegistry
 
     EditDecisionCb = Callable[[list[DiffEntry]], Awaitable[dict[str, object]]]
+    # Persist+render an edit's resolution (diff, decision: "accept"|"reject", reason).
+    # The controller owns the durable diff_card record + transcript broadcast; the
+    # loop no longer broadcasts diff_ready itself (Class-A: the record cb is the one
+    # writer, so every edit survives a reload — smoke-found gap #2/#5).
+    EditRecordCb = Callable[[list[DiffEntry], str, str], Awaitable[None]]
     # Given the files an accepted edit touched, return a compact retrieval-refresh
     # note (pointers only, no bodies) to append to history — or None.
     RetrievalDeltaCb = Callable[[list[str]], Awaitable[str | None]]
+
+
+logger = logging.getLogger(__name__)
 
 
 class ControllerLoopExhausted(Exception):
@@ -91,6 +99,9 @@ class ControllerOutcome:
     # agent message so they survive a reload (live SSE pills die). None until the
     # loop finalizes it in run().
     tool_events: list[dict[str, object]] | None = None
+    # Durable thinking entries (tool labels) for the turn — persisted alongside the
+    # pills so the ThinkingBlock reconstructs on reload (mirrors agent.py/ToolLoop).
+    thinking_log: list[str] | None = None
 
 
 class ControllerLoop:
@@ -112,6 +123,7 @@ class ControllerLoop:
         self._edit = edit_session
         self._calls: list[ToolCall] = []
         self._results: list[ToolResult] = []
+        self._thinking: list[str] = []
 
     async def run(
         self,
@@ -121,6 +133,7 @@ class ControllerLoop:
         seed_history: list[dict[str, object]] | None = None,
         auto_accept_edits: bool = False,
         edit_decision_cb: EditDecisionCb | None = None,
+        edit_record_cb: EditRecordCb | None = None,
         retrieval_delta_cb: RetrievalDeltaCb | None = None,
     ) -> ControllerOutcome:
         tool_defs = [d.model_dump() for d in self._registry.definitions()]
@@ -130,21 +143,26 @@ class ControllerLoop:
         _MAX_MALFORMED = 3
         consecutive_malformed = 0
         plan_context = {**plan_context, "max_iters": max_iters}
-        # Tool trace accumulated across the turn → persisted as durable pills (reload).
+        # Tool trace + thinking accumulated across the turn → persisted as durable
+        # pills + thinking entries (reload). Live SSE copies die on reload.
         self._calls = []
         self._results = []
+        self._thinking = []
         try:
             outcome = await self._iterate(
                 plan_context, history, tool_defs, seen, max_iters,
                 _MAX_MALFORMED, consecutive_malformed,
                 auto_accept_edits=auto_accept_edits,
                 edit_decision_cb=edit_decision_cb,
+                edit_record_cb=edit_record_cb,
                 retrieval_delta_cb=retrieval_delta_cb,
             )
             if outcome.tool_events is None and self._calls:
                 outcome.tool_events = trace_to_tool_events(
                     AgentToolTrace(step_id="chat", calls=self._calls, results=self._results),
                     "execution")
+            if outcome.thinking_log is None and self._thinking:
+                outcome.thinking_log = list(self._thinking)
             return outcome
         finally:
             # The per-turn shadow is discarded at turn end on ANY exit (submit, budget
@@ -164,8 +182,16 @@ class ControllerLoop:
         *,
         auto_accept_edits: bool,
         edit_decision_cb: EditDecisionCb | None,
+        edit_record_cb: EditRecordCb | None,
         retrieval_delta_cb: RetrievalDeltaCb | None,
     ) -> ControllerOutcome:
+        def _on_thinking(chunk: str) -> None:
+            # Stream the model's reasoning live so the chat thinking pane updates
+            # during a model call (the FE maps tool_thinking_chunk). Raw token
+            # chunks are live-only; durable thinking_log gets compact tool labels.
+            self._broadcaster.broadcast(self._channel_id, {
+                "type": "tool_thinking_chunk", "payload": {"chunk": chunk}})
+
         for iteration in range(max_iters + 1):
             # Live "thinking" status so the chat UI isn't blank during the first model
             # call (the frontend maps chat_agent_thinking → the thinking pane). Only the
@@ -177,8 +203,10 @@ class ControllerLoop:
             resp = await self._reasoning.create_controller_step(
                 plan_context=plan_context, history=history,
                 tool_definitions=tool_defs, phase=self._sm.phase,
+                on_thinking=_on_thinking,
             )
             atype = str(resp.get("type", ""))
+            logger.info("[controller] iter=%d phase=%s action=%s", iteration, self._sm.phase, atype)
             if atype == "answer":
                 history.append(assistant_turn(resp))
                 return ControllerOutcome(
@@ -193,7 +221,7 @@ class ControllerLoop:
             )
             if correction is not None:
                 if atype == "propose_mode":
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "[controller] propose_mode REJECTED: recommended=%r options=%r",
                         resp.get("recommended"), resp.get("options"))
                 consecutive_malformed += 1
@@ -221,6 +249,11 @@ class ControllerLoop:
                     })
                     continue
                 seen[key] = iteration + 1
+                # Observability: log every tool call/result (ToolLoop does the same).
+                # Without this, controller turns are invisible in logs — you can't tell
+                # whether a turn explored or emitted straight from seed_history.
+                logger.info("[controller] tool_call phase=%s iter=%d tool=%s args=%s",
+                            self._sm.phase, iteration, tool, str(args)[:200])
                 # Live tool pill: tool_call before execute, tool_result after. The
                 # frontend pairs these by source ("execution") into a pill with thought.
                 self._broadcaster.broadcast(self._channel_id, {
@@ -228,6 +261,8 @@ class ControllerLoop:
                     "payload": {"tool": tool, "thought": str(resp.get("thought", "")),
                                 "args": args}})
                 out = await self._registry.execute(tool, args)
+                logger.info("[controller] tool_result tool=%s is_error=%s chars=%d",
+                            tool, out.is_error, len(out.output or ""))
                 self._broadcaster.broadcast(self._channel_id, {
                     "type": "tool_result",
                     "payload": {"output": out.output, "is_error": out.is_error}})
@@ -238,6 +273,12 @@ class ControllerLoop:
                     thought=str(resp.get("thought", "")) or None))
                 self._results.append(ToolResult(
                     call_id=call_id, tool_name=tool, output=out.output, is_error=out.is_error))
+                # Durable thinking entry (compact label, not the raw token stream).
+                thought = str(resp.get("thought", ""))
+                path = str(args.get("path", "")) if isinstance(args, dict) else ""
+                label = f" {path.split('/')[-1]}" if path else ""
+                self._thinking.append(
+                    f"{tool}{label} — {thought[:200]}" if thought else f"{tool}{label}")
                 history.append(assistant_turn(resp))
                 history.append({"role": "tool_result", "tool": tool, "content": out.output})
                 continue
@@ -258,6 +299,9 @@ class ControllerLoop:
                 assert self._edit is not None
                 raw_ops = resp.get("patch_ops")
                 ops: list[dict[str, object]] = raw_ops if isinstance(raw_ops, list) else []
+                logger.info("[controller] edit phase=%s ops=%d files=%s",
+                            self._sm.phase, len(ops),
+                            [op.get("file") for op in ops if isinstance(op, dict)])
                 try:
                     diff = await self._edit.apply(ops)
                 except Exception as exc:
@@ -271,16 +315,11 @@ class ControllerLoop:
                         "content": f"PATCH FAILED: {exc}. Read the file and re-emit a "
                                    "corrected patch (check the exact search text)."})
                     continue
-                self._broadcaster.broadcast(self._channel_id, {
-                    "type": "diff_ready",
-                    "payload": {"diff_entries": [
-                        {"path": d.path, "additions": d.additions,
-                         "deletions": d.deletions, "unified_diff": d.unified_diff}
-                        for d in diff]},
-                })
                 # Auto-accept (instant promote) OR hold for a per-edit review decision.
-                # The cb holds the SSE stream open + renders the diff via /live
-                # (Strategy: pluggable accept policy, reuses step_review semantics).
+                # The decision cb holds the SSE stream open + renders the live diff via
+                # the /live EditGate (review mode only). The loop does NOT broadcast
+                # diff_ready — edit_record_cb is the single transcript writer (durable
+                # diff_card + the auto-accept live render), so nothing dangles on reload.
                 if auto_accept_edits or edit_decision_cb is None:
                     await self._edit.accept()
                     accepted = True
@@ -293,6 +332,8 @@ class ControllerLoop:
                         await self._edit.accept()
                     else:
                         await self._edit.reject()  # restore shadow from real (shadow==real)
+                if edit_record_cb is not None:
+                    await edit_record_cb(diff, "accept" if accepted else "reject", reason)
                 history.append(assistant_turn(resp))
                 if accepted:
                     touched = [d.path for d in diff]

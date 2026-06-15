@@ -595,8 +595,27 @@ export class AiEditorController {
         } else if (event.type === "chat_response") {
           const chunk = (event.payload["chunk"] as string) ?? "";
           this.ui.appendChatChunk(chunk);
+        } else if (event.type === "chat_breadcrumb") {
+          // Controller decisions (mode choice, edit accept/reject) broadcast their
+          // breadcrumbs on THIS turn stream. streamTurn previously had no branch for
+          // them, so they only appeared on reload (persisted) — render live too.
+          this.ui.appendChatMessage({
+            role: "agent",
+            content: (event.payload["text"] as string) ?? "",
+            type: "text",
+            taskId: (event.payload["task_id"] as string) ?? "",
+            timestamp: this.now(),
+            metadata: { breadcrumb: true },
+          });
         } else if (event.type === "diff_ready") {
           const taskId = (event.payload["task_id"] as string) ?? "";
+          // `resolved` is set by the chat controller's auto-accept edit path (the
+          // change is already promoted) → the card renders inert. The legacy inline
+          // path omits it → interactive Accept/Reject, as before.
+          const resolved = event.payload["resolved"] as
+            | "applied"
+            | "discarded"
+            | undefined;
           this.ui.appendChatMessage({
             role: "agent",
             content: taskId,
@@ -606,6 +625,7 @@ export class AiEditorController {
             metadata: {
               diff_entries: event.payload["diff_entries"],
               thinking_log: event.payload["thinking_log"] ?? [],
+              ...(resolved ? { resolved } : {}),
             },
           });
         } else if (event.type === "task_card") {

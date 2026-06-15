@@ -64,6 +64,10 @@ class ChatController:
         # Per-thread per-edit review future (held-open gate; mirrors the engine's
         # _pending_step_decisions). resolve_edit fires it.
         self._pending_edit: dict[str, asyncio.Future[dict[str, object]]] = {}
+        # Per-thread "Review each edit" toggle from the message that opened the mode
+        # gate — read back in resolve_mode so the edit re-entry honors it (the
+        # /mode-decision POST carries no step_review; smoke-found gap #4).
+        self._step_review_by_thread: dict[str, bool | None] = {}
 
     def _build_registry(self) -> AggregatingToolRegistry:
         return AggregatingToolRegistry([BuiltinToolSource(
@@ -102,6 +106,9 @@ class ChatController:
                 "payload": {"thread_id": thread_id, "title": title},
             })
         self._store.append_message(thread_id, ChatMessage(role="user", content=message))
+        # Remember this turn's review toggle so a propose_mode → "edit" re-entry
+        # (resolved via /mode-decision, which carries no step_review) honors it.
+        self._step_review_by_thread[thread_id] = step_review
 
         seed = self._histories.get(thread_id, [])
         # On a continued turn (clarify/discuss), append the user's reply to the
@@ -137,12 +144,16 @@ class ChatController:
         if seed:
             plan_context["retrieval_seed"] = seed
         # "Review each edit" on → hold each patch for a decision; off → instant promote.
+        is_review = step_review is True
         edit_cb = partial(self._edit_decision_cb, thread_id, channel_id) \
-            if step_review is True else None
+            if is_review else None
+        # Single durable-record writer for every edit resolution (both modes): persists
+        # an inert diff_card, + a breadcrumb (review) or a live render (auto-accept).
+        record_cb = partial(self._edit_record_cb, thread_id, channel_id, is_review)
         outcome = await loop.run(
             plan_context, seed_history=seed_history,
-            auto_accept_edits=(step_review is not True), edit_decision_cb=edit_cb,
-            retrieval_delta_cb=self._retrieval_delta_cb)
+            auto_accept_edits=(not is_review), edit_decision_cb=edit_cb,
+            edit_record_cb=record_cb, retrieval_delta_cb=self._retrieval_delta_cb)
         self._histories[thread_id] = outcome.history or []
         return outcome
 
@@ -166,18 +177,38 @@ class ChatController:
         step_review: bool | None,
     ) -> None:
         if outcome.kind in ("answer", "clarify"):
-            # Persist the turn's tool pills onto the message so they survive a reload
-            # (live SSE pills die) — mirrors ChatAgent's metadata.tool_events.
-            metadata = {"tool_events": outcome.tool_events} if outcome.tool_events else {}
-            self._store.append_message(
-                thread_id, ChatMessage(role="agent", content=outcome.text, metadata=metadata))
+            # Persist the turn's tool pills + thinking onto the message so they survive
+            # a reload (live SSE pills/thinking die) — mirrors ChatAgent's metadata.
+            self._store.append_message(thread_id, ChatMessage(
+                role="agent", content=outcome.text, metadata=self._turn_metadata(outcome)))
             self._broadcaster.broadcast(
                 channel_id, {"type": "chat_response", "payload": {"chunk": outcome.text}})
             self._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
         elif outcome.kind == "submit_changes":
+            # Persist the EDIT turn's summary + exploration pills/thinking. The per-edit
+            # diff_cards are already durable (edit_record_cb); without this closing
+            # message the turn's pills/thinking vanish on reload (smoke-found gap #3).
+            summary = outcome.text or ""
+            metadata = self._turn_metadata(outcome)
+            if summary or metadata:
+                self._store.append_message(
+                    thread_id, ChatMessage(role="agent", content=summary, metadata=metadata))
+                if summary:
+                    self._broadcaster.broadcast(
+                        channel_id, {"type": "chat_response", "payload": {"chunk": summary}})
             self._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
         elif outcome.kind == "propose_mode":
             await self._present_mode_choice(thread_id, channel_id, outcome)
+
+    @staticmethod
+    def _turn_metadata(outcome: ControllerOutcome) -> dict[str, object]:
+        """Durable pills + thinking for a turn's agent message (reload survival)."""
+        metadata: dict[str, object] = {}
+        if outcome.tool_events:
+            metadata["tool_events"] = outcome.tool_events
+        if outcome.thinking_log:
+            metadata["thinking_log"] = outcome.thinking_log
+        return metadata
 
     async def _present_mode_choice(
         self, thread_id: str, channel_id: str, outcome: ControllerOutcome,
@@ -185,12 +216,13 @@ class ChatController:
         """Class-A gate: set a durable thread gate (/live renders it via LiveSlot,
         survives reload) and END the message stream. No SSE mode event — chat gates
         render purely from the /live poll (CLAUDE.md). Resolved by /mode-decision (F2)."""
-        # Persist the exploration pills as a durable record (mirrors ChatAgent writing
-        # a pills-only message before task cards) so they survive a reload; the gate
-        # itself is durable via pending_controller_gate.
-        if outcome.tool_events:
+        # Persist the exploration pills + thinking as a durable record (mirrors ChatAgent
+        # writing a pills-only message before task cards) so they survive a reload; the
+        # gate itself is durable via pending_controller_gate.
+        metadata = self._turn_metadata(outcome)
+        if metadata:
             self._store.append_message(thread_id, ChatMessage(
-                role="agent", content="", metadata={"tool_events": outcome.tool_events}))
+                role="agent", content="", metadata=metadata))
         self._store.set_controller_gate(
             thread_id, PendingGate(kind="mode", payload=outcome.payload or {}))
         self._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
@@ -222,6 +254,44 @@ class ChatController:
         finally:
             self._pending_edit.pop(thread_id, None)
             self._store.set_controller_gate(thread_id, None)
+
+    async def _edit_record_cb(
+        self, thread_id: str, channel_id: str, was_review: bool,
+        diff: list[DiffEntry], decision: str, reason: str,
+    ) -> None:
+        """Durably record a resolved edit (the loop's single transcript writer).
+
+        Persists an inert diff_card (renders Applied/Discarded on reload, never
+        interactive — mirrors engine._write_chat_step_diff_record). temp_path is
+        omitted: the edit is instant-promoted (shadow==real) so a native diff is
+        meaningless, and the turn-shadow is rmtree'd at turn end. In review mode the
+        live EditGate already showed the diff, so we add a breadcrumb (the card
+        materializes on reload); in auto-accept there was no gate, so we render the
+        inert card live too."""
+        diff_payload = [
+            {"path": d.path, "additions": d.additions,
+             "deletions": d.deletions, "unified_diff": d.unified_diff}
+            for d in diff]
+        resolved = "applied" if decision == "accept" else "discarded"
+        self._store.append_message(thread_id, ChatMessage(
+            role="agent", content="", type="diff_card",
+            metadata={"diff_entries": diff_payload, "resolved": resolved}))
+        # Render the inert card live in BOTH modes so the accepted/rejected diff stays
+        # in the transcript without waiting for a reload. In review mode the live
+        # EditGate (pinned /live slot) has already cleared by now, so this fills the
+        # hole it leaves; `resolved` is set so the card is inert (no dead buttons).
+        self._broadcaster.broadcast(channel_id, {
+            "type": "diff_ready",
+            "payload": {"diff_entries": diff_payload, "resolved": resolved}})
+        files = ", ".join(d.path for d in diff) or "(no files)"
+        if was_review:
+            if decision == "accept":
+                text = f"✓ Edit accepted: {files}"
+            else:
+                text = f"✗ Edit rejected: {files}"
+                if reason:
+                    text += f" — {reason}"  # surface the user's reason in the record
+            self._write_breadcrumb(thread_id, channel_id, text)
 
     async def resolve_edit(self, thread_id: str, decision: dict[str, object]) -> bool:
         """Resolve the per-edit gate (POST /edit-decision). Only fires the future —
@@ -273,18 +343,28 @@ class ChatController:
             if mode == "edit" and self._orchestrator is None:
                 raise RuntimeError("edit mode requires an orchestrator")
             phase = "EDIT" if mode == "edit" else None
+            # Honor the "Review each edit" toggle from the message that opened this
+            # gate (explain has no edits, so the value is inert there).
+            review = self._step_review_by_thread.get(thread_id)
             outcome = await self._run_loop(
                 thread_id, channel_id, goal,
-                seed_history=self._histories.get(thread_id), step_review=False, phase=phase)
-            await self._finish(thread_id, channel_id, outcome, step_review=False)
+                seed_history=self._histories.get(thread_id), step_review=review, phase=phase)
+            await self._finish(thread_id, channel_id, outcome, step_review=review)
             return
 
         if mode == "create_task":
             if self._orchestrator is None:
                 raise RuntimeError("create_task mode requires an orchestrator")
+            # Thread the "Review each step" toggle through to the task (matches the
+            # edit path + the old ChatAgent large_change handoff): True → gate each
+            # step, None → env default. (explore_context stays [] in v1 — the
+            # PlanningAgent re-explores; forwarding the controller's findings is a
+            # follow-up.)
+            review = self._step_review_by_thread.get(thread_id)
             task_id = await self._orchestrator.create_task_from_chat(
                 thread_id=thread_id, goal=goal, workspace_path=self._workspace_path,
-                explore_context=[], store=self._store)
+                explore_context=[], store=self._store,
+                step_review_auto_accept=(not review) if review is not None else None)
             self._store.append_message(thread_id, ChatMessage(
                 role="agent", content=task_id, type="task_card", task_id=task_id,
                 metadata={"taskId": task_id}))
@@ -294,8 +374,9 @@ class ChatController:
         else:
             # resume is offered only when a resumable recent task exists; that
             # plumbing isn't wired in v1, so degrade gracefully rather than guess.
+            # Persist (not broadcast-only) so the note survives a reload like every
+            # other decision record — no live-only crumb (the bug class we're fixing).
             logger.warning("[controller] unhandled mode %r — no dispatch", mode)
-            self._broadcaster.broadcast(channel_id, {
-                "type": "chat_breadcrumb",
-                "payload": {"text": f"Mode {mode!r} is not available yet.", "task_id": ""}})
+            self._write_breadcrumb(
+                thread_id, channel_id, f"Mode {mode!r} is not available yet.")
         self._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})

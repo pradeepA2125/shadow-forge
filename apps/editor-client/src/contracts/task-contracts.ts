@@ -187,7 +187,7 @@ export type StreamEvent =
   | { type: "task_card"; payload: { task_id: string } }
   | { type: "plan_card"; payload: { task_id: string; plan_markdown: string } }
   | { type: "task_status_changed"; payload: { task_id: string; status: string; plan_markdown?: string; message?: string } }
-  | { type: "diff_ready"; payload: { task_id: string; diff_entries: DiffEntry[]; thinking_log: string[]; completed_steps: number; total_steps: number } }
+  | { type: "diff_ready"; payload: { task_id: string; diff_entries: DiffEntry[]; thinking_log: string[]; completed_steps: number; total_steps: number; resolved?: "applied" | "discarded" } }
   | { type: "thread_title_updated"; payload: { thread_id: string; title: string } }
   | { type: "step_review_requested"; payload: { step_id: string; step_title: string; diff_entries: DiffEntry[] } }
   | { type: "env_profile_building"; payload: { workspace_root: string } }
