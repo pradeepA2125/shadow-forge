@@ -101,5 +101,27 @@ Secondary (best-effort): J2, J6, J8, J10.
 
 ## Results log
 
-### 2026-06-15 — Phase J kickoff
-(to be filled in as scenarios run)
+### 2026-06-15 — Phase J session 1 (tqp/qwen3.6 :11435, controller flag ON, backend :8001, worktree ext dev-host CDP :9335)
+
+**Env notes:** TQP = llama-server (llama.cpp) on :11435 serving qwen3.6:35b-a3b (OpenAI-compatible `/v1/...`, NOT ollama `/api/tags`). `start-vscode-mcp.sh` EXT_PATH was stale (dead worktree) — repointed to this worktree. Extension `dist/extension.js` + `webview-ui/dist` must be BUILT (`npm run -w @ai-editor/vscode-extension build`) before launch; the dev-host needs a window reload after a build. **webview-ui has its OWN node_modules** (separate `npm install`). Command palette: `fill` overwrites the auto `>` prefix → must type `>Command`. The a11y `browser_snapshot` DOES pierce the webview iframes now (refs usable for `browser_click`); `browser_evaluate` (main-frame only) does NOT reach the cross-origin webview DOM.
+
+**VERIFIED working live:**
+- Controller active (no `intent_classified`/classifier in path). QA `answer` grounded (cited `PlanningLoop` `loop.py:70`).
+- **J1** QA answer terminal ✓. **J9** gate durability across full window reload ✓ (gate re-rendered from `/live`). ACID instant-promote ✓ — picking "edit" landed a correct `src/mathutil.py clamp()` on the **real** workspace.
+
+**🐞 Smoke-found + FIXED (commit `05e057c`):**
+1. **No live thinking/tool pills** — `ControllerLoop` never broadcast `chat_agent_thinking`/`tool_call`/`tool_result` (frontend already maps them). Blank UI during turns. → broadcast added (first-iter thinking + per-tool pills). Verified live (`read_file ✓`/`search_code ✓` pills).
+2. **Repeated "Thinking…"** entries → emit only on iteration 0. Verified ("Thinking (N steps)" single header).
+3. **ModeGate never rendered** — `editor-client` `PendingGateSchema` Zod enum missing `mode`/`edit` (I1 changed TS types only); `ThreadLiveState.parse()` threw → `pollThreadLiveState` `catch` swallowed it silently. → added to enum + rebuilt editor-client. Verified (renders + survives reload).
+4. **propose_mode invalid mode vocab** (qwen3: `recommended=None`, `options[].type` not `.mode`) → unusable gate. → validate options against `{edit,create_task,resume,explain}` w/ correction-retry (SM-style); normalize the non-blocking `recommended` to first option; tightened prompt w/ explicit format+example. Verified: gate now shows **Create inline now / Plan it as a task / Just explain** + discuss hint.
+5. **Tool pills died on reload** — controller persisted nothing. → accumulate `AgentToolTrace`, persist `metadata.tool_events` (mirror `ChatAgent`/`trace_to_tool_events`).
+
+**🐞 Smoke-found + FIXED (commit `1651b34`):**
+6. **plan_sketch echoed input / no exploration** → prompt nudge: explore existing code first; make sketch concrete (path+signature+integration).
+8. **Mode-choice breadcrumb not persisted** — `resolve_mode` broadcast-only → lost on reload. → persist+broadcast `"▸ You chose: <label>"` (mirror `write_chat_breadcrumb`).
+
+**🔴 OPEN (next chunk — decided: DiffCard becomes canonical edit-review card, drop EditGate):**
+9. **`resolve_mode` hardcodes `step_review=False`** → "Review each step" ignored for edits (always auto-accept). The controller **edit path persists nothing durable** (no diff record, no completion) — the whole edit turn vanishes on reload except the user msg. `diff_ready` DiffCard shows Accept/Reject even on auto-accept. Plan: persist a durable `diff_card` per controller edit (mirror inline-change/step diff records); wire `step_review` through `/mode-decision`→`resolve_mode`; route the DiffCard Accept/Reject to `/edit-decision` (resolve the edit future); remove the `/live` EditGate path + `EditGate.tsx` + LiveSlot `edit` case.
+7. **ModeGate "really ugly"** — needs a visual pass to match the other cards.
+
+**Not yet driven:** J2 (clarify), J5 (auto-accept edit, partially seen), J6 (edit reject), J7 (create_task handoff end-to-end), J8 (discuss/refine), J10 (multi-turn context).
