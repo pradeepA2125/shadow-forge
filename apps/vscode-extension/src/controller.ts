@@ -499,6 +499,7 @@ export class AiEditorController {
     this.ui.clearLiveGate();
     this.ui.clearLivePlan();
     this.lastLiveSignature = null;
+    this._liveResumeThreadId = null;
     let threads: ChatThreadSummary[];
     try {
       threads = await client.listChatThreads(workspacePath);
@@ -518,6 +519,7 @@ export class AiEditorController {
     this.ui.clearLiveGate();
     this.ui.clearLivePlan();
     this.lastLiveSignature = null;
+    this._liveResumeThreadId = null;
     for (const message of thread.messages) {
       this.ui.appendChatMessage(message);
     }
@@ -559,6 +561,30 @@ export class AiEditorController {
         stepReview !== undefined ? { stepReview } : undefined,
       ),
     );
+  }
+
+  // Thread currently being live-resumed (channel re-subscribe) — idempotency guard.
+  private _liveResumeThreadId: string | null = null;
+
+  /**
+   * Resume the live overlay for an in-flight controller turn after a webview reload.
+   * Subscribe-only relay (no turn launch) over GET /v1/channels/{id}/stream; reuses
+   * streamTurn's event rendering. Best-effort: events older than the 50-event replay
+   * buffer (and everything after a backend restart) come from the reconstructed
+   * transcript, not here.
+   */
+  private async resumeLiveOverlay(threadId: string): Promise<void> {
+    try {
+      this.turnAbort = new AbortController();
+      await this.streamTurn(this.clientForChat().streamChannel(`chat:${threadId}`));
+    } catch (error) {
+      // A closed/empty channel is expected (turn already done) — clear the guard so a
+      // later turn can resume, and let the /live poll keep driving durable state.
+      this._liveResumeThreadId = null;
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        // non-fatal
+      }
+    }
   }
 
   /**
@@ -1137,8 +1163,23 @@ export class AiEditorController {
     this.stopLiveStatePolling();
   }
 
-  stopActiveTurn(): void {
+  async stopActiveTurn(): Promise<void> {
+    // Detached turns are not cancelled by disconnecting the SSE anymore — Stop is an
+    // explicit POST /stop (a slimmer cousin of task /abort). Still abort the local SSE
+    // reader so the relay loop unwinds promptly; the server-side cancel is the real stop.
     this.turnAbort?.abort();
+    const threadId = this.activeThreadId;
+    if (!threadId) return;
+    try {
+      await this.clientForChat().stopChatTurn(threadId);
+    } catch (error) {
+      if (this.isBenignConflict(error)) return;
+      // A failed stop is non-fatal — the turn finishes on its own; log only.
+      this.ui.showWarning(`Stop failed: ${formatError(error)}`);
+    } finally {
+      this.lastLiveSignature = null;
+      void this.pollThreadLiveState();
+    }
   }
 
   private forwardToolCall(source: "explore" | "execution" | "planning", payload: Record<string, unknown>): void {
@@ -1500,6 +1541,20 @@ export class AiEditorController {
       return;
     }
     this.latestLiveState = live;
+
+    // Live-resume: a fresh webview (reload mid-turn) reconstructs the transcript from
+    // the thread fetch, but the live overlay (streaming pills/chunks) died with the old
+    // SSE. When /live reports an in-flight turn or a controller gate, re-subscribe to the
+    // chat channel (subscribe-only — does NOT relaunch the turn) to resume the overlay
+    // from the broadcaster's replay buffer onward. Idempotent via _liveResumeThreadId.
+    const channelActive = live.turnActive || live.pendingGate?.kind === "mode"
+      || live.pendingGate?.kind === "edit";
+    if (channelActive && this._liveResumeThreadId !== threadId) {
+      this._liveResumeThreadId = threadId;
+      void this.resumeLiveOverlay(threadId);
+    } else if (!channelActive && this._liveResumeThreadId === threadId) {
+      this._liveResumeThreadId = null; // turn ended — allow a future resume
+    }
 
     const signature = JSON.stringify({
       taskId: live.activeTaskId,
