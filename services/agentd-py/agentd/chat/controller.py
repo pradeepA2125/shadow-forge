@@ -443,6 +443,27 @@ class ChatController:
         fut.set_result(decision)
         return True
 
+    async def stop_turn(self, thread_id: str) -> bool:
+        """Cancel a detached turn (POST /stop) — a slimmer cousin of task /abort.
+
+        Cancels the asyncio.Task; the turn's own finally chain does the cleanup:
+        _run_turn pops _active_turns, ControllerLoop.run's finally closes the turn-
+        shadow, and a held-open EditGate's _edit_decision_cb finally clears the gate +
+        pops _pending_edit. Then broadcast chat_done so the relay closes, and write a
+        durable ✗ Stopped breadcrumb. Benign no-op (False) if no active turn."""
+        task = self._active_turns.get(thread_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task  # let the cancellation unwind (finally chain runs)
+        except asyncio.CancelledError:
+            pass
+        channel_id = f"chat:{thread_id}"
+        self._write_breadcrumb(thread_id, channel_id, "✗ Stopped")
+        self._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
+        return True
+
     def _write_breadcrumb(self, thread_id: str, channel_id: str, text: str) -> None:
         """Persist a durable transcript breadcrumb AND broadcast it live (mirror
         engine.write_chat_breadcrumb). The live mode/edit gate is ephemeral; this is

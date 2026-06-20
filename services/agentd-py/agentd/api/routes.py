@@ -1305,4 +1305,15 @@ def build_router(
             ok = await _chat_agent.resolve_edit(thread_id, request)  # type: ignore[attr-defined]
             return {"ok": ok}
 
+        @router.post("/chat/threads/{thread_id}/stop")
+        async def post_stop_turn(thread_id: str) -> dict:
+            # Stop a detached controller turn (replaces the old SSE-disconnect cancel).
+            # Benign no-op when no turn is active. The legacy ChatAgent has no stop_turn —
+            # report ok=false rather than 500.
+            stop = getattr(_chat_agent, "stop_turn", None)
+            if stop is None:
+                return {"ok": False}
+            ok = await stop(thread_id)  # type: ignore[misc]
+            return {"ok": ok}
+
     return router

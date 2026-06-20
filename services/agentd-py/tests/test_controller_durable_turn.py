@@ -81,3 +81,33 @@ async def test_handle_message_clears_stale_gate_at_start(tmp_path):
         thread.thread_id, "hello", channel_id=f"chat:{thread.thread_id}")
 
     assert gate_at_turn_start == [None]  # cleared before the loop ran
+
+
+@pytest.mark.asyncio
+async def test_stop_turn_cancels_and_breadcrumbs(tmp_path):
+    store = ChatThreadStore(tmp_path / "chat.sqlite3")
+    thread = store.create_thread(str(tmp_path))
+    ctrl = _controller(tmp_path, store)
+    channel_id = f"chat:{thread.thread_id}"
+
+    release = asyncio.Event()
+
+    async def _body():
+        await release.wait()  # never released — stop_turn cancels it
+
+    task = ctrl.launch_turn(thread.thread_id, _body(), channel_id=channel_id)
+    await asyncio.sleep(0.02)
+    assert thread.thread_id in ctrl._active_turns
+
+    ok = await ctrl.stop_turn(thread.thread_id)
+    assert ok is True
+    assert task.cancelled()
+    assert thread.thread_id not in ctrl._active_turns
+
+    # Durable ✗ Stopped breadcrumb persisted.
+    refreshed = store.get_thread(thread.thread_id)
+    assert any(
+        m.metadata.get("breadcrumb") and "Stopped" in m.content
+        for m in refreshed.messages)
+    # Idempotent: stopping an idle thread is a benign no-op.
+    assert await ctrl.stop_turn(thread.thread_id) is False

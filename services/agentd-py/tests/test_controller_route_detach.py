@@ -122,3 +122,26 @@ async def test_live_reports_turn_active(_app):
         assert live1.json()["turn_active"] is True
         gate.set()
         await bg
+
+
+@pytest.mark.asyncio
+async def test_stop_route_cancels_active_turn(_app):
+    app, chat_store, gate, handler = _app
+    thread = chat_store.create_thread("/ws")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        url = f"/v1/chat/threads/{thread.thread_id}/message"
+        bg = asyncio.create_task(_consume_stream(client, url, {"content": "hi"}))
+        await asyncio.sleep(0.05)
+        assert thread.thread_id in handler._active_turns
+        resp = await client.post(f"/v1/chat/threads/{thread.thread_id}/stop")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        # The cancelled turn's relay closes on the stop's chat_done broadcast.
+        await bg
+    assert thread.thread_id not in handler._active_turns
+    # Idle thread → benign no-op.
+    transport2 = ASGITransport(app=app)
+    async with AsyncClient(transport=transport2, base_url="http://t") as client:
+        resp = await client.post(f"/v1/chat/threads/{thread.thread_id}/stop")
+        assert resp.json()["ok"] is False
