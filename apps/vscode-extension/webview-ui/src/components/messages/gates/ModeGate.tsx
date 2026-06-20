@@ -40,11 +40,21 @@ export function ModeGate({ taskId, payload }: Props) {
   const options = parseOptions(payload);
 
   const [resolved, setResolved] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
 
   function handlePick(mode: string, label: string) {
     if (resolved !== null) return; // one-shot guard
     setResolved(label);
     vscode.postMessage({ type: "modeDecision", threadId: taskId, mode });
+  }
+
+  function handleChatAbout() {
+    if (resolved !== null) return; // one-shot — shared with the mode picks
+    const text = draft.trim();
+    if (!text) return;
+    setResolved("Discussing…");
+    // A fresh turn supersedes the gate (handle_message clears it at start).
+    vscode.postMessage({ type: "sendMessage", text });
   }
 
   return (
@@ -92,9 +102,19 @@ export function ModeGate({ taskId, payload }: Props) {
               </BtnGhost>
             );
           })}
-          <span className="text-[10px] text-text-2 px-0.5">
-            …or keep typing to discuss / refine the approach.
-          </span>
+          <input
+            type="text"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleChatAbout();
+              }
+            }}
+            placeholder="Chat about this approach…"
+            className="mt-1 w-full rounded border border-border bg-transparent px-2 py-1 text-[11px] text-text-1 placeholder:text-text-2"
+          />
         </div>
       ) : (
         <div className="flex items-center gap-1.5 px-2.5 py-2 border-t border-border">
