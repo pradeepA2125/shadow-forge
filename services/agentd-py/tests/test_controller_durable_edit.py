@@ -5,6 +5,7 @@ no diff_card, submit_changes dropped the turn's pills, the model's thinking neve
 streamed, and the "Review each edit" toggle was ignored. These tests lock in the
 agent.py-parity behavior: broadcast live AND persist for reload.
 """
+import json
 from pathlib import Path
 
 import pytest
@@ -244,9 +245,13 @@ async def test_resolve_mode_create_task_uses_plan_sketch_not_last_message(tmp_pa
         "plan_sketch": "Create src/pricing/ package with discount.py and tax.py + tests",
         "options": [{"mode": "create_task", "label": "Plan it as a task"}]}))
     ctrl._step_review_by_thread[th.thread_id] = True
-    ctrl._explore_by_thread[th.thread_id] = [
-        {"tool": "read_file", "args": {"path": "src/pricing.py"},
-         "result": "def price(): ...", "is_error": False}]
+    # Prior-turn verbatim history with one tool call (the create_task handoff derives
+    # pre_explored_context from this, not a separate accumulator).
+    ctrl._histories[th.thread_id] = [
+        {"role": "assistant", "content": json.dumps(
+            {"type": "tool_call", "tool": "read_file", "args": {"path": "src/pricing.py"}})},
+        {"role": "tool_result", "tool": "read_file", "content": "def price(): ..."},
+    ]
 
     await ctrl.resolve_mode(
         th.thread_id, "create_task", channel_id=f"chat:{th.thread_id}", goal="keep it minimal")
@@ -255,4 +260,27 @@ async def test_resolve_mode_create_task_uses_plan_sketch_not_last_message(tmp_pa
     assert captured["goal"] == "Create src/pricing/ package with discount.py and tax.py + tests"
     assert captured["step_review_auto_accept"] is False  # review=True → gate each step
     # The controller's exploration is forwarded (not an empty list → planner re-explores).
-    assert captured["explore_context"] == ctrl._explore_by_thread[th.thread_id]
+    assert captured["explore_context"] == [
+        {"tool": "read_file", "args": {"path": "src/pricing.py"},
+         "result": "def price(): ...", "is_error": False}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_edit_clears_stale_gate_when_no_waiter(tmp_path: Path):
+    """Backend-restart orphan: a persisted EditGate with no live _pending_edit future
+    is cleared (+ breadcrumb) instead of no-op'ing, so the UI unwedges."""
+    store = ChatThreadStore(tmp_path / "chat.sqlite3")
+    thread = store.create_thread(str(tmp_path))
+    # Simulate the post-restart state: gate persisted, no in-memory waiter.
+    store.set_controller_gate(thread.thread_id, PendingGate(kind="edit", payload={}))
+    ctrl = _controller(tmp_path, store)
+    assert thread.thread_id not in ctrl._pending_edit
+
+    ok = await ctrl.resolve_edit(thread.thread_id, {"decision": "accept"})
+    assert ok is False  # nothing resumed (no waiter)
+
+    refreshed = store.get_thread(thread.thread_id)
+    assert refreshed.pending_controller_gate is None  # stale gate cleared
+    assert any(
+        m.metadata.get("breadcrumb") and "re-send" in m.content.lower()
+        for m in refreshed.messages)

@@ -435,10 +435,23 @@ class ChatController:
             self._write_breadcrumb(thread_id, channel_id, text)
 
     async def resolve_edit(self, thread_id: str, decision: dict[str, object]) -> bool:
-        """Resolve the per-edit gate (POST /edit-decision). Only fires the future —
-        never mutates/persists state during the await (Class-A safety)."""
+        """Resolve the per-edit gate (POST /edit-decision). Fires the future when a
+        live waiter exists (never mutates/persists during the await — Class-A safety).
+
+        Backend-restart orphan: when the EditGate persisted in sqlite but the in-memory
+        waiter is gone (`thread_id not in _pending_edit`), clear the stale gate + write a
+        breadcrumb so the UI unwedges (turn_active is already False post-restart → input
+        re-enables). The user re-issues the edit. Matches the orphaned-task degradation."""
         fut = self._pending_edit.get(thread_id)
         if fut is None or fut.done():
+            # No live waiter. If a stale edit gate persists (restart orphan), clear it.
+            thread = self._store.get_thread(thread_id)
+            gate = thread.pending_controller_gate if thread is not None else None
+            if gate is not None and gate.kind == "edit":
+                self._store.set_controller_gate(thread_id, None)
+                self._write_breadcrumb(
+                    thread_id, f"chat:{thread_id}",
+                    "Previous turn ended — please re-send your request.")
             return False
         fut.set_result(decision)
         return True
