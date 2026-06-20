@@ -1371,18 +1371,24 @@ class AgentOrchestrator:
         step_title: str,
         diff_entries: list[dict],
         resolution: str,
+        *,
+        broadcast_live: bool = False,
     ) -> None:
         """Persist a reviewed step's diff as a read-only diff_card transcript message.
 
         The live StepGate card is /live-slot only and vanishes once the decision
         lands; this is the durable record (same Class-A model as breadcrumbs).
-        Not broadcast live \u2014 the gate card already showed the diff. resolved is
-        pre-set so the card renders inert (Applied/Discarded), never interactive.
+        resolved is pre-set so the card renders inert (Applied/Discarded), never
+        interactive. By default NOT broadcast live \u2014 the review gate card already
+        showed the diff. `broadcast_live=True` (auto-accept, where no gate ever
+        showed it) also emits a `diff_ready` event so the inert card appears in the
+        transcript without a reload \u2014 mirrors the controller edit auto-accept path.
         """
         if not task.chat_channel_id or self._chat_store is None or not diff_entries:
             return
         from agentd.chat.models import ChatMessage
         thread_id = task.chat_channel_id[len("chat:"):]
+        resolved = "applied" if resolution == "accept" else "discarded"
         msg = ChatMessage(
             role="agent", content=task.task_id, type="diff_card", task_id=task.task_id,
             metadata={
@@ -1390,10 +1396,21 @@ class AgentOrchestrator:
                 "step_id": step_id,
                 "step_title": step_title,
                 "diff_entries": diff_entries,
-                "resolved": "applied" if resolution == "accept" else "discarded",
+                "resolved": resolved,
             },
         )
         self._chat_store.append_message(thread_id, msg)  # type: ignore[union-attr]
+        if broadcast_live:
+            # Push over the task channel (the chat stream is bridged to it during a
+            # create_task handoff \u2014 same channel write_chat_breadcrumb uses).
+            self.broadcaster.broadcast(task.task_id, {
+                "type": "diff_ready",
+                "payload": {
+                    "task_id": task.task_id,
+                    "diff_entries": diff_entries,
+                    "resolved": resolved,
+                },
+            })
 
     async def await_plan_ready(self, task_id: str, timeout_sec: float = 3600.0) -> "TaskRecord | None":
         """Poll until task reaches AWAITING_PLAN_APPROVAL or a terminal state."""
@@ -1623,6 +1640,7 @@ class AgentOrchestrator:
                     _ctrl.step_review_auto_accept if _ctrl is not None
                     else task.step_review_auto_accept
                 )
+                _auto_step_diff: list[dict] | None = None
                 if not _auto:
                     decision = await self._pause_for_step_review(
                         task, step, step_result, shadow_path, real_path,
@@ -1633,6 +1651,18 @@ class AgentOrchestrator:
                             completed_ops_by_file,
                         )
                         continue
+                else:
+                    # Auto-accept shows no live review gate, so capture the diff HERE —
+                    # before the partial-promote, after which real==shadow → empty diff —
+                    # to persist AND live-render a resolved diff_card. Parity with the
+                    # review path's durable record and the controller edit auto-accept
+                    # live render; otherwise the transcript has only a bare breadcrumb.
+                    _auto_step_diff = [
+                        dataclasses.asdict(e)
+                        for e in self._compute_diff_entries(
+                            real_path, shadow_path, step_result.touched_files, task.task_id,
+                        )
+                    ]
                 # Always partial-promote so subsequent steps' EXPLORE reads see prior
                 # accepted changes. Review (if enabled above) runs BEFORE; promote is
                 # required regardless of whether review was shown.
@@ -1650,6 +1680,13 @@ class AgentOrchestrator:
                 ))
                 await self._store.save(task)
                 if _auto:
+                    # Durable resolved diff_card (renders Applied, inert) THEN the
+                    # completion breadcrumb — same order the review path uses
+                    # (diff → ✓). Broadcast live since no gate showed the diff.
+                    self._write_chat_step_diff_record(
+                        task, step.id, step.goal[:120], _auto_step_diff or [],
+                        "accept", broadcast_live=True,
+                    )
                     self._write_step_completed_breadcrumb(task, step)
 
             task = transition(task, TaskStatus.VALIDATING, "full validation started")

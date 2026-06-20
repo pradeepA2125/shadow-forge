@@ -35,7 +35,23 @@ class ChatThreadStore:
         # Controller-turn gate (mode/edit), added after the table shipped.
         if "controller_gate_json" not in existing:
             self._conn.execute("ALTER TABLE chat_threads ADD COLUMN controller_gate_json TEXT")
+        # Durable controller conversation history (seed_history substrate), added later.
+        if "controller_history_json" not in existing:
+            self._conn.execute("ALTER TABLE chat_threads ADD COLUMN controller_history_json TEXT")
+        # Pinned retrieval seed (cache-prefix head), added later.
+        if "controller_seed_json" not in existing:
+            self._conn.execute("ALTER TABLE chat_threads ADD COLUMN controller_seed_json TEXT")
         self._conn.commit()
+
+    @staticmethod
+    def _history_from_row(row: sqlite3.Row) -> list[dict] | None:
+        raw = row["controller_history_json"]
+        return json.loads(raw) if raw else None
+
+    @staticmethod
+    def _seed_from_row(row: sqlite3.Row) -> dict | None:
+        raw = row["controller_seed_json"]
+        return json.loads(raw) if raw else None
 
     @staticmethod
     def _gate_from_row(row: sqlite3.Row) -> PendingGate | None:
@@ -72,6 +88,8 @@ class ChatThreadStore:
                 touched_files=json.loads(row["touched_files_json"]),
                 active_task_id=row["active_task_id"],
                 pending_controller_gate=self._gate_from_row(row),
+                controller_conversation_history=self._history_from_row(row),
+                controller_retrieval_seed=self._seed_from_row(row),
             )
             for row in rows
         ]
@@ -91,7 +109,32 @@ class ChatThreadStore:
             touched_files=json.loads(row["touched_files_json"]),
             active_task_id=row["active_task_id"],
             pending_controller_gate=self._gate_from_row(row),
+            controller_conversation_history=self._history_from_row(row),
+            controller_retrieval_seed=self._seed_from_row(row),
         )
+
+    def set_controller_seed(self, thread_id: str, seed: dict | None) -> None:
+        """Pin the thread's retrieval seed (frozen cache-prefix head). Written once on
+        first compute; replayed verbatim thereafter so the KV prefix survives restart."""
+        raw = json.dumps(seed) if seed else None
+        self._conn.execute(
+            "UPDATE chat_threads SET controller_seed_json = ? WHERE thread_id = ?",
+            (raw, thread_id),
+        )
+        self._conn.commit()
+
+    def set_controller_history(
+        self, thread_id: str, history: list[dict] | None
+    ) -> None:
+        """Persist the controller loop's verbatim turn history. Mirrors
+        set_controller_gate: an in-place durable update the next turn rehydrates
+        seed_history from (parity with TaskRecord.planning_conversation_history)."""
+        raw = json.dumps(history) if history else None
+        self._conn.execute(
+            "UPDATE chat_threads SET controller_history_json = ? WHERE thread_id = ?",
+            (raw, thread_id),
+        )
+        self._conn.commit()
 
     def set_controller_gate(self, thread_id: str, gate: PendingGate | None) -> None:
         """Set (or clear, with None) the thread's controller-turn gate. Mirrors

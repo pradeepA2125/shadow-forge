@@ -143,3 +143,57 @@ async def test_auto_accept_writes_step_completed_breadcrumb(tmp_path: Path) -> N
     thread = chat_store.get_thread(thread_id)
     crumbs = [m.content for m in thread.messages if m.metadata.get("breadcrumb")]
     assert any("Step completed" in c and "bump x" in c for c in crumbs)
+
+
+@pytest.mark.asyncio
+async def test_auto_accept_diff_record_persists_and_broadcasts(tmp_path: Path) -> None:
+    """Auto-accept (no review gate) still leaves a resolved diff_card in the
+    transcript AND broadcasts it live so it renders without a reload."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    orch, chat_store, thread_id = _make(tmp_path)
+    task = await _seed_executing(orch, thread_id, ws)
+
+    diff_entries = [{
+        "path": "a.py", "additions": 1, "deletions": 1,
+        "temp_path": "", "unified_diff": "+x = 2\n-x = 1\n",
+    }]
+    orch._write_chat_step_diff_record(
+        task, "s1", "bump x", diff_entries, "accept", broadcast_live=True,
+    )
+
+    # Durable, inert (resolved=applied) record.
+    thread = chat_store.get_thread(thread_id)
+    [card] = [m for m in thread.messages if m.type == "diff_card"]
+    assert card.metadata["resolved"] == "applied"
+    assert card.metadata["step_id"] == "s1"
+    assert card.metadata["diff_entries"][0]["path"] == "a.py"
+
+    # Live broadcast on the task channel (where the chat stream is bridged).
+    events = list(orch.broadcaster._replay[task.task_id])
+    diff_ready = [e for e in events if e["type"] == "diff_ready"]
+    assert len(diff_ready) == 1
+    payload = diff_ready[0]["payload"]
+    assert payload["resolved"] == "applied"
+    assert payload["task_id"] == task.task_id
+    assert payload["diff_entries"][0]["path"] == "a.py"
+
+
+@pytest.mark.asyncio
+async def test_step_review_record_no_live_broadcast_by_default(tmp_path: Path) -> None:
+    """The review path's durable record must NOT broadcast diff_ready — the live
+    StepGate already showed the diff (broadcast_live defaults False)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    orch, chat_store, thread_id = _make(tmp_path)
+    task = await _seed_executing(orch, thread_id, ws)
+
+    orch._write_chat_step_diff_record(
+        task, "s1", "bump x",
+        [{"path": "a.py", "additions": 1, "deletions": 0,
+          "temp_path": "", "unified_diff": "+x = 2\n"}],
+        "accept",
+    )
+
+    events = list(orch.broadcaster._replay[task.task_id])
+    assert not [e for e in events if e["type"] == "diff_ready"]

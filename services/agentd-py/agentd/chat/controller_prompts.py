@@ -55,7 +55,11 @@ CONTROLLER_RESPONSE_SCHEMA: dict[str, object] = {
 
 _PHASE_TYPES: dict[str, list[str]] = {
     "DECIDE": ["tool_call", "answer", "clarify", "propose_mode"],
-    "EDIT": ["tool_call", "edit", "submit_changes"],
+    # EDIT keeps `clarify` so the agent can ask when a genuine ambiguity blocks it
+    # mid-edit (reading the workspace can't resolve it); the user's reply resumes the
+    # loop in EDIT (ChatController._edit_clarify_pending). It still cannot re-open mode
+    # selection — `propose_mode` stays DECIDE-only.
+    "EDIT": ["tool_call", "edit", "clarify", "submit_changes"],
 }
 
 
@@ -91,7 +95,9 @@ Use the exact key "mode" (never "type") and only those four mode values. Example
    {"mode":"create_task","label":"Plan it as a task","description":"Draft a plan you approve, then execute."},
    {"mode":"explain","label":"Just explain","description":"No changes — I describe the approach."}]}
 After the user picks "edit" you may emit type="edit" with patch_ops, then type="submit_changes" when
-done. Each patch op is an object where "file" is a WORKSPACE-RELATIVE PATH (a single line like
+done. If a genuine ambiguity blocks you mid-edit and reading the workspace won't resolve it, emit
+type="clarify" with a question instead of guessing — the user's answer resumes the edit.
+Each patch op is an object where "file" is a WORKSPACE-RELATIVE PATH (a single line like
 "src/tax.py") — NEVER put code in "file". The code/text goes in "content" (for create_file) or in
 "search"/"replace" (for search_replace). EVERY op also needs a one-line "reason". Examples:
 {"type":"edit","thought":"...","patch_ops":[
@@ -147,7 +153,9 @@ def build_controller_step_payload(
     payload["goal"] = plan_context.get("goal", "")
     _phase_hint = (
         "You are in EDIT mode: emit type='edit' (patch_ops) to make changes, then "
-        "type='submit_changes' when done. Do NOT propose_mode again."
+        "type='submit_changes' when done. If a genuine ambiguity blocks you and reading "
+        "the workspace won't resolve it, emit type='clarify' instead of guessing. Do NOT "
+        "propose_mode again."
         if phase == "EDIT"
         else "Explore with tools, then answer, clarify, or propose_mode."
     )
