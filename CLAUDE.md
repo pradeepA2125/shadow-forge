@@ -168,6 +168,15 @@ Routes registered when `chat_agent` is non-None in `build_router()`:
 - `GET /v1/chat/threads/{thread_id}` — get thread with messages
 - `POST /v1/chat/threads/{thread_id}/message` — SSE stream. Body: `{content, step_review?}` — `step_review` (bool) is the composer's "Review each step" toggle, sent with every message; it's applied only when the turn creates a task (`large_change`): `step_review_auto_accept = not step_review`, frozen into the TaskRecord at creation (flipping the checkbox mid-task changes nothing). When omitted/non-bool the `AI_EDITOR_STEP_REVIEW_AUTO_ACCEPT` env default applies
 
+#### Reactive controller (`AI_EDITOR_CHAT_CONTROLLER=1`) — supersedes the legacy `ChatAgent` flow below
+
+Merged on `main` via PR #2 (2026-06-21), flag-gated. `controller_factory.select_chat_handler` returns `ChatController` (`chat/controller.py`) instead of the legacy `ChatAgent` when the flag is truthy; both expose the same `handle_message(...)` surface + `_store`/`_broadcaster` attrs. **There is no explore→classify→route pre-classification.** Each turn runs one `ControllerLoop` (ReAct, mirrors `PlanningLoop`; `chat/controller_loop.py`): explore tools → **decide** one action — `answer` | `clarify` | `propose_mode` | `edit` | `submit_changes`. Phases are owned by `ControllerPhaseSM` (`chat/controller_phase.py`): `DECIDE → EDIT | EXPLAIN`; per-phase action-type filtering + a tight `oneOf` response schema on providers with `supports_oneof_grammar` (flat fallback otherwise). Edits run in a `TurnEditSession` (ACID shadow, **instant-promote on accept**, restore on reject). Prompts in `chat/controller_prompts.py`.
+
+- **Reactive routing of a "large feature":** for an ambitious request (e.g. "build X") in an empty workspace the controller does NOT force inline; it emits `propose_mode` → a **ModeGate** carrying `{plan_sketch, recommended, reason, options:[{mode,label,description}]}` (typically `edit` vs `explain`, recommending `edit`). Accepting `edit` (via `POST /mode-decision` or the live ModeGate buttons — labels are **model-authored**, e.g. "Create index.html now") starts the EDIT phase, which writes the file into the turn shadow and parks at an **EditGate** when review is on; **Accept = instant-promote** to the real workspace. (Verified live this session: single-file Three.js game built end-to-end on TQP `qwen3.6:35b-a3b-q4_K_M` through ModeGate→EditGate→promote.)
+- **Class-A live gates:** the active gate is on the thread as `pending_controller_gate` and surfaced by `GET /v1/chat/threads/{id}/live` → `{turn_active, pending_gate:{kind: mode|edit|command, payload}, status, plan, failure_summary, run_summary, task_narrative}`. Same render-from-`/live`, durable-breadcrumb model as the task gates. Turns are detached/durable (`/message` & `/mode-decision` 409-guard + subscribe-relay; `POST /stop` to halt; live-resume re-subscribes on reload).
+- **GOTCHA — the controller is workspace-frozen at startup.** `main.py` reads `AI_EDITOR_WORKSPACE_PATH` (default cwd) **once** and passes it into `select_chat_handler`; `ChatController._workspace_path` is used for the shadow root, all file ops, and retrieval **on every turn**. The thread's `workspace_path` column is stored and used for thread *listing* but is **ignored per-turn** — one backend process serves exactly one editing workspace. To test a specific workspace, point both the backend env AND the dev-host's opened folder at the same path. And **always quote `--workspace`** to `start-backend.sh`: an unquoted path with a space corrupts `$WORKSPACE` and every derived var (`DB_PATH`, `SHADOW_ROOT`, `ARTIFACTS_ROOT`, …) to the pre-space prefix.
+- **Debug artifacts:** `<workspace>/.agentd/artifacts/chat/<thread_id>/<turn_id>/controller-turn-NN.json` (exact per-iteration LLM bytes) + `turn-trace.json` — the controller analog of the task path's `plan-turn`/`tool-trace`.
+
 SSE event types from the chat message endpoint:
 
 | Event | Description |
@@ -184,7 +193,7 @@ SSE event types from the chat message endpoint:
 | `plan_card` | Read-only plan version (`{task_id, plan_markdown}`), pushed to the transcript live. Persisted via `append_plan_card`. |
 | `chat_done` | Turn complete |
 
-`ChatAgent` flow per message:
+`ChatAgent` flow per message (legacy path, `AI_EDITOR_CHAT_CONTROLLER` off — see reactive controller above for the flag-on path):
 1. **Explore phase** — up to 5 tool calls via `PlanningToolRegistry`; results go into `context`
 2. **Classify** — `IntentClassifier` → `qa / small_change / large_change`
 3. **Respond** — `qa` → `generate_text` answer; `small_change` → `run_inline_change`; `large_change` → `create_task_from_chat`
