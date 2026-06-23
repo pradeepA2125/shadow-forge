@@ -64,3 +64,28 @@ def test_edit_phase_instruction_hint():
     payload = build_controller_step_payload(
         {"goal": "g", "workspace_path": "/w"}, history=[], tool_definitions=[], phase="EDIT")
     assert "EDIT mode" in str(payload["instruction"])
+
+
+def test_todo_status_lands_in_tail_when_present():
+    payload = build_controller_step_payload(
+        {"goal": "add features", "workspace_path": "/w",
+         "todo_status": "2 items (1 done) — [✓ A] [☐ B]"},
+        history=[], tool_definitions=[], phase="EDIT")
+    assert payload.get("todo_status") == "2 items (1 done) — [✓ A] [☐ B]"
+    keys = list(payload.keys())
+    assert keys.index("todo_status") > keys.index("workspace_path")
+
+
+def test_todo_status_omitted_when_blank():
+    payload = build_controller_step_payload(
+        {"goal": "g", "workspace_path": "/w", "todo_status": ""},
+        history=[], tool_definitions=[], phase="EDIT")
+    assert "todo_status" not in payload
+
+
+def test_system_prompt_teaches_write_todos_and_policy():
+    from agentd.chat.controller_prompts import CONTROLLER_SYSTEM_PROMPT
+    p = CONTROLLER_SYSTEM_PROMPT
+    assert "write_todos" in p
+    assert "enumerate" in p.lower()
+    assert "evidence" in p.lower()

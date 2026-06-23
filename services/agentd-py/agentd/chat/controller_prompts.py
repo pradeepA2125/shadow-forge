@@ -246,6 +246,9 @@ Variant — clarify (you genuinely cannot proceed): {type, question}
 
 Variant — propose_mode (the request needs a change): {type, plan_sketch, reason, recommended, options}
   "recommended": EXACTLY one of edit | create_task | resume | explain.
+  When the change is LARGE / multi-part, "plan_sketch" MUST enumerate EVERY distinct part
+  (e.g. "1. Enemies … 2. Jump … 3. Timer …"), not just the first — that full scope becomes
+  your todo list.
   "options": list of {"mode": <edit|create_task|resume|explain>, "label": <short>, "description": <one line>}.
   Use the exact key "mode" (never "type") and only those four values. Normally offer "edit"
   (inline now, user accepts/rejects each edit), "create_task" (a reviewed step-by-step task), and
@@ -281,6 +284,19 @@ Variant — edit (EDIT mode only, after the user picked "edit"): {type, patch_op
 Variant — submit_changes (EDIT mode, when all edits are done): {type, summary}
   "summary": a non-empty one-liner of what you changed. Emit this to END the edit turn.
   {"type":"submit_changes","thought":"done","summary":"Added with_tax() to src/tax.py and rounded the total in pricing.py."}
+
+TODO LIST POLICY (the write_todos tool) — optional working memory, NOT default:
+Create a list (call write_todos with all items, status "pending") ONLY when the request needs
+several distinct features/steps or more than ~2 edit cycles. SKIP it for a single small edit, a
+plain answer, or a clarification. Once a list exists it is your contract: implement items ONE AT
+A TIME (emit type='edit' for the next item, then write_todos to flip it 'done'), and resend the
+WHOLE list each call (reshape freely — split/insert/reorder by resending in the new shape).
+submit_changes is BLOCKED until nothing is pending — this is how you finish the whole request
+instead of stopping after one feature.
+Rules: mark 'done' ONLY with concrete evidence (a tool/edit result) cited in 'note' — never from
+memory. Mark 'blocked' (with the unblock condition) instead of faking done when stuck; mark
+'cancelled' (with why) instead of silently dropping. Every change must serve the user's original
+goal — no speculative nice-to-haves.
 
 After an edit, prefer live tools (read_file/search_code) over the retrieval seed — your edit is
 already on the real workspace. Available tools:
@@ -330,6 +346,11 @@ def build_controller_step_payload(
     # TAIL (per-turn-varying): the current request + instruction + budget. Placed
     # AFTER the append-only history so the multi-k-token prefix stays cache-stable.
     payload["goal"] = plan_context.get("goal", "")
+    # Per-turn-varying ledger status (ControllerLoop sets it each iteration). Tail-only so the
+    # KV prefix stays stable; omitted when blank (no list) so simple turns are byte-identical.
+    todo_status = plan_context.get("todo_status")
+    if isinstance(todo_status, str) and todo_status:
+        payload["todo_status"] = todo_status
     # Per-turn steering, mirroring build_planning_step_payload's reflect-then-choose
     # scaffold: first-turn anchoring (don't commit cold), mid-turn reflect→(explore|commit),
     # and a final-step "land it now" warning. Phase-aware (DECIDE vs EDIT). This — not the
@@ -352,11 +373,14 @@ def build_controller_step_payload(
         else:
             hint = (
                 "FIRST reflect on your last edit's result: did it apply ('applied+promoted') or "
-                "fail ('PATCH FAILED: …')? THEN choose ONE: (A) CONTINUE/FIX — if it failed, "
-                "re-read the exact lines and re-emit ONE corrected op (do NOT repeat the failed "
-                "op verbatim); if more changes remain, emit the next type='edit'. (B) DONE — emit "
-                "type='submit_changes' with a summary. A genuine, read-resistant blocker → "
-                "type='clarify'. Do NOT propose_mode again."
+                "fail ('PATCH FAILED: …')? If a todo list is active, todo_status shows the "
+                "remaining items — work the next pending one; submit_changes is BLOCKED until "
+                "nothing is pending. THEN choose ONE: (A) CONTINUE/FIX — if it failed, re-read "
+                "the exact lines and re-emit ONE corrected op (do NOT repeat the failed op "
+                "verbatim); for the next item emit type='edit', and after it applies call "
+                "write_todos to mark it 'done' (cite evidence in 'note'). (B) DONE — only when no "
+                "items remain, emit type='submit_changes' with a summary. A read-resistant "
+                "blocker → mark the item 'blocked' or use type='clarify'. Do NOT propose_mode again."
             )
     else:  # DECIDE
         if not history:
