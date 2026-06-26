@@ -10,7 +10,7 @@ describe("TodoCard", () => {
       { title: "Timer", status: "pending", note: "" },
       { title: "Sound", status: "blocked", note: "needs asset" },
     ]} />);
-    expect(screen.getByText(/1 of 4/i)).toBeTruthy();   // done count (cancelled excluded from total)
+    expect(screen.getByText("1/4")).toBeTruthy();   // done/total count (cancelled excluded from total)
     expect(screen.getByText("Enemies")).toBeTruthy();
     expect(screen.getByText("Jump")).toBeTruthy();
     expect(screen.getByText(/needs asset/i)).toBeTruthy();  // blocked reason shown
@@ -21,7 +21,7 @@ describe("TodoCard", () => {
       { title: "A", status: "done", note: "" },
       { title: "B", status: "cancelled", note: "superseded" },
     ]} />);
-    expect(screen.getByText(/1 of 1/i)).toBeTruthy();   // cancelled not counted in total
+    expect(screen.getByText("1/1")).toBeTruthy();   // cancelled not counted in total
     expect(screen.getByText("B")).toBeTruthy();
   });
 });
