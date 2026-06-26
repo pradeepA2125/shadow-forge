@@ -245,18 +245,13 @@ Variant — clarify (you genuinely cannot proceed): {type, question}
   {"type":"clarify","thought":"ambiguous target","question":"Which pricing module — src/pricing.py or billing/pricing.py?"}
 
 Variant — propose_mode (the request needs a change): {type, plan_sketch, reason, recommended, options}
-  "recommended": EXACTLY one of edit | create_task | resume | explain.
+  Inline "edit" is the PRIMARY path for a change of ANY size — small AND large. A large /
+  multi-part change is still done inline: you track it with the todo list (write_todos) and
+  work it one item at a time. Do NOT treat "edit" as only-for-small.
   When the change is LARGE / multi-part, "plan_sketch" MUST enumerate EVERY distinct part
   (e.g. "1. Enemies … 2. Jump … 3. Timer …"), not just the first — that full scope becomes
   your todo list.
-  "options": list of {"mode": <edit|create_task|resume|explain>, "label": <short>, "description": <one line>}.
-  Use the exact key "mode" (never "type") and only those four values. Normally offer "edit"
-  (inline now, user accepts/rejects each edit), "create_task" (a reviewed step-by-step task), and
-  "explain" (describe only).
-  {"type":"propose_mode","thought":"small new file","plan_sketch":"Add clamp(x,lo,hi) to src/mathutil.py","reason":"single small new file","recommended":"edit","options":[
-    {"mode":"edit","label":"Edit inline now","description":"I add the file directly; you review it."},
-    {"mode":"create_task","label":"Plan it as a task","description":"Draft a plan you approve, then execute."},
-    {"mode":"explain","label":"Just explain","description":"No changes — I describe the approach."}]}
+{propose_mode_modes}
 
 Variant — edit (EDIT mode only, after the user picked "edit"): {type, patch_ops}
   "patch_ops" is a NON-EMPTY list — one edit can combine MULTIPLE ops on one or more files, and they
@@ -320,11 +315,49 @@ already on the real workspace. Available tools:
 _DEFAULT_MAX_ITERS = 32
 
 
-def format_controller_system_prompt(tool_definitions: list[dict[str, object]]) -> str:
-    # .replace (not .format): the prompt embeds a literal JSON example with { } braces
-    # that str.format would misparse as fields.
-    return CONTROLLER_SYSTEM_PROMPT.replace(
-        "{tools_json}", json.dumps(tool_definitions, indent=2, sort_keys=True)
+# The propose_mode mode-vocabulary lines, swapped by the task-subsystem flag. OFF (default):
+# only edit/explain — the controller handles everything inline. ON: the full task path.
+_PROPOSE_MODE_MODES_ENABLED = """\
+  "recommended": EXACTLY one of edit | create_task | resume | explain.
+  "options": list of {"mode": <edit|create_task|resume|explain>, "label": <short>, "description": <one line>}.
+  Use the exact key "mode" (never "type") and only those four values. Normally offer "edit"
+  (inline now, user accepts/rejects each edit), "create_task" (a reviewed step-by-step task), and
+  "explain" (describe only).
+  {"type":"propose_mode","thought":"new feature","plan_sketch":"Add clamp(x,lo,hi) to src/mathutil.py","reason":"single new file","recommended":"edit","options":[
+    {"mode":"edit","label":"Edit inline now","description":"I make the change directly; you review it."},
+    {"mode":"create_task","label":"Plan it as a task","description":"Draft a plan you approve, then execute."},
+    {"mode":"explain","label":"Just explain","description":"No changes — I describe the approach."}]}"""
+
+_PROPOSE_MODE_MODES_DISABLED = """\
+  "recommended": EXACTLY one of edit | explain.
+  "options": list of {"mode": <edit|explain>, "label": <short>, "description": <one line>}.
+  Use the exact key "mode" (never "type") and only those two values. Offer "edit"
+  (make the change inline now — any size, tracked with the todo list) and "explain" (describe only).
+  {"type":"propose_mode","thought":"new feature","plan_sketch":"Add clamp(x,lo,hi) to src/mathutil.py","reason":"single new file","recommended":"edit","options":[
+    {"mode":"edit","label":"Edit inline now","description":"I make the change directly; you review it."},
+    {"mode":"explain","label":"Just explain","description":"No changes — I describe the approach."}]}"""
+
+
+def format_controller_system_prompt(
+    tool_definitions: list[dict[str, object]],
+    *,
+    task_subsystem_enabled: bool | None = None,
+) -> str:
+    """Assemble the controller system prompt. The propose_mode mode-vocabulary block is
+    swapped by the task-subsystem flag (default resolved from env) — see the spec. The
+    flag is process-fixed, so the assembled prompt is stable per process (cache-safe).
+
+    .replace (not .format): the prompt embeds literal JSON examples with { } braces that
+    str.format would misparse as fields."""
+    from agentd.chat.controller_factory import is_task_subsystem_enabled
+
+    if task_subsystem_enabled is None:
+        task_subsystem_enabled = is_task_subsystem_enabled()
+    modes = _PROPOSE_MODE_MODES_ENABLED if task_subsystem_enabled else _PROPOSE_MODE_MODES_DISABLED
+    return (
+        CONTROLLER_SYSTEM_PROMPT
+        .replace("{propose_mode_modes}", modes)
+        .replace("{tools_json}", json.dumps(tool_definitions, indent=2, sort_keys=True))
     )
 
 
