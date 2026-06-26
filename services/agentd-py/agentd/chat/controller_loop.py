@@ -205,6 +205,16 @@ class ControllerLoop:
         self._calls: list[ToolCall] = []
         self._results: list[ToolResult] = []
         self._thinking: list[str] = []
+        # The live conversation list `_iterate` mutates — exposed via partial_history() so a
+        # caller can persist what a CANCELLED turn (/stop) accumulated before the cancel
+        # raised, instead of losing the turn's exploration + already-promoted edits (Q2).
+        self._history: list[dict[str, object]] = []
+
+    def partial_history(self) -> list[dict[str, object]]:
+        """The verbatim conversation accumulated so far this turn. Meaningful after a
+        cancel: run()'s normal return persists history itself, but a CancelledError unwinds
+        before that — the caller reads this to persist the partial."""
+        return self._history
 
     async def run(
         self,
@@ -220,6 +230,9 @@ class ControllerLoop:
     ) -> ControllerOutcome:
         tool_defs = [d.model_dump() for d in self._registry.definitions()]
         history = [dict(m) for m in seed_history] if seed_history else []
+        # Expose the live list NOW (before _iterate can raise) so a cancel mid-turn still
+        # leaves the caller a readable partial (Q2). _iterate mutates this same object.
+        self._history = history
         seen: dict[str, int] = {}
         # Bail only after this many CONSECUTIVE malformed responses (mirror PlanningLoop).
         _MAX_MALFORMED = 3

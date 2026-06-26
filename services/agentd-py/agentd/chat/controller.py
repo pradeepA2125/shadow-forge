@@ -351,11 +351,29 @@ class ChatController:
         pills_cb = partial(self._persist_inflight_pills, thread_id, turn_id) \
             if turn_id else None
         max_iters = int(os.environ.get("AI_EDITOR_CONTROLLER_MAX_ITERS", "500"))
-        outcome = await loop.run(
-            plan_context, max_iters=max_iters, seed_history=seed_history,
-            auto_accept_edits=(not is_review), edit_decision_cb=edit_cb,
-            edit_record_cb=record_cb, retrieval_delta_cb=self._retrieval_delta_cb,
-            on_pills_update=pills_cb)
+        try:
+            outcome = await loop.run(
+                plan_context, max_iters=max_iters, seed_history=seed_history,
+                auto_accept_edits=(not is_review), edit_decision_cb=edit_cb,
+                edit_record_cb=record_cb, retrieval_delta_cb=self._retrieval_delta_cb,
+                on_pills_update=pills_cb)
+        except asyncio.CancelledError:
+            # /stop cancels the turn's asyncio.Task, raising here BEFORE the normal post-run
+            # persistence below ever runs. Capture what the turn accumulated — its exploration
+            # AND any edits it already instant-promoted to the real workspace — so the NEXT turn
+            # rehydrates it instead of seeding from stale pre-turn state ("forgot what it just
+            # did"). The diff_cards were persisted live (edit_record_cb), but those live in the
+            # transcript column, NOT in controller_conversation_history (the model's replayed
+            # context), so without this the model has no memory of its own stopped-turn edits.
+            # Sync writes only (no further await) → the re-raised cancellation can't interrupt
+            # them; then re-raise so stop_turn's own teardown/breadcrumb proceeds.
+            partial_hist = loop.partial_history()
+            if partial_hist:
+                self._histories[thread_id] = partial_hist
+                self._store.set_controller_history(thread_id, partial_hist)
+            self._store.set_controller_todos(
+                thread_id, ledger.to_json() if ledger.items else None)
+            raise
         self._histories[thread_id] = outcome.history or []
         # Turn trace artifact (controller analog of tool-trace.json): the whole turn's
         # info in one file for offline debugging — phase, verbatim history, pills,
