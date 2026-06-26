@@ -8,15 +8,34 @@ step_review=None) plus `_store`/`_broadcaster` attrs the route reads.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 _FLAG_ENV = "AI_EDITOR_CHAT_CONTROLLER"
+_TASK_SUBSYSTEM_ENV = "AI_EDITOR_TASK_SUBSYSTEM"
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
 def is_controller_enabled() -> bool:
     return os.getenv(_FLAG_ENV, "0").strip().lower() in _TRUTHY
+
+
+def is_task_subsystem_enabled() -> bool:
+    """Whether the task-based path (create_task/resume + task UI) is active. Default OFF:
+    the controller handles small + large changes inline via the todo ledger. Opt in with
+    AI_EDITOR_TASK_SUBSYSTEM=1 (only coherent with AI_EDITOR_CHAT_CONTROLLER=1)."""
+    return os.getenv(_TASK_SUBSYSTEM_ENV, "0").strip().lower() in _TRUTHY
+
+
+def warn_if_incoherent_flags(logger: logging.Logger) -> None:
+    """Task-subsystem OFF only works when the controller is ON (the legacy ChatAgent's
+    large_change branch has nowhere to go without create_task). Warn — do not fail."""
+    if not is_task_subsystem_enabled() and not is_controller_enabled():
+        logger.warning(
+            "incoherent flags: AI_EDITOR_TASK_SUBSYSTEM is off but AI_EDITOR_CHAT_CONTROLLER "
+            "is also off — large changes have no path. Set AI_EDITOR_CHAT_CONTROLLER=1."
+        )
 
 
 def select_chat_handler(

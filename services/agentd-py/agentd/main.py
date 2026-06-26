@@ -311,7 +311,7 @@ def _scope_remember_env() -> ScopeRemember:
         return ScopeRemember.TASK
 
 
-from agentd.chat.controller_factory import select_chat_handler
+from agentd.chat.controller_factory import select_chat_handler, warn_if_incoherent_flags
 from agentd.chat.storage import ChatThreadStore
 
 _chat_db_path = Path(os.getenv("AI_EDITOR_CHAT_DB_PATH", ".agentd/chat.sqlite3")).resolve()
@@ -368,6 +368,8 @@ _chat_agent = select_chat_handler(
     shell_policy=_shell_policy_env(),
     command_decision_timeout_sec=_float_env("AI_EDITOR_COMMAND_DECISION_TIMEOUT_SEC", 0.0),
 ) if reasoning_backend != "scripted" else None
+
+warn_if_incoherent_flags(logging.getLogger("agentd.startup"))
 
 app.include_router(build_router(store, orchestrator, workspace_manager, retrieval_client, _chat_agent))
 
