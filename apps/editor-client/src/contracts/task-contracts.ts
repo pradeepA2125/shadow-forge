@@ -240,11 +240,11 @@ export const ChatEventSchema = z.object({
 export type ChatEvent = z.infer<typeof ChatEventSchema>;
 
 // The single gate a thread's current task is waiting on (mirrors backend PendingGate).
-// "mode"/"edit" are the agentic chat-controller gates (no task) — the Zod enum is the
-// RUNTIME gate: a kind missing here makes ThreadLiveStateSchema.parse() throw, which
+// "mode"/"edit"/"clarify" are the agentic chat-controller gates (no task) — the Zod enum
+// is the RUNTIME gate: a kind missing here makes ThreadLiveStateSchema.parse() throw, which
 // pollThreadLiveState swallows, so the gate silently never renders.
 export const PendingGateSchema = z.object({
-  kind: z.enum(["command", "step", "scope", "validation", "mode", "edit"]),
+  kind: z.enum(["command", "step", "scope", "validation", "mode", "edit", "clarify"]),
   payload: z.record(z.unknown()).default({}),
 });
 export type PendingGate = z.infer<typeof PendingGateSchema>;
@@ -313,6 +313,8 @@ export interface BackendTaskClient {
   // produce live events); the per-edit gate is a plain JSON ack (its continuation rides
   // the already-open message stream).
   postModeDecision(threadId: string, mode: string): AsyncIterable<StreamEvent>;
+  // Controller clarify gate: a STREAMED dispatch (the answer re-enters the loop).
+  postClarifyDecision(threadId: string, answer: string): AsyncIterable<StreamEvent>;
   postEditDecision(threadId: string, decision: "accept" | "reject", reason?: string): Promise<void>;
   // Controller run_command gate: a plain JSON ack (continuation rides the open message stream).
   postChatCommandDecision(threadId: string, decision: CommandDecision): Promise<void>;

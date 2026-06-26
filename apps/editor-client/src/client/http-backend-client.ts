@@ -268,6 +268,45 @@ export class HttpBackendClient implements BackendTaskClient {
     }
   }
 
+  // Controller clarify gate: a STREAMED dispatch (the answer re-enters the loop),
+  // consumed like sendChatMessage — mirror of postModeDecision.
+  async *postClarifyDecision(threadId: string, answer: string): AsyncIterable<StreamEvent> {
+    const response = await this.fetchFn(
+      `${this.options.baseUrl}/v1/chat/threads/${encodeURIComponent(threadId)}/clarify-decision`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answer }),
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`Clarify decision failed (${response.status}) for thread ${threadId}`);
+    }
+    if (!response.body) return;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          try {
+            yield ChatEventSchema.parse(JSON.parse(line.slice(5).trim())) as StreamEvent;
+          } catch {
+            // skip malformed SSE line
+          }
+        }
+      }
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+  }
+
   async stopChatTurn(threadId: string): Promise<{ ok: boolean }> {
     const raw = await this.fetchJson(
       `/v1/chat/threads/${encodeURIComponent(threadId)}/stop`,

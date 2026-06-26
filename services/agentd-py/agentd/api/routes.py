@@ -1310,6 +1310,60 @@ def build_router(
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+        @router.post("/chat/threads/{thread_id}/clarify-decision")
+        async def post_clarify_decision(thread_id: str, request: dict) -> StreamingResponse:
+            import asyncio as _asyncio_clar
+            import json as _json_clar
+            answer = request.get("answer", "")
+            channel_id = f"chat:{thread_id}"
+            # Read the goal from the thread's last user message — don't trust the client.
+            thread = _chat_agent._store.get_thread(thread_id)
+            goal = ""
+            if thread is not None:
+                goal = next(
+                    (m.content for m in reversed(thread.messages) if m.role == "user"), "")
+
+            _active = getattr(_chat_agent, "_active_turns", None)
+            if _active is not None:
+                if thread_id in _active:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Thread {thread_id} already has a turn in progress")
+                _chat_agent._broadcaster.clear_replay(channel_id)
+                _chat_agent.launch_turn(  # type: ignore[attr-defined]
+                    thread_id,
+                    _chat_agent.resolve_clarify(  # type: ignore[attr-defined]
+                        thread_id, answer, channel_id=channel_id, goal=goal),
+                    channel_id=channel_id,
+                )
+                queue = _chat_agent._broadcaster.subscribe(channel_id)
+
+                async def detached_clarify_stream():
+                    try:
+                        while True:
+                            try:
+                                event = await _asyncio_clar.wait_for(
+                                    queue.get(), timeout=15.0)
+                            except TimeoutError:
+                                yield ": ping\n\n"
+                                continue
+                            yield f"data: {_json_clar.dumps(event)}\n\n"
+                            if event.get("type") in ("chat_done", "done"):
+                                break
+                    finally:
+                        _chat_agent._broadcaster.unsubscribe(channel_id, queue)
+
+                return StreamingResponse(
+                    detached_clarify_stream(), media_type="text/event-stream")
+
+            # Legacy ChatAgent path has no clarify gate — degrade to an empty stream.
+            _chat_agent._broadcaster.clear_replay(channel_id)
+
+            async def _empty_clarify():
+                yield 'data: {"type": "chat_done", "payload": {}}\n\n'
+
+            return StreamingResponse(_empty_clarify(), media_type="text/event-stream")
+
         @router.post("/chat/threads/{thread_id}/edit-decision")
         async def post_edit_decision(thread_id: str, request: dict) -> dict:
             # Resolves the held-open per-edit gate. The continuation surfaces on the

@@ -106,6 +106,31 @@ async def test_mode_decision_registers_detached_turn(_app):
 
 
 @pytest.mark.asyncio
+async def test_clarify_decision_registers_detached_turn(_app):
+    app, chat_store, gate, handler = _app
+    thread = chat_store.create_thread("/ws")
+
+    # Override resolve_clarify to block on the gate so we can observe registration.
+    captured: dict[str, object] = {}
+
+    async def _slow_resolve(thread_id, answer, *, channel_id, goal):
+        captured["answer"] = answer
+        await handler._gate.wait()
+        handler._broadcaster.broadcast(channel_id, {"type": "chat_done", "payload": {}})
+    handler.resolve_clarify = _slow_resolve  # type: ignore[assignment]
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        url = f"/v1/chat/threads/{thread.thread_id}/clarify-decision"
+        bg = asyncio.create_task(_consume_stream(client, url, {"answer": "src/pricing.py"}))
+        await asyncio.sleep(0.05)
+        assert thread.thread_id in handler._active_turns
+        assert captured["answer"] == "src/pricing.py"
+        gate.set()
+        await bg
+
+
+@pytest.mark.asyncio
 async def test_live_reports_turn_active(_app):
     app, chat_store, gate, handler = _app
     thread = chat_store.create_thread("/ws")
