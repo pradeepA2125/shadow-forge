@@ -182,7 +182,9 @@ Defaults `w_sem=0.5, w_lex=0.3, w_struct=0.2`, all env-tunable (measure, don't h
 - **Rerank:** top-3k by fused score → final-k. v1 rerank = fused score (no cross-encoder); seam left.
 - **This is also where evicted `compaction_segments` become recoverable** — recall can fold the raw
   segment store into its candidate set, which is the read-time realization of "warm vs cold" (relevance
-  decides, not a write-time label).
+  decides, not a write-time label). Phase 1 stores one segment per evicted message verbatim; **Phase 2
+  re-chunks segments to a token target before embedding** (see open questions) so each vector covers a
+  coherent retrieval-sized unit rather than a whole 40KB tool dump.
 - **Query source:** automatic path → current user message + active goal/active-todo; tool path →
   the agent's explicit `recall(query)` string.
 - **Budget:** ≤ `MEMORY_RECALL_TOKEN_BUDGET` (default ~1500 tokens) injected into the dynamic tail.
@@ -387,4 +389,10 @@ AI_EDITOR_MEMORY_GRAPH_GROUNDING       # default on
   provider/model. Resolve in the Phase 1 plan / Phase 2.
 - **Embedder choice** (local sentence-transformer/fastembed vs provider embeddings) — Phase 2; lean
   local-first for offline + zero per-write API cost.
+- **Segment chunking (Phase 2).** Phase 1 persists one segment per evicted message, verbatim — fine
+  while segments are write-only. When Phase 2 embeds + retrieves them, message-shaped granularity
+  breaks down (a 40KB message → one averaged, useless embedding; wildly uneven units). Phase 2 must
+  re-chunk evicted content to a **token target** (~256–512 tokens, optional small overlap, respecting
+  message/turn boundaries) so each embedding covers a coherent unit. The oversize-turn full-original
+  segment needs the same treatment. Decide chunk size/overlap in the Phase 2 spec.
 - **Golden-set authoring** for `RecallEngine` is manual and domain-specific — budget time for it (Phase 2).

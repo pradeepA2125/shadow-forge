@@ -17,6 +17,8 @@
 - New DB path env `AI_EDITOR_MEMORY_DB_PATH` (default `.agentd/memory.sqlite3`). Separate file from task/chat DBs. Phase 1 creates only `compaction_segments` + `anchored_summaries`.
 - **Hot set is token-bounded, not count-bounded.** Keep newest turns that fit `MEMORY_HOT_TOKEN_FRAC × window` (default 0.4), capped at `MEMORY_HOT_TURNS` (default 10). `hot_frac (0.4) < trigger_frac (0.65)` guarantees eviction frees space once triggered. Always keep ≥1 turn; if the single newest turn alone exceeds the hot budget, truncate its in-window copy (head + `…[truncated]…` + tail) and persist the full original as a segment. This is what handles "history ≤ hot_turns but already over budget" and "one giant turn > window".
 - **No `tier` (warm/cold) label is written.** Tiering is a Phase-2 read-time concern; Phase 1 persists evicted turns as plain segments.
+- **`seq` is run-monotonic, not per-batch.** A run can compact many times; each segment's `seq` continues from the run's current max (`store.next_seq(run_id)`) so ordering is stable across compaction rounds (a per-batch `seq=i` would collide round-over-round and corrupt `get_segments` ordering for Phase-2 recall).
+- **Segment granularity is 1 message = 1 segment, verbatim (Phase 1).** No size target / chunking — segments are write-only here (never retrieved until Phase 2), so lossless raw preservation is all that's needed. Token-target chunking is a Phase-2 decision (captured in the spec's open questions).
 - Phase-1 simplification (decided, document in code): Phase 1 folds **all** evicted history into the anchor — no information cliff before recall exists.
 - Default tuning constants (env-overridable): `MEMORY_COMPACT_TRIGGER_FRAC=0.65`, `MEMORY_HOT_TOKEN_FRAC=0.4`, `MEMORY_HOT_TURNS=10`, `MEMORY_WINDOW_TOKENS=128000`.
 - Run the suite with `pytest` and read the actual `FAILED`/summary lines — never trust a piped exit code.
@@ -203,6 +205,7 @@ git commit -m "feat(memory): scaffold memory subpackage with models + config"
   - `__init__(self, db_path: str | Path)` — opens/creates DB, runs migrations.
   - `add_segments(self, segments: list[CompactionSegment]) -> None`
   - `get_segments(self, run_id: str) -> list[CompactionSegment]` — ordered by `seq`.
+  - `next_seq(self, run_id: str) -> int` — `MAX(seq)+1` for the run (0 if none); makes `seq` run-monotonic across compaction rounds.
   - `upsert_anchor(self, run_id: str, summary_md: str) -> AnchoredSummary` — version 1 on insert, else bump.
   - `get_anchor(self, run_id: str) -> AnchoredSummary | None`
 
@@ -231,6 +234,15 @@ def test_segments_scoped_by_run(tmp_path):
     store = MemoryStore(tmp_path / "m.sqlite3")
     store.add_segments([_seg("r1", 0, "a"), _seg("r2", 0, "b")])
     assert [s.content for s in store.get_segments("r1")] == ["a"]
+
+def test_next_seq_monotonic_across_batches(tmp_path):
+    store = MemoryStore(tmp_path / "m.sqlite3")
+    assert store.next_seq("r1") == 0
+    store.add_segments([_seg("r1", store.next_seq("r1"), "a")])
+    assert store.next_seq("r1") == 1
+    store.add_segments([_seg("r1", 1, "b"), _seg("r1", 2, "c")])
+    assert store.next_seq("r1") == 3
+    assert store.next_seq("r2") == 0   # scoped per run
 
 def test_anchor_insert_then_bump_version(tmp_path):
     store = MemoryStore(tmp_path / "m.sqlite3")
@@ -305,6 +317,12 @@ class MemoryStore:
             )
             for r in rows
         ]
+
+    def next_seq(self, run_id: str) -> int:
+        r = self._conn.execute(
+            "SELECT MAX(seq) AS m FROM compaction_segments WHERE run_id=?", (run_id,)
+        ).fetchone()
+        return 0 if r["m"] is None else r["m"] + 1
 
     def upsert_anchor(self, run_id: str, summary_md: str) -> AnchoredSummary:
         now = datetime.now(timezone.utc)
@@ -521,7 +539,8 @@ git commit -m "feat(memory): compactor token helpers, hot selection, below-thres
 - Test: `tests/memory/test_compactor.py` (add cases)
 
 **Interfaces:**
-- Produces: `maybe_compact` over threshold returns `compacted=True` with `history = [anchor_message] + hot`, persists evicted as segments, merges into the anchor via the injected summarizer. Single oversize newest turn ⇒ truncated in-window + full original persisted (`degraded=True`). Empty-evicted (truncation made room alone) ⇒ summarizer not called.
+- Consumes: `MemoryStore.next_seq` (Task 2) for run-monotonic segment ordering.
+- Produces: `maybe_compact` over threshold returns `compacted=True` with `history = [anchor_message] + hot`, persists evicted as segments (`seq` continues from `store.next_seq(run_id)`), merges into the anchor via the injected summarizer. Single oversize newest turn ⇒ truncated in-window + full original persisted (`degraded=True`). Empty-evicted (truncation made room alone) ⇒ summarizer not called.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -592,6 +611,7 @@ Replace the `# Compaction logic added in Task 4.` line and its `return` with:
         ms = int(now.timestamp() * 1000)
         hot_budget = int(self._window_tokens * self._hot_token_frac)
         evicted, hot, hot_used = _select_hot(history, hot_budget, self._hot_turns)
+        base = self._store.next_seq(run_id)  # run-monotonic seq across compaction rounds
         degraded = False
         extra: list[CompactionSegment] = []
         # Backstop: a single newest turn that alone busts the hot budget must be truncated
@@ -599,14 +619,14 @@ Replace the `# Compaction logic added in Task 4.` line and its `return` with:
         if hot_used > hot_budget and len(hot) == 1:
             full = str(hot[0].get("content", ""))
             extra.append(CompactionSegment(
-                id=f"{run_id}-tail-{ms}", run_id=run_id, seq=len(evicted),
+                id=f"{run_id}-{base + len(evicted)}-{ms}", run_id=run_id, seq=base + len(evicted),
                 content=full, created_at=now,
             ))
             hot = [{**hot[0], "content": _truncate_to_tokens(full, hot_budget)}]
             degraded = True
         segments = [
             CompactionSegment(
-                id=f"{run_id}-{i}-{ms}", run_id=run_id, seq=i,
+                id=f"{run_id}-{base + i}-{ms}", run_id=run_id, seq=base + i,
                 content=str(m.get("content", "")), created_at=now,
             )
             for i, m in enumerate(evicted)
@@ -1106,7 +1126,7 @@ git commit -m "test(memory): end-to-end compaction + kill-switch parity"
 
 **Spec coverage (Phase 1 scope only):**
 - §1 component boundaries → Tasks 1–6 (one unit per file; store is the only DB-aware unit). ✓
-- §2 data model (`compaction_segments` with **no** `tier`/`embedding`, `anchored_summaries`) → Task 2. `memories` table is Phase 2 — correctly absent. ✓
+- §2 data model (`compaction_segments` with **no** `tier`/`embedding`, `anchored_summaries`, run-monotonic `seq` via `next_seq`) → Task 2, asserted by `test_next_seq_monotonic_across_batches`. `memories` table is Phase 2 — correctly absent. ✓
 - §5 compaction (0.65 trigger; **token-bounded** hot set + count cap; single-message truncation backstop; anchored merge not regenerate; all-evicted folded; fallback) → Tasks 3/4/5, asserted by `test_select_hot_*`, `test_over_threshold_compacts`, `test_anchor_merges_not_regenerates`, `test_single_oversize_message_is_truncated`, `test_summarizer_failure_falls_back`. The token bound (not count bound) is what guarantees the post-compaction window fits — proven by the oversize + count-cap tests. ✓
 - §7 error handling (kill switch, prepare_turn swallows, summarize/truncation degrade) → Task 6 (`test_prepare_turn_swallows_errors`) + Task 5 + Task 9 parity. ✓
 - §9 phasing (Phase 1 standalone, no `sqlite-vec`/embeddings) → no embedding column, no vec dependency. ✓
