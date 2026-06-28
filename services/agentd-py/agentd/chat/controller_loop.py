@@ -312,6 +312,8 @@ class ControllerLoop:
             run_id = str(plan_context.get("run_id", "chat"))
             _prep = await self._memory_harness.prepare_turn(history, run_id)
             history[:] = _prep.history
+            # Recalled long-term memories → the payload tail (KV-safe). Empty list omits it.
+            plan_context["recalled_memories"] = _prep.recalled_memories
             if _prep.compacted:
                 # Observability: surface the compaction so the chat UI can show it fired.
                 self._broadcaster.broadcast(self._channel_id, {

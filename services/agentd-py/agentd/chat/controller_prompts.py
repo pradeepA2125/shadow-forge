@@ -402,6 +402,11 @@ def build_controller_step_payload(
         payload["conversation_history"] = history
     # TAIL (per-turn-varying): the current request + instruction + budget. Placed
     # AFTER the append-only history so the multi-k-token prefix stays cache-stable.
+    # Recalled long-term memories ride the tail too (finding #13: never the cached head);
+    # omitted when empty so a no-relevant-memory turn stays byte-identical.
+    recalled = plan_context.get("recalled_memories")
+    if isinstance(recalled, list) and recalled:
+        payload["recalled_memories"] = recalled
     payload["goal"] = plan_context.get("goal", "")
     # Per-turn-varying ledger status (ControllerLoop sets it each iteration). Tail-only so the
     # KV prefix stays stable; omitted when blank (no list) so simple turns are byte-identical.
