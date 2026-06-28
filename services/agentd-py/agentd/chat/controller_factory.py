@@ -64,8 +64,10 @@ def select_chat_handler(
         from agentd.memory.harness import build_memory_harness
         from agentd.reasoning.engine import DefaultReasoningEngine
 
-        # Within-run compaction for controller turns (no-op unless AI_EDITOR_MEMORY_ENABLED).
-        memory_harness = build_memory_harness(MemoryConfig.from_env(os.environ), transport, model)
+        # Within-run compaction + cross-session memory for controller turns (no-op unless
+        # AI_EDITOR_MEMORY_ENABLED). workspace_path enables consolidation (workspace scope).
+        memory_harness = build_memory_harness(
+            MemoryConfig.from_env(os.environ), transport, model, workspace_path=workspace_path)
         return ChatController(
             workspace_path=workspace_path,
             reasoning_engine=DefaultReasoningEngine(model=model, transport=transport),

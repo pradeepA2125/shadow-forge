@@ -339,7 +339,10 @@ _chat_model = os.getenv(
 # scripted backend has no transport). Disjoint run_id namespace (task_id) from the chat
 # controller's harness — both share the one memory DB file, which sqlite handles fine.
 _task_memory_harness = (
-    build_memory_harness(MemoryConfig.from_env(os.environ), transport, _chat_model)  # type: ignore[possibly-unbound]
+    build_memory_harness(
+        MemoryConfig.from_env(os.environ), transport, _chat_model,  # type: ignore[possibly-unbound]
+        workspace_path=_chat_workspace_path,  # enables consolidation (workspace scope)
+    )
     if reasoning_backend != "scripted"
     else NO_OP_HARNESS
 )

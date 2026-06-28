@@ -435,6 +435,14 @@ class ChatController:
         elif outcome.kind == "clarify":
             await self._present_clarify_choice(thread_id, channel_id, outcome)
         elif outcome.kind == "submit_changes":
+            # Cross-session memory (Phase 2): an edit-promoting turn (NOT answer/clarify/QnA)
+            # consolidates into durable memory — closes the short-thread inline-edit hole.
+            # Best-effort, fire-and-forget; no-op unless memory + a consolidator are enabled.
+            if (outcome.text or "").strip():
+                self._memory_harness.schedule_consolidation(
+                    run_id=thread_id, scope_kind="workspace",
+                    scope_id=str(self._workspace_path), transcript=outcome.text or "",
+                    seq_lo=None, seq_hi=None)
             # Persist the EDIT turn's summary + exploration pills/thinking. The per-edit
             # diff_cards are already durable (edit_record_cb); without this closing
             # message the turn's pills/thinking vanish on reload (smoke-found gap #3).
