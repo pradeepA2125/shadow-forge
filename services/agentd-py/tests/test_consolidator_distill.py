@@ -1,6 +1,14 @@
 import pytest
 
-from agentd.memory.consolidator import make_engine_consolidator
+from agentd.memory.consolidator import _CONSOLIDATION_SYSTEM, make_engine_consolidator
+
+
+def test_prompt_has_research_driven_elements():
+    p = _CONSOLIDATION_SYSTEM
+    assert "EXAMPLE" in p  # few-shot input→output (Mem0 technique)
+    assert "NEVER output these example notes" in p  # anti-leak guard
+    assert "present-tense" in p  # declarative phrasing
+    assert all(k in p for k in ("episodic", "semantic", "procedural"))  # taxonomy intact
 
 
 class _FakeTransport:
