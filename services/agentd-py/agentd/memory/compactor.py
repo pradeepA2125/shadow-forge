@@ -99,14 +99,10 @@ class Compactor:
 
     async def maybe_compact(self, history: History, run_id: str) -> CompactionResult:
         # Pure token-trigger check (no count short-circuit: a short history of oversized
-        # turns can be over budget and must still compact).
+        # turns can be over budget and must still compact). Below threshold is the common
+        # per-iteration case — return without touching the store (no hot-path DB read).
         if _history_tokens(history) < self._window_tokens * self._trigger_frac:
-            anchor = self._store.get_anchor(run_id)
-            return CompactionResult(
-                compacted=False,
-                history=history,
-                anchor=anchor.summary_md if anchor else None,
-            )
+            return CompactionResult(compacted=False, history=history)
         now = datetime.now(UTC)
         ms = int(now.timestamp() * 1000)
         hot_budget = int(self._window_tokens * self._hot_token_frac)
