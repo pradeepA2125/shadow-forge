@@ -25,17 +25,19 @@ _agentd_logger.propagate = False
 from fastapi import FastAPI
 
 from agentd.api.routes import build_router
-from agentd.patch.engine import PatchEngine
 from agentd.domain.models import ScopePolicy, ScopeRemember, ScopeTrigger, ShellPolicy
 from agentd.orchestrator.engine import AgentOrchestrator
 from agentd.orchestrator.scripted_engine import ScriptedReasoningEngine
+from agentd.patch.engine import PatchEngine
 from agentd.providers.anthropic_transport import AnthropicJsonTransport
 from agentd.providers.gemini_transport import GeminiJsonTransport
 from agentd.providers.groq_transport import GroqJsonTransport
 from agentd.providers.huggingface_transport import HuggingFaceJsonTransport
 from agentd.providers.ollama_transport import OllamaJsonTransport
-from agentd.providers.turboquant_transport import TurboQuantTransport
 from agentd.providers.openai_transport import OpenAIJsonTransport
+from agentd.providers.openrouter_transport import OpenRouterJsonTransport
+from agentd.providers.turboquant_transport import TurboQuantTransport
+from agentd.providers.watsonx_transport import WatsonxJsonTransport
 from agentd.reasoning.contracts import ReasoningEngine
 from agentd.reasoning.engine import DefaultReasoningEngine
 from agentd.retrieval.artifact_client import RetrievalArtifactClient
@@ -43,9 +45,6 @@ from agentd.runtime.adapters import build_evidence_adapter, build_planning_adapt
 from agentd.storage.sqlite_store import SQLiteTaskStore
 from agentd.validation.command_validator import CommandValidator
 from agentd.workspace.shadow import ShadowWorkspaceManager
-from agentd.providers.openrouter_transport import OpenRouterJsonTransport
-from agentd.providers.watsonx_transport import WatsonxJsonTransport
-
 
 app = FastAPI(title="ai-editor agentd-py", version="0.1.0")
 
@@ -313,14 +312,42 @@ def _scope_remember_env() -> ScopeRemember:
 
 from agentd.chat.controller_factory import select_chat_handler, warn_if_incoherent_flags
 from agentd.chat.storage import ChatThreadStore
+from agentd.memory.config import MemoryConfig
+from agentd.memory.harness import NO_OP_HARNESS, build_memory_harness
 
 _chat_db_path = Path(os.getenv("AI_EDITOR_CHAT_DB_PATH", ".agentd/chat.sqlite3")).resolve()
 _chat_db_path.parent.mkdir(parents=True, exist_ok=True)
 _chat_thread_store = ChatThreadStore(_chat_db_path)
 
+# workspace_path for chat — the real repo being edited; defaults to cwd if not set
+_chat_workspace_path = os.getenv("AI_EDITOR_WORKSPACE_PATH", str(Path.cwd()))
+_BACKEND_MODEL_ENVVAR: dict[str, str] = {
+    "anthropic":   "AI_EDITOR_ANTHROPIC_MODEL",
+    "gemini":      "AI_EDITOR_GEMINI_MODEL",
+    "huggingface": "AI_EDITOR_HUGGINGFACE_MODEL",
+    "groq":        "AI_EDITOR_GROQ_MODEL",
+    "openrouter":  "AI_EDITOR_OPENROUTER_MODEL",
+    "watsonx":     "AI_EDITOR_WATSONX_MODEL",
+    "ollama":      "AI_EDITOR_OLLAMA_MODEL",
+    "turboquant":  "AI_EDITOR_TURBOQUANT_MODEL",
+    "openai":      "AI_EDITOR_OPENAI_MODEL",
+}
+_chat_model = os.getenv(
+    _BACKEND_MODEL_ENVVAR.get(reasoning_backend, "AI_EDITOR_OPENAI_MODEL"), "gpt-4o"
+)
+# Within-run compaction for task ToolLoop steps (no-op unless AI_EDITOR_MEMORY_ENABLED;
+# scripted backend has no transport). Disjoint run_id namespace (task_id) from the chat
+# controller's harness — both share the one memory DB file, which sqlite handles fine.
+_task_memory_harness = (
+    build_memory_harness(MemoryConfig.from_env(os.environ), transport, _chat_model)  # type: ignore[possibly-unbound]
+    if reasoning_backend != "scripted"
+    else NO_OP_HARNESS
+)
+
 orchestrator = AgentOrchestrator(
     store=store,
     reasoning_engine=reasoning_engine,
+    memory_harness=_task_memory_harness,
     validator=validator,
     patch_engine=patch_engine,
     workspace_manager=workspace_manager,
@@ -336,23 +363,6 @@ orchestrator = AgentOrchestrator(
     shell_policy=_shell_policy_env(),
     command_decision_timeout_sec=_float_env("AI_EDITOR_COMMAND_DECISION_TIMEOUT_SEC", 0.0),
     chat_store=_chat_thread_store,
-)
-
-# workspace_path for ChatAgent — the real repo being edited; defaults to cwd if not set
-_chat_workspace_path = os.getenv("AI_EDITOR_WORKSPACE_PATH", str(Path.cwd()))
-_BACKEND_MODEL_ENVVAR: dict[str, str] = {
-    "anthropic":   "AI_EDITOR_ANTHROPIC_MODEL",
-    "gemini":      "AI_EDITOR_GEMINI_MODEL",
-    "huggingface": "AI_EDITOR_HUGGINGFACE_MODEL",
-    "groq":        "AI_EDITOR_GROQ_MODEL",
-    "openrouter":  "AI_EDITOR_OPENROUTER_MODEL",
-    "watsonx":     "AI_EDITOR_WATSONX_MODEL",
-    "ollama":      "AI_EDITOR_OLLAMA_MODEL",
-    "turboquant":  "AI_EDITOR_TURBOQUANT_MODEL",
-    "openai":      "AI_EDITOR_OPENAI_MODEL",
-}
-_chat_model = os.getenv(
-    _BACKEND_MODEL_ENVVAR.get(reasoning_backend, "AI_EDITOR_OPENAI_MODEL"), "gpt-4o"
 )
 
 # scripted backend has no provider transport — both chat handlers require a real one.

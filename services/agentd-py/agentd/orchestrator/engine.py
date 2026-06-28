@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import difflib
 import hashlib
 import json
@@ -16,20 +17,19 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-import dataclasses
-
+from agentd.chat.tool_events import ToolEventSource, trace_to_tool_events
 from agentd.domain.models import (
     AgentToolTrace,
     CandidateScoreBreakdown,
     CheckpointManifest,
+    CommandApprovalRequest,
+    CommandDecision,
+    CommandRule,
     DeltaReplanRequest,
-    DiffEntry,
     Diagnostic,
+    DiffEntry,
     FailureSummary,
     InlineChangeResult,
-    RunEvent,
-    RunSummary,
-    TaskNarrative,
     PatchCandidateV2,
     PatchDocumentV2,
     PatchFailureCode,
@@ -39,31 +39,33 @@ from agentd.domain.models import (
     PlanStep,
     PlanTarget,
     PlanTargetIntent,
+    RunEvent,
+    RunSummary,
     ScopeExtensionRequest,
-    CommandApprovalRequest,
-    CommandDecision,
-    CommandRule,
     ScopePolicy,
     ScopeRemember,
-    ShellPolicy,
     ScopeTrigger,
+    ShellPolicy,
     StepExecutionTrace,
     StepReviewPayload,
     StepRunResult,
     TaskBudget,
     TaskMilestoneSnapshot,
+    TaskNarrative,
     TaskRecord,
     TaskStatus,
     TaskUsage,
     ValidationResult,
 )
-from agentd.chat.tool_events import ToolEventSource, trace_to_tool_events
 from agentd.domain.state_machine import assert_budget, bump_usage, transition
 from agentd.env.ensure import EnvProfileEnsurer
+from agentd.memory.harness import NO_OP_HARNESS, MemoryHarness
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster
 from agentd.orchestrator.task_control import TaskAborted, TaskControl
 from agentd.patch.diffing import (
     cap_unified_diff as _cap_unified_diff,  # noqa: F401 back-compat re-export
+)
+from agentd.patch.diffing import (
     compute_diff_entries as _compute_diff_entries_free,
 )
 from agentd.patch.engine import PatchEngine
@@ -235,9 +237,11 @@ class AgentOrchestrator:
         shell_policy: ShellPolicy = ShellPolicy.ASK,
         command_decision_timeout_sec: float = 0.0,
         chat_store: object | None = None,
+        memory_harness: MemoryHarness = NO_OP_HARNESS,
     ) -> None:
         self._store = store
         self._reasoning_engine = reasoning_engine
+        self._memory_harness = memory_harness
         self._validator = validator
         self._patch_engine = patch_engine
         self._workspace_manager = workspace_manager
@@ -2479,6 +2483,7 @@ class AgentOrchestrator:
                             if (_c := self._task_controls.get(task.task_id)) is not None
                             else None
                         ),
+                        memory_harness=self._memory_harness,
                     )
                     step_outcome = await tool_loop.run(
                         step,

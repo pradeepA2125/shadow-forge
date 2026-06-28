@@ -21,6 +21,7 @@ from agentd.domain.models import (
     ToolCall,
     ToolResult,
 )
+from agentd.memory.harness import NO_OP_HARNESS, MemoryHarness
 from agentd.orchestrator.broadcaster import PatchEventBroadcaster, cap_event_output
 from agentd.orchestrator.task_control import TaskAborted
 from agentd.reasoning.contracts import ReasoningEngine
@@ -216,11 +217,13 @@ class ToolLoop:
         thinking_log: list[str] | None = None,
         static_baseline: frozenset[str] | None = None,
         abort: "asyncio.Event | None" = None,
+        memory_harness: MemoryHarness = NO_OP_HARNESS,
     ) -> None:
         self._reasoning = reasoning_engine
         self._registry = registry
         self._broadcaster = broadcaster
         self._task_id = task_id
+        self._memory_harness = memory_harness
         self._broadcast_key = broadcast_key if broadcast_key is not None else task_id
         self._skip_verify = skip_verify
         self._patch_engine = patch_engine
@@ -362,6 +365,11 @@ class ToolLoop:
             # raising here leaves nothing of this step half-promoted.
             if self._abort is not None and self._abort.is_set():
                 raise TaskAborted()
+            # Memory middleware: compact the live ReAct history in place before the model
+            # call (no-op unless AI_EDITOR_MEMORY_ENABLED). step_context is separate and
+            # untouched — only the growing conversation `history` is compacted.
+            _prep = await self._memory_harness.prepare_turn(history, str(self._task_id))
+            history[:] = _prep.history
             phase = "explore" if sm.state == VerifyPhaseState.EXPLORE else "verify"
             # Fix 1: a state change means the workspace/context moved on — clear the
             # consecutive-repeat cache so a fresh read of the same target is allowed.
