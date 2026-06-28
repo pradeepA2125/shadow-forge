@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from agentd.memory.embedder import Embedder
@@ -97,3 +98,22 @@ class RecallEngine:
         ranked = _fuse(mems, sem, lex, struct, self._weights, datetime.now(UTC))
         # FIX #7: drop weak matches so a no-relevant-memory turn injects nothing.
         return [m for m, score in ranked[:k] if score >= self._min_score]
+
+    async def recall_grounded(
+        self, query: str, scope_kind: str, scope_id: str, k: int,
+        ground: Callable[[str], str] | None = None,
+    ) -> list[str]:
+        """Recall + render to lines; optionally ground the top 1-2 in the code graph."""
+        mems = await self.recall(query, scope_kind, scope_id, k)
+        lines = [f"- ({m.kind}) {m.content}" for m in mems]
+        if ground is not None:
+            for i, m in enumerate(mems[:2]):  # top 1-2 only (cost-bounded)
+                if not m.entities:
+                    continue
+                try:
+                    g = ground(m.entities[0])
+                    if g:
+                        lines[i] += f"  (grounding: {g[:120]})"
+                except Exception:  # noqa: BLE001 — best-effort: grounding never breaks recall
+                    logger.warning("[memory] grounding failed for entity=%s", m.entities[0])
+        return lines
