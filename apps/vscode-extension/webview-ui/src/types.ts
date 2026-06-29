@@ -126,7 +126,10 @@ export type ExtensionMessage =
   | { type: "clearLiveTodos" }
   | { type: "liveStatus"; status: string | null; turnActive?: boolean }
   | { type: "resolveInlineChangeCard"; taskId: string; resolution: "applied" | "discarded" }
-  | { type: "thread_title_updated"; payload: { thread_id: string; title: string } };
+  | { type: "thread_title_updated"; payload: { thread_id: string; title: string } }
+  // P1: prompt-file expansion replies from the host
+  | { type: "promptList"; names: string[] }
+  | { type: "promptExpanded"; name: string; found: boolean; text: string };
 
 // ── Webview → Extension ──────────────────────────────────────────────────────
 export type WebviewMessage =
@@ -154,7 +157,10 @@ export type WebviewMessage =
   // Tier B: cooperative Stop for a running task (revert rolls back vs keeps changes)
   | { type: "abortTask"; revert: boolean }
   // Tier B: live-mutable "Review each step" preference for the running task
-  | { type: "setReviewPref"; autoAccept: boolean };
+  | { type: "setReviewPref"; autoAccept: boolean }
+  // P1: prompt-file (.ai-editor/prompts/<name>.md) listing + expand-before-send
+  | { type: "listPrompts" }
+  | { type: "expandPrompt"; name: string; args: string };
 
 // ── App state ─────────────────────────────────────────────────────────────────
 export interface StreamingBubble {

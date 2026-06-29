@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState } from "react";
 import { Icon } from "./Icon";
 import { vscode } from "../vscodeApi";
+import { parseSlashCommand } from "../slash";
 import type { InputAvailability } from "../inputAvailability";
 
 interface Props {
@@ -49,6 +50,20 @@ export function InputArea({ availability, draft, onDraftChange }: Props) {
     }
   }, [availability.taskStop]);
 
+  // Prompt-file expansion: the host replies to an expandPrompt request with the
+  // substituted body, which fills the draft so the user can review/edit and send.
+  useEffect(() => {
+    function onMessage(e: MessageEvent) {
+      const m = e.data as Record<string, unknown>;
+      if (m?.["type"] === "promptExpanded" && m["found"] === true) {
+        onDraftChange(m["text"] as string);
+      }
+      // found=false → leave the draft as typed (soft no-op).
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [onDraftChange]);
+
   function autoGrow() {
     const el = textareaRef.current;
     if (!el) return;
@@ -65,6 +80,13 @@ export function InputArea({ availability, draft, onDraftChange }: Props) {
     if (availability.disabled) return;
     const trimmed = draft.trim();
     if (!trimmed) return;
+    const slash = parseSlashCommand(trimmed);
+    if (slash) {
+      // Expand first; the host replies with promptExpanded which fills the draft.
+      // The user then reviews/edits and sends again (now non-slash → real send).
+      vscode.postMessage({ type: "expandPrompt", name: slash.name, args: slash.args });
+      return;
+    }
     vscode.postMessage({ type: "sendMessage", text: trimmed, stepReview });
     onDraftChange("");
     // Reset height after clearing.
