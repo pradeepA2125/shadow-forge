@@ -111,7 +111,9 @@ class MemoryHarness:
         self._recall_cache: dict[str, list[str]] = {}  # per-run rendered recall
         self._recall_key: str | None = None  # last (run_id::query) recalled, to dedup per turn
 
-    async def prepare_turn(self, history: History, run_id: str) -> TurnPreparation:
+    async def prepare_turn(
+        self, history: History, run_id: str, query: str = "",
+    ) -> TurnPreparation:
         if not self._enabled:
             return TurnPreparation(history=history, recalled_memories=[], compacted=False)
         # Compaction (only when a compactor is wired) — best-effort.
@@ -140,11 +142,13 @@ class MemoryHarness:
             )
         # Recall (every turn, cached per query) — best-effort.
         if self._recall_engine is not None:
-            prep.recalled_memories = await self._fill_recall(history, run_id)
+            prep.recalled_memories = await self._fill_recall(history, run_id, query)
         return prep
 
-    async def _fill_recall(self, history: History, run_id: str) -> list[str]:
-        query = self._recall_query(history)
+    async def _fill_recall(self, history: History, run_id: str, query: str = "") -> list[str]:
+        # The current user message is in the loop's plan_context (`goal`), NOT in `history` on
+        # the first turn — so prefer the explicit query; fall back to the last user msg in history.
+        query = query.strip() or self._recall_query(history)
         if not query:
             return self._recall_cache.get(run_id, [])
         key = f"{run_id}::{query}"

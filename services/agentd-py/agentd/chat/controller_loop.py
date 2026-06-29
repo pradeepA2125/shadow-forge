@@ -310,7 +310,10 @@ class ControllerLoop:
             # (no-op unless AI_EDITOR_MEMORY_ENABLED). history[:] keeps the same list object
             # partial_history() and downstream .append() calls reference.
             run_id = str(plan_context.get("run_id", "chat"))
-            _prep = await self._memory_harness.prepare_turn(history, run_id)
+            # Pass the current user message (goal) so recall has a query even on turn 1, when
+            # the message lives in plan_context, not yet in history.
+            _prep = await self._memory_harness.prepare_turn(
+                history, run_id, query=str(plan_context.get("goal", "")))
             history[:] = _prep.history
             # Recalled long-term memories → the payload tail (KV-safe). Empty list omits it.
             plan_context["recalled_memories"] = _prep.recalled_memories
