@@ -8,6 +8,9 @@ import type {
   TaskSubmission,
   ThreadLiveState,
 } from "@ai-editor/editor-client";
+import { promises as fsp } from "fs";
+import * as os from "os";
+import * as path from "path";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -1694,5 +1697,37 @@ describe("AiEditorController — command-decision", () => {
     controller.dispose();
 
     expect(resultCallCount).toBeGreaterThanOrEqual(2);
+  });
+
+  test("prompt files: lists and expands from the workspace", async () => {
+    const ws = await fsp.mkdtemp(path.join(os.tmpdir(), "ctl-prompts-"));
+    await fsp.mkdir(path.join(ws, ".ai-editor", "prompts"), { recursive: true });
+    await fsp.writeFile(path.join(ws, ".ai-editor", "prompts", "review.md"), "Review $1", "utf8");
+
+    const state: StubBackendState = {
+      submitPayloads: [],
+      getTaskCalls: [],
+      acceptCalls: [],
+      rejectCalls: [],
+      getResultCalls: [],
+      planFeedbackCalls: [],
+    };
+    const controller = new AiEditorController(
+      () => createStubBackend(state),
+      new MemorySessionStore(),
+      createSettings(),
+      createUi({ getWorkspacePath: () => ws }),
+      { openDiff: async (_entry: ReviewFileEntry) => {} },
+      () => "2026-03-03T00:00:00.000Z"
+    );
+
+    expect(await controller.listPrompts()).toEqual(["review"]);
+    expect(await controller.expandPrompt("review", "src/a.py")).toEqual({
+      found: true,
+      text: "Review src/a.py",
+    });
+    expect(await controller.expandPrompt("ghost", "")).toEqual({ found: false, text: "" });
+
+    await fsp.rm(ws, { recursive: true, force: true });
   });
 });

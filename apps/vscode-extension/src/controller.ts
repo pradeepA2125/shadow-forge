@@ -12,7 +12,9 @@ import type {
   ThreadLiveState,
 } from "@ai-editor/editor-client";
 
+import * as path from "path";
 import type { MemoryDataSource } from "./memory-data.js";
+import { listPromptNames, loadPromptBody, substitutePrompt } from "./prompt-files.js";
 import { buildReviewFileEntries } from "./review-files.js";
 import { SessionStore } from "./session-store.js";
 import { shouldStopPolling, TaskPoller } from "./task-poller.js";
@@ -233,6 +235,26 @@ export class AiEditorController {
 
   memoryWorkspacePath(): string {
     return this.session?.workspacePath ?? this.ui.getWorkspacePath() ?? "";
+  }
+
+  private promptsDir(): string {
+    return path.join(this.memoryWorkspacePath(), ".ai-editor", "prompts");
+  }
+
+  /** Names of available `.ai-editor/prompts/*.md` for composer `/` autocomplete. */
+  async listPrompts(): Promise<string[]> {
+    const ws = this.memoryWorkspacePath();
+    if (!ws) return [];
+    return listPromptNames(this.promptsDir());
+  }
+
+  /** Expand `/name args` to its substituted body; `found=false` when no such prompt. */
+  async expandPrompt(name: string, args: string): Promise<{ found: boolean; text: string }> {
+    const ws = this.memoryWorkspacePath();
+    if (!ws) return { found: false, text: "" };
+    const body = await loadPromptBody(this.promptsDir(), name);
+    if (body === null) return { found: false, text: "" };
+    return { found: true, text: substitutePrompt(body, args) };
   }
 
   private memoryClient(): BackendTaskClient {
