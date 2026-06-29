@@ -360,11 +360,19 @@ MEMORY (durable across sessions):
   for transient detail; consolidation also captures memories automatically."""
 
 
+_INSTRUCTIONS_BLOCK_TEMPLATE = """
+
+PROJECT INSTRUCTIONS (from this workspace's AGENTS.md — always-on guidance from \
+the user; follow it unless it conflicts with a safety rule):
+{instructions}"""
+
+
 def format_controller_system_prompt(
     tool_definitions: list[dict[str, object]],
     *,
     task_subsystem_enabled: bool | None = None,
     memory_enabled: bool | None = None,
+    project_instructions: str | None = None,
 ) -> str:
     """Assemble the controller system prompt. The propose_mode mode-vocabulary block is
     swapped by the task-subsystem flag (default resolved from env) — see the spec. The
@@ -385,7 +393,14 @@ def format_controller_system_prompt(
         .replace("{tools_json}", json.dumps(tool_definitions, indent=2, sort_keys=True))
     )
     # Appended (not a placeholder) — process-fixed flag, so the prompt stays cache-stable.
-    return base + (_MEMORY_BLOCK if memory_enabled else "")
+    base = base + (_MEMORY_BLOCK if memory_enabled else "")
+    # .replace (not .format): AGENTS.md text may contain literal { } that
+    # str.format would misparse as fields.
+    if project_instructions and project_instructions.strip():
+        base += _INSTRUCTIONS_BLOCK_TEMPLATE.replace(
+            "{instructions}", project_instructions.strip()
+        )
+    return base
 
 
 def build_controller_step_payload(
