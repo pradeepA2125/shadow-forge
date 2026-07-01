@@ -52,10 +52,14 @@ gate machinery** (`PendingGate`, async future + timeout, remember-rule).
 ### 3.2 Client (`agentd/mcp/client.py`)
 
 - Thin wrapper around the official `mcp` SDK's `ClientSession`. One session per **enabled** server.
-- **Eager connection, once per process** — at `controller_factory.select_chat_handler` time,
-  alongside where the workspace-frozen `SkillCatalogLoader`/`ProjectInstructionsLoader` are built
-  (§3.6), **not** inside `ChatController._build_registry` (which runs once per `_run_loop`, i.e. once
-  per user *message*). `McpToolSource` wraps the already-connected sessions; it never triggers a new
+- **Eager connection, once per process** — the manager is *constructed* at
+  `controller_factory.select_chat_handler` time (alongside the workspace-frozen
+  `SkillCatalogLoader`/`ProjectInstructionsLoader`, §3.6) but *connects* in a FastAPI **startup
+  event handler** (`app.add_event_handler("startup", manager.start)` in `main.py`): the factory
+  runs at module import with **no running event loop**, and the SDK's transports/sessions are
+  async context managers, so connecting at factory time is literally impossible (verified against
+  `main.py:373` during planning). Connection is **not** inside `ChatController._build_registry`
+  (which runs once per `_run_loop`, i.e. once per user *message*). `McpToolSource` wraps the already-connected sessions; it never triggers a new
   connection itself. Getting this scope wrong — reconnecting subprocesses on every chat message
   instead of once for the process lifetime — is exactly the class of bug this session's `decide_entry`
   fix was about (a value silently built at the wrong lifecycle scope), so it's called out explicitly
@@ -64,6 +68,14 @@ gate machinery** (`PendingGate`, async future + timeout, remember-rule).
 - A server that fails to connect (bad command, unreachable URL, handshake failure) logs a warning
   and contributes zero tools — degrade-not-raise, same contract as every other optional subsystem
   (memory, instructions, skills).
+- **Shape the client as a manager with a `reconcile(configs)` method** (eager boot connect =
+  `reconcile(loader.load())` once at factory time), and keep a queryable per-server
+  `status: connected | failed(reason) | disabled` — not connect-once logic baked into factory
+  wiring. Rationale: the P4 settings UI (see
+  `docs/superpowers/2026-07-02-mcp-settings-ui-research.md`) edits `.ai-editor/mcp.json` at
+  runtime and expects servers to connect/disconnect without a backend restart, and every surveyed
+  product exposes per-server status in its UI. v1 still only *calls* reconcile once — the seam
+  costs nothing now and avoids a P4 refactor of subprocess-lifecycle code.
 
 ### 3.3 Tool exposure (`agentd/mcp/tool_source.py`)
 
@@ -217,6 +229,12 @@ rather than hard-failing.
   v1; a failed server stays excluded until the next config-driven reconnect (mtime change or
   restart).
 - **Per-server management UI** (add/remove/health/enable-disable pane) — **P4**, same as skills.
+  Field research on how Claude Code/Codex/VS Code/Cursor/Claude Desktop do this (and the concrete
+  P4 shape: a write-API over `mcp.json` + a QuickPick-wizard tier + a settings-pane tier) is in
+  `docs/superpowers/2026-07-02-mcp-settings-ui-research.md`. Two of its findings act on P3
+  itself: the `reconcile()` client-manager seam (§3.2), and the caveat that `enabled: true` in a
+  *committed* config file degrades to presence-trust — P4's per-user toggle must live outside the
+  shared file.
 - **Planning/task-path injection** — dormant path, untouched (decision 1, same scope call as P1/P2).
 - **MCP *resources* (as opposed to tools)** — the roadmap scope is tools; resource access is a
   candidate follow-up if a real use case shows up.
