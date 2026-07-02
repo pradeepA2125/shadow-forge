@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
 from agentd.mcp.config import (
@@ -35,7 +36,7 @@ class McpServerUnavailable(RuntimeError):
 
 
 @asynccontextmanager
-async def _open_session(cfg: McpServerConfig):
+async def _open_session(cfg: McpServerConfig) -> AsyncIterator[Any]:
     """Default session factory: real SDK transport + initialized ClientSession.
     ${VAR} in env/headers resolves here (connect time) — a missing variable makes
     the connect fail with a message naming it, never a blank credential."""
@@ -83,7 +84,13 @@ class _ServerHandle:
 
 
 class McpConnectionManager:
-    def __init__(self, loader: McpConfigLoader, session_factory=_open_session) -> None:
+    def __init__(
+        self,
+        loader: McpConfigLoader,
+        session_factory: Callable[
+            [McpServerConfig], AbstractAsyncContextManager[Any]
+        ] = _open_session,
+    ) -> None:
         self._loader = loader
         self._session_factory = session_factory
         self._handles: dict[str, _ServerHandle] = {}
@@ -173,7 +180,7 @@ class McpConnectionManager:
                 ))
         return out
 
-    async def call_tool(self, server: str, tool: str, args: dict[str, object]):
+    async def call_tool(self, server: str, tool: str, args: dict[str, object]) -> Any:
         handle = self._handles.get(server)
         if handle is None or handle.session is None:
             raise McpServerUnavailable(

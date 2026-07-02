@@ -4,7 +4,7 @@ CommandRuleStore, keyed on the exact pair (spec §3.4: not a command string)."""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -29,6 +29,6 @@ class McpRuleStore:
         if any(r.get("server") == server and r.get("tool") == tool for r in rules):
             return
         rules.append({"server": server, "tool": tool,
-                      "added_at": datetime.now(timezone.utc).isoformat()})
+                      "added_at": datetime.now(UTC).isoformat()})
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(rules, indent=2), encoding="utf-8")

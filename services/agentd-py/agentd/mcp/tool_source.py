@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 _PREFIX = "mcp__"
 
-ApprovalCallback = Callable[[str, str, dict], Awaitable[bool]]
+ApprovalCallback = Callable[[str, str, dict[str, object]], Awaitable[bool]]
 
 
 def parse_tool_name(name: str) -> tuple[str, str] | None:
