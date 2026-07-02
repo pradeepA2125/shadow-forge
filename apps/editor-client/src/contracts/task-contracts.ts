@@ -151,6 +151,13 @@ export type ValidationDecisionResponse = z.infer<typeof ValidationDecisionRespon
 export type CommandDecision = z.infer<typeof CommandDecisionSchema>;
 export type CommandDecisionResponse = z.infer<typeof CommandDecisionResponseSchema>;
 
+// User decision on an mcp_tool approval gate (chat controller). Remember persists
+// the exact (server, tool) pair to the workspace's approved-mcp-tools.json.
+export interface McpToolDecision {
+  approve: boolean;
+  remember: boolean;
+}
+
 export interface DiffEntry {
   path: string;
   additions: number;
@@ -177,6 +184,7 @@ export type StreamEvent =
   | { type: "scope_extension_requested"; payload: { decision_id: string; files: string[]; reason: string; step_id: string } }
   | { type: "validation_decision_requested"; payload: { task_id: string; diagnostics: Array<{ source: string; message: string; level: string }> } }
   | { type: "command_approval_requested"; payload: { decision_id: string; command: string; args: string[]; cwd: string; step_id: string } }
+  | { type: "mcp_approval_requested"; payload: { server: string; tool: string; args: Record<string, unknown> } }
   | { type: "tool_thinking_chunk"; payload: { chunk: string } }
   | { type: "chat_agent_thinking"; payload: { message: string } }
   | { type: "chat_agent_thinking_chunk"; payload: { chunk: string } }
@@ -245,7 +253,7 @@ export type ChatEvent = z.infer<typeof ChatEventSchema>;
 // is the RUNTIME gate: a kind missing here makes ThreadLiveStateSchema.parse() throw, which
 // pollThreadLiveState swallows, so the gate silently never renders.
 export const PendingGateSchema = z.object({
-  kind: z.enum(["command", "step", "scope", "validation", "mode", "edit", "clarify"]),
+  kind: z.enum(["command", "step", "scope", "validation", "mode", "edit", "clarify", "mcp_tool"]),
   payload: z.record(z.unknown()).default({}),
 });
 export type PendingGate = z.infer<typeof PendingGateSchema>;
@@ -283,6 +291,7 @@ export const BackendConfigSchema = z.object({
   chatControllerEnabled: z.boolean(),
   memoryEnabled: z.boolean(),
   skillsEnabled: z.boolean(),
+  mcpEnabled: z.boolean(),
 });
 export type BackendConfig = z.infer<typeof BackendConfigSchema>;
 
@@ -387,6 +396,8 @@ export interface BackendTaskClient {
   postEditDecision(threadId: string, decision: "accept" | "reject", reason?: string): Promise<void>;
   // Controller run_command gate: a plain JSON ack (continuation rides the open message stream).
   postChatCommandDecision(threadId: string, decision: CommandDecision): Promise<void>;
+  // Controller mcp_tool gate: a plain JSON ack (continuation rides the open message stream).
+  postChatMcpDecision(threadId: string, decision: McpToolDecision): Promise<void>;
   // Stop a detached controller turn (POST /chat/threads/{id}/stop). ok=false is benign.
   stopChatTurn(threadId: string): Promise<{ ok: boolean }>;
   // Subscribe-only SSE to any broadcaster channel (GET /v1/channels/{id}/stream). Used

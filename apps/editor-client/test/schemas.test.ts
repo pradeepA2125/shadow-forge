@@ -99,6 +99,7 @@ describe("memory inspector schemas (Phase 3-B)", () => {
       chatControllerEnabled: true,
       memoryEnabled: true,
       skillsEnabled: false,
+      mcpEnabled: false,
     });
     expect(c.memoryEnabled).toBe(true);
   });

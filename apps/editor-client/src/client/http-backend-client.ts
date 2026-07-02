@@ -31,6 +31,7 @@ import {
   type ScopeDecisionResponse,
   type CommandDecision,
   type CommandDecisionResponse,
+  type McpToolDecision,
   type ValidationDecisionResponse,
   type ChatThreadSummary,
   type ChatThread,
@@ -232,6 +233,21 @@ export class HttpBackendClient implements BackendTaskClient {
     await this.fetchJson(
       `/v1/chat/threads/${encodeURIComponent(threadId)}/command-decision`,
       { method: "POST", body: JSON.stringify(body) }
+    );
+  }
+
+  // Controller mcp_tool gate: a plain JSON ack — the loop's continuation rides the
+  // already-open message SSE stream. Mirrors postChatCommandDecision.
+  async postChatMcpDecision(
+    threadId: string,
+    decision: McpToolDecision
+  ): Promise<void> {
+    await this.fetchJson(
+      `/v1/chat/threads/${encodeURIComponent(threadId)}/mcp-decision`,
+      {
+        method: "POST",
+        body: JSON.stringify({ approve: decision.approve, remember: decision.remember }),
+      }
     );
   }
 
@@ -539,6 +555,7 @@ export class HttpBackendClient implements BackendTaskClient {
       chatControllerEnabled: raw["chat_controller_enabled"] ?? false,
       memoryEnabled: raw["memory_enabled"] ?? false,
       skillsEnabled: raw["skills_enabled"] ?? false,
+      mcpEnabled: raw["mcp_enabled"] ?? false,
     });
   }
 
